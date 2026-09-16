@@ -49,14 +49,13 @@
 #define CAM_HMIRROR     0
 
 // ============================================================
-// VIDEO - VGA capture (full FOV, 4:3)
-// JPEG_QUALITY 26 keeps frames small enough for 20 FPS on this radio.
-// The zip used quality 12 @ 12 FPS (larger JPEGs, slower live).
+// VIDEO - same capture as firmware.zip: VGA JPEG q=12 @ 12 FPS.
+// Transport stays WebSocket (0x01 + JPEG). Audio stays on /ws/audio.
 // ============================================================
 #define STREAM_WIDTH    640
 #define STREAM_HEIGHT   480
-#define JPEG_QUALITY    26
-#define STREAM_FPS      20
+#define JPEG_QUALITY    12
+#define STREAM_FPS      12
 
 // ============================================================
 // INMP441
@@ -67,20 +66,14 @@
 #define MIC_SAMPLE_RATE 16000
 
 // ============================================================
-// AUDIO — same mic path as firmware.zip (>>14, 3 s ring, 8×256 DMA).
-//
-// Zip sent 250 ms over HTTP. That payload is 8000 bytes and does not fit
-// CONFIG_LWIP_TCP_SND_BUF_DEFAULT (5744), so a WebSocket send of the same
-// size blocked lwIP and dropped live video to ~5 FPS. 125 ms is 4000 bytes
-// (fits one TCP buffer) at 8 sends/s (under the device's ~10–25 send cap).
-// The samples are identical; only the frame size on the wire changed.
+// AUDIO — capture identical to firmware.zip (INMP441 >>14, 3 s ring,
+// 8×256 DMA, LEFT slot). Live still goes out on /ws/audio as 125 ms
+// packets so one send fits the TCP buffer; two sends = one zip chunk.
 // ============================================================
 #define AUDIO_CHUNK_MS  125
 #define AUDIO_RING_MS   3000
-#define AUDIO_LIVE_MS   375
 #define AUDIO_TX_SAMPLES ((MIC_SAMPLE_RATE * AUDIO_CHUNK_MS) / 1000)
 #define AUDIO_RING_SAMPLES ((MIC_SAMPLE_RATE * AUDIO_RING_MS) / 1000)
-#define AUDIO_LIVE_SAMPLES ((MIC_SAMPLE_RATE * AUDIO_LIVE_MS) / 1000)
 #define MIC_SHIFT       14
 
 // ============================================================

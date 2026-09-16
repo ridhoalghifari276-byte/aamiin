@@ -206,6 +206,23 @@
       font-size: 0.82rem;
       margin-bottom: 0.35rem;
     }
+    .bulk-bar {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.4rem;
+      margin: 0.55rem 0 0.75rem;
+    }
+    .face-card { position: relative; }
+    .face-card .pick {
+      position: absolute;
+      top: 0.4rem;
+      left: 0.4rem;
+      width: 16px;
+      height: 16px;
+      z-index: 2;
+    }
+    .rec-list li .pick { margin-right: 0.35rem; }
+    .ov-btn.danger { border-color: rgba(255, 77, 106, 0.55); color: var(--red); }
     .device-meta {
       display: block;
       color: var(--muted);
@@ -1124,15 +1141,25 @@
           <button type="button" class="intel-tab active" data-tab="video" role="tab">Video <span class="cnt" id="cnt-video">0</span></button>
           <button type="button" class="intel-tab" data-tab="audio" role="tab">Audio <span class="cnt" id="cnt-audio">0</span></button>
         </div>
+        <div class="bulk-bar">
+          <button type="button" class="ov-btn" id="rec-select-all">Pilih semua</button>
+          <button type="button" class="ov-btn danger" id="rec-delete-selected">Hapus yang dipilih</button>
+          <button type="button" class="ov-btn rec" id="rec-delete-all">Hapus semua tab ini</button>
+        </div>
         <div id="panel-video" class="tab-panel active" data-panel="video"><ul id="video-list" class="rec-list"></ul></div>
         <div id="panel-audio" class="tab-panel" data-panel="audio"><ul id="audio-list" class="rec-list"></ul></div>
       </section>
 
       <section class="page-view" id="view-faces">
         <h2>Wajah yang tercapture</h2>
-        <p class="page-hint">Wajah tercapture dipisah per perangkat. Pilih unit di bawah.</p>
+        <p class="page-hint">Wajah tercapture dipisah per perangkat. Pilih unit di bawah. Bisa hapus banyak sekaligus.</p>
         <div class="device-chips" id="face-devices"></div>
         <div id="face-live" class="panel-status">Deteksi: …</div>
+        <div class="bulk-bar">
+          <button type="button" class="ov-btn" id="face-select-all">Pilih semua</button>
+          <button type="button" class="ov-btn danger" id="face-delete-selected">Hapus yang dipilih</button>
+          <button type="button" class="ov-btn rec" id="face-delete-all">Hapus semua</button>
+        </div>
         <div id="face-grid" class="face-grid capture-grid"></div>
       </section>
 
@@ -2126,10 +2153,15 @@
             (r.wav ? '<a href="' + fileUrl(r.wav, true) + '">WAV</a>' : "") +
             (r.mp4 ? '<a href="' + fileUrl(r.mp4, true) + '">MP4</a>' : "") +
             (canPlay ? '<span class="view-hint">View ▶</span>' : "") +
+            '<button type="button" class="ov-btn rec" data-rec-del="' +
+              encodeURIComponent(r.session_id || "") + '">Hapus</button>' +
           "</div>";
+        const pick = '<input type="checkbox" class="pick" data-sid="' +
+          (r.session_id || "").replace(/"/g, "") + '" />';
         if (asThumbs) {
           const thumb = recThumbUrl(r);
           li.innerHTML =
+            pick +
             '<div class="yt-thumb">' +
               (thumb
                 ? '<img src="' + thumb + '" alt="" loading="lazy" />'
@@ -2143,17 +2175,18 @@
             "</div>";
         } else {
           li.innerHTML =
+            pick +
             '<div class="title">' + (r.mode || "").toUpperCase() + " · " + (r.duration_sec || 0) + "s</div>" +
             '<div class="meta">' + (r.device || "") + " · " + when + "</div>" +
             actions;
         }
         if (canPlay) {
           li.addEventListener("click", (e) => {
-            if (e.target.closest("a")) return;
+            if (e.target.closest("a") || e.target.closest("input") || e.target.closest("button")) return;
             openMediaModal(r);
           });
         }
-        li.querySelectorAll("a").forEach((a) => {
+        li.querySelectorAll("a, input, button").forEach((a) => {
           a.addEventListener("click", (e) => e.stopPropagation());
         });
         listEl.appendChild(li);
@@ -2348,6 +2381,7 @@
           card.className = "face-card";
           const when = item.ts ? new Date(item.ts * 1000).toLocaleString() : "";
           card.innerHTML =
+            '<input type="checkbox" class="pick" data-id="' + item.id + '" />' +
             '<a href="' + fileUrl(item.full) + '" target="_blank" rel="noopener">' +
             '<img src="' + fileUrl(item.face) + '" alt="face" loading="lazy" /></a>' +
             '<div class="meta">' + (item.device || unit) + "<br/>" + when +
@@ -2401,6 +2435,41 @@
         refreshRegistry();
       } catch (_) {}
     });
+
+    async function bulkDeleteFaces(ids, all) {
+      const unit = facesDevice || currentDevice;
+      const n = all ? "semua wajah tercapture" : (ids.length + " wajah");
+      if (!confirm("Hapus " + n + " di " + unit + "?")) return;
+      try {
+        await fetch("/api/v1/faces/bulk-delete", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(all ? { device: unit } : { ids }),
+        });
+        lastFaceIds = "";
+        refreshFaces();
+      } catch (_) {}
+    }
+    const faceSelectAll = document.getElementById("face-select-all");
+    const faceDelSel = document.getElementById("face-delete-selected");
+    const faceDelAll = document.getElementById("face-delete-all");
+    if (faceSelectAll) {
+      faceSelectAll.addEventListener("click", () => {
+        const boxes = faceGrid.querySelectorAll("input.pick");
+        const on = ![...boxes].every((b) => b.checked);
+        boxes.forEach((b) => { b.checked = on; });
+      });
+    }
+    if (faceDelSel) {
+      faceDelSel.addEventListener("click", () => {
+        const ids = [...faceGrid.querySelectorAll("input.pick:checked")].map((b) => b.dataset.id).filter(Boolean);
+        if (!ids.length) return;
+        bulkDeleteFaces(ids, false);
+      });
+    }
+    if (faceDelAll) {
+      faceDelAll.addEventListener("click", () => bulkDeleteFaces([], true));
+    }
 
     async function refreshRegistry() {
       if (!registryGrid) return;
@@ -2547,6 +2616,61 @@
         renderRecItems(audioList, audios.slice(0, 40), "Belum ada audio record untuk " + unit, false);
         renderRecItems(videoList, videos.slice(0, 40), "Belum ada video record untuk " + unit, true);
       } catch (_) {}
+    }
+
+    function activeRecTab() {
+      const t = document.querySelector(".intel-tab.active");
+      return (t && t.dataset.tab) || "video";
+    }
+    function recListEl() {
+      return activeRecTab() === "audio" ? audioList : videoList;
+    }
+    async function deleteRecordings(sessionIds, allOfTab) {
+      const unit = archiveDevice || currentDevice;
+      const mode = activeRecTab();
+      const n = allOfTab ? ("semua rekaman " + mode) : (sessionIds.length + " file");
+      if (!confirm("Hapus " + n + " di " + unit + "?")) return;
+      try {
+        const body = allOfTab
+          ? { device: unit, mode }
+          : { session_ids: sessionIds };
+        await fetch("/api/v1/recordings/bulk-delete", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        });
+        refreshRecordings();
+      } catch (_) {}
+    }
+    document.getElementById("view-videos").addEventListener("click", async (e) => {
+      const one = e.target.closest("[data-rec-del]");
+      if (one) {
+        const sid = decodeURIComponent(one.dataset.recDel || "");
+        if (sid && confirm("Hapus rekaman ini?")) {
+          await fetch("/api/v1/recordings?session_id=" + encodeURIComponent(sid), { method: "DELETE" });
+          refreshRecordings();
+        }
+      }
+    });
+    const recSelAll = document.getElementById("rec-select-all");
+    const recDelSel = document.getElementById("rec-delete-selected");
+    const recDelAll = document.getElementById("rec-delete-all");
+    if (recSelAll) {
+      recSelAll.addEventListener("click", () => {
+        const boxes = recListEl().querySelectorAll("input.pick");
+        const on = ![...boxes].every((b) => b.checked);
+        boxes.forEach((b) => { b.checked = on; });
+      });
+    }
+    if (recDelSel) {
+      recDelSel.addEventListener("click", () => {
+        const ids = [...recListEl().querySelectorAll("input.pick:checked")].map((b) => b.dataset.sid).filter(Boolean);
+        if (!ids.length) return;
+        deleteRecordings(ids, false);
+      });
+    }
+    if (recDelAll) {
+      recDelAll.addEventListener("click", () => deleteRecordings([], true));
     }
 
     document.querySelectorAll(".nav-btn").forEach((btn) => {

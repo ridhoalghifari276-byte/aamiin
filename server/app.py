@@ -716,11 +716,9 @@ _gap_fillers: dict[str, GapFiller] = {}
 
 
 def clean_pcm(device: str, data: bytes) -> bytes:
-    chain = _voice_chains.get(device)
-    if chain is None:
-        chain = VoiceChain()
-        _voice_chains[device] = chain
-    return chain.process(data)
+    # firmware.zip posted the mic samples as-is. The noise gate (OPEN_RMS=1000)
+    # was swallowing quiet speech, which is why live audio sounded empty/choppy.
+    return data
 
 
 def append_pcm(device: str, data: bytes, session_id: str | None, session_mode: str | None = None):
@@ -1145,6 +1143,66 @@ def get_recording_thumb(session_id: str):
     )
 
 
+def _unlink_rel(rel) -> None:
+    if not rel:
+        return
+    path = (BASE / str(rel)).resolve()
+    if not str(path).startswith(str(BASE.resolve())):
+        return
+    try:
+        if path.is_dir():
+            shutil.rmtree(path, ignore_errors=True)
+        elif path.exists():
+            path.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
+def delete_recording(session_id: str) -> bool:
+    with lock:
+        item = next((r for r in recordings_index if r.get("session_id") == session_id), None)
+        if not item:
+            return False
+        recordings_index[:] = [r for r in recordings_index if r.get("session_id") != session_id]
+        persist_recordings_index()
+    for key in ("wav", "m4a", "mp4", "thumb"):
+        _unlink_rel(item.get(key))
+    device = item.get("device") or ""
+    safe = str(session_id).replace("/", "_")
+    if device:
+        _unlink_rel(Path(device) / "recordings" / f"{safe}_frames")
+        _unlink_rel(Path(device) / "recordings" / f"{safe}.jpg")
+    return True
+
+
+@app.delete("/api/v1/recordings")
+def api_delete_recording(session_id: str):
+    if not delete_recording(session_id):
+        raise HTTPException(404, "not found")
+    return {"ok": True, "session_id": session_id}
+
+
+@app.post("/api/v1/recordings/bulk-delete")
+async def api_bulk_delete_recordings(req: Request):
+    body = await req.json()
+    ids = body.get("session_ids") or []
+    device = (body.get("device") or "").strip() or None
+    mode = (body.get("mode") or "").strip() or None
+    with lock:
+        items = list(recordings_index)
+    if not ids and device:
+        ids = [
+            r.get("session_id")
+            for r in items
+            if r.get("device") == device and (not mode or r.get("mode") == mode)
+        ]
+    n = 0
+    for sid in ids:
+        if sid and delete_recording(str(sid)):
+            n += 1
+    return {"ok": True, "deleted": n}
+
+
 _snap_cache: dict[str, tuple[float, bytes]] = {}
 
 
@@ -1417,6 +1475,22 @@ async def enroll_face_upload(
     except ValueError as e:
         raise HTTPException(400, str(e)) from e
     return {"ok": True, "item": item}
+
+
+@app.post("/api/v1/faces/bulk-delete")
+async def bulk_delete_faces(req: Request):
+    if not face_engine:
+        raise HTTPException(503, "face engine not ready")
+    body = await req.json()
+    ids = body.get("ids") or []
+    device = (body.get("device") or "").strip() or None
+    if ids:
+        n = face_engine.delete_captures([str(i) for i in ids])
+    elif device:
+        n = face_engine.delete_unlabeled_for_device(device)
+    else:
+        raise HTTPException(400, "ids or device required")
+    return {"ok": True, "deleted": n}
 
 
 @app.delete("/api/v1/faces/{face_id}")

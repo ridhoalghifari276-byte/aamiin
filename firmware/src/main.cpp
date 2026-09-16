@@ -109,23 +109,24 @@ static void applyCamNight(bool on) {
     s->set_raw_gma(s, 1);
     s->set_dcw(s, 1);
   } else {
-    // Indoors the sensor was stretching exposure to ~1/4 s, which drops the
-    // OV2640 to ~3 FPS and smears motion. Let AGC use gain instead: gain
-    // ceiling high, aec2 (DSP night mode / auto frame-rate drop) off, and a
-    // slightly darker AE target so frame time stays short.
+    // firmware.zip daytime capture: auto AE/AWB, no forced gain-ceiling.
     s->set_gain_ctrl(s, 1);
     s->set_exposure_ctrl(s, 1);
     s->set_aec2(s, 0);
-    s->set_gainceiling(s, GAINCEILING_16X);
+    s->set_gainceiling(s, GAINCEILING_2X);
     s->set_agc_gain(s, 0);
-    s->set_aec_value(s, 200);
-    s->set_ae_level(s, -1);
-    s->set_brightness(s, 1);
+    s->set_aec_value(s, 300);
+    s->set_ae_level(s, 0);
+    s->set_brightness(s, 0);
     s->set_contrast(s, 0);
     s->set_saturation(s, 0);
     s->set_whitebal(s, 1);
     s->set_awb_gain(s, 1);
     s->set_special_effect(s, 0);
+    s->set_quality(s, JPEG_QUALITY);
+    s->set_framesize(s, FRAMESIZE_VGA);
+    s->set_vflip(s, CAM_VFLIP);
+    s->set_hmirror(s, CAM_HMIRROR);
     s->set_raw_gma(s, 1);
     s->set_lenc(s, 1);
     s->set_dcw(s, 1);
@@ -161,23 +162,14 @@ static void ringClear() {
 
 static void ringPush(const int16_t *src, size_t n) {
   portENTER_CRITICAL(&ringMux);
-  // Trim the backlog in whole packets before writing, not one sample at a time
-  // while writing. Dropping mid-write used to tear a word in half every time
-  // the link stuttered; this drops only stale audio and lands on a packet edge.
-  size_t held = ringCountUnsafe();
-  if (held + n >= AUDIO_RING_SAMPLES) {
-    size_t keep = AUDIO_LIVE_SAMPLES > n ? AUDIO_LIVE_SAMPLES - n : 0;
-    size_t drop = held > keep ? held - keep : 0;
-    ringRead = (ringRead + drop) % AUDIO_RING_SAMPLES;
+  for (size_t i = 0; i < n; i++) {
+    size_t next = (ringWrite + 1) % AUDIO_RING_SAMPLES;
+    if (next == ringRead) {
+      ringRead = (ringRead + 1) % AUDIO_RING_SAMPLES;
+    }
+    audioRing[ringWrite] = src[i];
+    ringWrite = next;
   }
-  // Two memcpys, not 320 single-sample writes with a modulo each. This runs
-  // with interrupts masked on the same core as the I2S ISR, so the length of
-  // this window is exactly what decides whether a DMA block gets dropped.
-  size_t first = AUDIO_RING_SAMPLES - ringWrite;
-  if (first > n) first = n;
-  memcpy(audioRing + ringWrite, src, first * sizeof(int16_t));
-  if (n > first) memcpy(audioRing, src + first, (n - first) * sizeof(int16_t));
-  ringWrite = (ringWrite + n) % AUDIO_RING_SAMPLES;
   portEXIT_CRITICAL(&ringMux);
 }
 
@@ -424,9 +416,9 @@ static bool sendAudioWs() {
   if (!audioWsConnected || !audioRing) return false;
   bool any = false;
   int sent = 0;
-  // One packet per pass so a 4000-byte send cannot pile up in lwIP and
-  // delay the JPEG socket that shares the radio.
-  while (ringCount() >= (size_t)AUDIO_TX_SAMPLES && sent < 1) {
+  // Two 125 ms packets = one firmware.zip 250 ms batch, without a single
+  // 8000-byte send that would stall lwIP.
+  while (ringCount() >= (size_t)AUDIO_TX_SAMPLES && sent < 2) {
     size_t n = ringPop(txBuf, AUDIO_TX_SAMPLES);
     if (!n) break;
     if (!audioWs.sendBIN((uint8_t *)txBuf, n * sizeof(int16_t))) {
@@ -503,13 +495,13 @@ static void applySessionCmd() {
 }
 
 // ============================================================
-// AUDIO CAPTURE — same as firmware.zip: shift the INMP441 word and store it
+// AUDIO CAPTURE — firmware.zip: shift the INMP441 word and store it
 // ============================================================
 
 static void audioCaptureTask(void *) {
   const size_t RAW_N = 256;
-  static int32_t raw[RAW_N];
-  static int16_t pcm[RAW_N];
+  int32_t raw[RAW_N];
+  int16_t pcm[RAW_N];
   for (;;) {
     bool need = streamEnabled || audioEnabled || videoEnabled;
     if (!need || !audioRing) {
@@ -598,7 +590,7 @@ static bool initCam() {
   c.pixel_format = PIXFORMAT_JPEG;
   c.frame_size = FRAMESIZE_VGA;
   c.jpeg_quality = JPEG_QUALITY;
-  c.fb_count = 3;
+  c.fb_count = 2;
   c.grab_mode = CAMERA_GRAB_LATEST;
   c.fb_location = CAMERA_FB_IN_PSRAM;
 
@@ -614,20 +606,11 @@ static bool initCam() {
     s->set_contrast(s, 0);
     s->set_saturation(s, 0);
     s->set_framesize(s, FRAMESIZE_VGA);
-    s->set_quality(s, JPEG_QUALITY);
     s->set_vflip(s, CAM_VFLIP);
     s->set_hmirror(s, CAM_HMIRROR);
-    s->set_gainceiling(s, GAINCEILING_16X);
-    s->set_aec2(s, 0);  // no auto frame-rate drop in dim rooms
-    s->set_ae_level(s, -1);
-    s->set_dcw(s, 1);
-    s->set_special_effect(s, 0); // color until GPIO 14 night vision
-    s->set_whitebal(s, 1);
-    s->set_awb_gain(s, 1);
-    s->set_saturation(s, 0);
   }
 
-  Serial.printf("[CAM] VGA %dx%d JPEG q=%d @ %d FPS (full FOV)\n",
+  Serial.printf("[CAM] VGA %dx%d JPEG q=%d @ %d FPS (firmware.zip capture)\n",
                 STREAM_WIDTH, STREAM_HEIGHT, JPEG_QUALITY, STREAM_FPS);
   return true;
 }
@@ -710,9 +693,8 @@ static void audioTxTask(void *) {
       vTaskDelay(pdMS_TO_TICKS(ringCount() >= (size_t)AUDIO_TX_SAMPLES ? 1 : 15));
       continue;
     }
-    // Socket down: throw the backlog away instead of opening an HTTP
-    // connection per chunk. Stale audio would only replay as delay later.
-    ringClear();
+    // Zip drained the ring over HTTP when the socket was down.
+    sendAudioChunk();
     vTaskDelay(pdMS_TO_TICKS(20));
   }
 }

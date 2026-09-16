@@ -495,6 +495,46 @@ class FaceEngine:
                 pass
         return True
 
+    def delete_captures(self, ids: list[str]) -> int:
+        want = {str(i) for i in ids if i}
+        if not want:
+            return 0
+        dropped: list[dict] = []
+        with self._lock:
+            kept: list[dict] = []
+            for c in self.captures:
+                if str(c.get("id") or "") in want:
+                    dropped.append(c)
+                else:
+                    kept.append(c)
+            if not dropped:
+                return 0
+            self.captures = kept
+            self._save_index()
+            self._save_registry()
+            self._rebuild_gallery()
+        self._delete_files(dropped)
+        return len(dropped)
+
+    def delete_unlabeled_for_device(self, device: str) -> int:
+        dropped: list[dict] = []
+        with self._lock:
+            kept: list[dict] = []
+            for c in self.captures:
+                same = (not device) or str(c.get("device") or "") == device
+                if same and not self._is_labeled(c):
+                    dropped.append(c)
+                else:
+                    kept.append(c)
+            if not dropped:
+                return 0
+            self.captures = kept
+            self._save_index()
+            self._save_registry()
+            self._rebuild_gallery()
+        self._delete_files(dropped)
+        return len(dropped)
+
     def unregister_label(self, label: str) -> int:
         n = 0
         with self._lock:
