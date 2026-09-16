@@ -18,10 +18,9 @@
 #define AP_CHANNEL      1
 
 // HTTP API (session/state)
-// Starting guess only. The laptop gets its IP from DHCP, so the firmware
-// probes /health and scans the local /24 when this address stops answering.
-#define SERVER_HOST     "172.16.23.135"
-#define SERVER_PORT     2222
+// Public VPS. Local /24 scan is only a fallback if this host is unreachable.
+#define SERVER_HOST     "45.250.101.17"
+#define SERVER_PORT     7890
 #define SERVER_WS_PATH  "/ws/device"
 
 #define DEVICE_ID       "bodycam-01"

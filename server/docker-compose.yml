@@ -25,8 +25,7 @@ services:
       # ESP32-S3-CAM dipasang horizontal → putar frame agar tegak (0/90/180/270)
       CAMERA_ROTATE: "270"
     ports:
-      - "8089:8080"
-      - "2222:8080"
+      - "7890:8080"
     volumes:
       - ./data:/data
 

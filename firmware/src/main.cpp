@@ -348,10 +348,23 @@ static bool probeHost(const String &ip, uint32_t connectMs) {
 
 // The laptop's DHCP lease changes, which used to kill the link until the
 // firmware was reflashed. Scan our own /24 for the gateway and remember it.
+static void rememberServerHost(const String &ip) {
+  if (!ip.length() || ip == serverHost) return;
+  serverHost = ip;
+  prefs.begin("bodycam", false);
+  prefs.putString("srv", ip);
+  prefs.end();
+}
+
 static bool discoverServer() {
   if (WiFi.status() != WL_CONNECTED) return false;
-  if (serverHost.length() && probeHost(serverHost, 600)) {
+  if (serverHost.length() && probeHost(serverHost, 800)) {
     Serial.printf("[NET] server ok at %s:%d\n", serverHost.c_str(), SERVER_PORT);
+    return true;
+  }
+  if (String(SERVER_HOST) != serverHost && probeHost(SERVER_HOST, 1200)) {
+    rememberServerHost(SERVER_HOST);
+    Serial.printf("[NET] server ok at %s:%d\n", SERVER_HOST, SERVER_PORT);
     return true;
   }
   IPAddress me = WiFi.localIP();
@@ -361,15 +374,12 @@ static bool discoverServer() {
     if (i == me[3]) continue;
     String ip = prefix + String(i);
     if (probeHost(ip, 120)) {
-      serverHost = ip;
-      prefs.begin("bodycam", false);
-      prefs.putString("srv", ip);
-      prefs.end();
+      rememberServerHost(ip);
       Serial.printf("[NET] gateway found at %s:%d\n", ip.c_str(), SERVER_PORT);
       return true;
     }
   }
-  Serial.println("[NET] gateway not found on this subnet");
+  Serial.println("[NET] gateway not found");
   return false;
 }
 
