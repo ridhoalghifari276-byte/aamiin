@@ -20,6 +20,9 @@ services:
       - ai-service
     environment:
       BODYCAM_TOKEN: X01040688
+      # Other apps: live video/audio per bodycam. Not the device ingest token.
+      BODYCAM_API_TOKEN: BC-LIVE-K8m2Qp4nR7xW
+      BODYCAM_API_TOKENS: '{"bodycam-01":"BC-01-n4T8vL2qH9cF","bodycam-02":"BC-02-w6Y1dM5sJ3bA","bodycam-03":"BC-03-p7C0kR8uE2gZ"}'
       DATA_DIR: /data
       AI_URL: http://ai-service:8001
       # ESP32-S3-CAM dipasang horizontal → putar frame agar tegak (0/90/180/270)

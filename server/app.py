@@ -1,4 +1,5 @@
 from fastapi import FastAPI, Request, Header, HTTPException, WebSocket, WebSocketDisconnect, File, Form, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse, FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pathlib import Path
@@ -13,10 +14,47 @@ import numpy as np
 from faces import FaceEngine
 
 app = FastAPI(title="ESP32-S3 Bodycam Gateway")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["GET", "HEAD", "OPTIONS"],
+    allow_headers=["Authorization", "X-Api-Token", "Content-Type"],
+)
 BASE = Path(os.getenv("DATA_DIR", "/data"))
 BASE.mkdir(parents=True, exist_ok=True)
 STATIC = Path(__file__).resolve().parent / "static"
 TOKEN = os.getenv("BODYCAM_TOKEN", "CHANGE_ME")
+# Separate from the device ingest token. Other apps use this to read live A/V.
+API_TOKEN = os.getenv("BODYCAM_API_TOKEN", "").strip()
+
+
+def _parse_device_api_tokens() -> dict[str, str]:
+    raw = os.getenv("BODYCAM_API_TOKENS", "").strip()
+    if not raw:
+        return {}
+    try:
+        if raw.startswith("{"):
+            data = json.loads(raw)
+            return {
+                str(k).strip(): str(v).strip()
+                for k, v in data.items()
+                if str(k).strip() and str(v).strip()
+            }
+    except Exception:
+        pass
+    out: dict[str, str] = {}
+    for part in raw.split(","):
+        part = part.strip()
+        if ":" not in part:
+            continue
+        key, val = part.split(":", 1)
+        key, val = key.strip(), val.strip()
+        if key and val:
+            out[key] = val
+    return out
+
+
+DEVICE_API_TOKENS = _parse_device_api_tokens()
 SAMPLE_RATE = 16000
 # Bodycam mounted horizontally: rotate JPEG so upright (0 / 90 / 180 / 270).
 CAMERA_ROTATE = int(os.getenv("CAMERA_ROTATE", "270")) % 360
@@ -290,6 +328,44 @@ def extract_thumb_from_mp4(item: dict) -> str | None:
 def auth(device, token):
     if not device or token != TOKEN:
         raise HTTPException(401, "unauthorized")
+
+
+def _bearer(authorization: str | None) -> str:
+    if authorization and authorization.lower().startswith("bearer "):
+        return authorization[7:].strip()
+    return ""
+
+
+def _incoming_api_token(
+    token: str | None = None,
+    x_api_token: str | None = None,
+    authorization: str | None = None,
+) -> str:
+    return (token or x_api_token or _bearer(authorization) or "").strip()
+
+
+def resolve_api_scope(token: str, device: str | None = None) -> str:
+    """Return 'all' or a device id. External apps only — never the ESP ingest token."""
+    token = (token or "").strip()
+    if not token:
+        raise HTTPException(401, "missing api token")
+    if API_TOKEN and token == API_TOKEN:
+        return "all"
+    bound = next((d for d, t in DEVICE_API_TOKENS.items() if t == token), None)
+    if not bound:
+        raise HTTPException(401, "unauthorized")
+    if device and device != bound:
+        raise HTTPException(403, "token not valid for this device")
+    return bound
+
+
+def ext_unit(scope: str, device: str | None) -> str:
+    if scope != "all":
+        return scope
+    unit = (device or "").strip()
+    if not unit:
+        raise HTTPException(400, "device required")
+    return unit
 
 
 def write_wav(path: Path, pcm: bytes, rate: int = SAMPLE_RATE):
@@ -825,6 +901,10 @@ def load_index():
     face_engine = FaceEngine(BASE)
     threading.Thread(target=ingest_loop, name="frame-ingest", daemon=True).start()
     print("[face] engine ready", flush=True)
+    if API_TOKEN or DEVICE_API_TOKENS:
+        print("[api] external live API enabled at /api/v1/ext", flush=True)
+    else:
+        print("[api] BODYCAM_API_TOKEN not set — /api/v1/ext is closed", flush=True)
 
 
 @app.get("/health")
@@ -1584,6 +1664,205 @@ async def pcm_stream(device: str = "bodycam-01", raw: int = 0):
             "X-Audio-Channels": "1",
         },
     )
+
+
+@app.get("/api/v1/ext")
+def ext_catalog():
+    """How other apps pull live bodycam data. Does not reveal tokens."""
+    host = "http://45.250.101.17:7890"
+    return {
+        "ok": True,
+        "auth": {
+            "header": "X-Api-Token: <token>",
+            "bearer": "Authorization: Bearer <token>",
+            "query": "?token=<token>  (required for <img>, MJPEG, WebSocket)",
+        },
+        "tokens": {
+            "master": "BODYCAM_API_TOKEN — all bodycams",
+            "per_device": "BODYCAM_API_TOKENS — one token per bodycam-01/02/03",
+        },
+        "endpoints": {
+            "devices": "GET /api/v1/ext/devices",
+            "state": "GET /api/v1/ext/state?device=bodycam-01",
+            "snapshot": "GET /api/v1/ext/latest.jpg?device=bodycam-01",
+            "mjpeg": "GET /api/v1/ext/mjpeg?device=bodycam-01",
+            "pcm": "GET /api/v1/ext/pcm?device=bodycam-01",
+            "video_ws": "WS /ws/ext/live?device=bodycam-01&token=<token>",
+            "audio_ws": "WS /ws/ext/audio?device=bodycam-01&token=<token>",
+        },
+        "examples": {
+            "list": f"curl -H 'X-Api-Token: TOKEN' {host}/api/v1/ext/devices",
+            "snapshot": f"curl -H 'X-Api-Token: TOKEN' -o live.jpg '{host}/api/v1/ext/latest.jpg?device=bodycam-01'",
+            "mjpeg": f"{host}/api/v1/ext/mjpeg?device=bodycam-01&token=TOKEN",
+            "video_ws": f"ws://45.250.101.17:7890/ws/ext/live?device=bodycam-01&token=TOKEN",
+            "audio_ws": f"ws://45.250.101.17:7890/ws/ext/audio?device=bodycam-01&token=TOKEN",
+        },
+        "video_ws_format": "binary 0x01 + JPEG bytes; text JSON {t:cfg|faces,...}",
+        "audio_format": "raw PCM s16le mono 16000 Hz",
+    }
+
+
+@app.get("/api/v1/ext/devices")
+def ext_devices(
+    token: str | None = None,
+    x_api_token: str | None = Header(None),
+    authorization: str | None = Header(None),
+):
+    scope = resolve_api_scope(_incoming_api_token(token, x_api_token, authorization))
+    with lock:
+        known = set(online_ids()) | set(latest.keys()) | set(device_state.keys())
+        if scope != "all":
+            known = {scope} if scope in known else {scope}
+        now = time.time()
+        items = []
+        for device in sorted(known):
+            ts = latest_ts.get(device, 0.0)
+            st = device_state.get(device) or {}
+            age = round(now - ts, 2) if ts else None
+            online = bool(ts and (now - ts) <= ONLINE_TTL)
+            if not online and st.get("ts"):
+                online = (now - float(st["ts"])) <= ONLINE_TTL
+            items.append({
+                "id": device,
+                "online": online,
+                "has_video": bool(latest.get(device) and ts and (now - ts) <= ONLINE_TTL),
+                "age_s": age,
+                "state": {
+                    "stream": bool(st.get("stream")),
+                    "audio": bool(st.get("audio")),
+                    "video": bool(st.get("video")),
+                    "nightvision": bool(st.get("nightvision")),
+                    "rssi": st.get("rssi"),
+                },
+            })
+    return {"ok": True, "devices": items}
+
+
+@app.get("/api/v1/ext/state")
+def ext_state(
+    device: str | None = None,
+    token: str | None = None,
+    x_api_token: str | None = Header(None),
+    authorization: str | None = Header(None),
+):
+    scope = resolve_api_scope(_incoming_api_token(token, x_api_token, authorization), device)
+    unit = ext_unit(scope, device)
+    return get_device_state(unit)
+
+
+@app.get("/api/v1/ext/latest.jpg")
+def ext_latest_jpg(
+    device: str | None = None,
+    annotate: int = 0,
+    token: str | None = None,
+    x_api_token: str | None = Header(None),
+    authorization: str | None = Header(None),
+):
+    scope = resolve_api_scope(_incoming_api_token(token, x_api_token, authorization), device)
+    unit = ext_unit(scope, device)
+    return latest_jpg(unit, annotate)
+
+
+@app.get("/api/v1/ext/mjpeg")
+async def ext_mjpeg(
+    device: str | None = None,
+    annotate: int = 0,
+    token: str | None = None,
+    x_api_token: str | None = Header(None),
+    authorization: str | None = Header(None),
+):
+    scope = resolve_api_scope(_incoming_api_token(token, x_api_token, authorization), device)
+    unit = ext_unit(scope, device)
+    return await mjpeg(unit, annotate)
+
+
+@app.get("/api/v1/ext/pcm")
+async def ext_pcm(
+    device: str | None = None,
+    raw: int = 0,
+    token: str | None = None,
+    x_api_token: str | None = Header(None),
+    authorization: str | None = Header(None),
+):
+    scope = resolve_api_scope(_incoming_api_token(token, x_api_token, authorization), device)
+    unit = ext_unit(scope, device)
+    return await pcm_stream(unit, raw)
+
+
+@app.websocket("/ws/ext/live")
+async def ws_ext_live(websocket: WebSocket, device: str = "bodycam-01"):
+    await websocket.accept()
+    token = websocket.query_params.get("token") or websocket.headers.get("x-api-token") or _bearer(
+        websocket.headers.get("authorization")
+    )
+    try:
+        scope = resolve_api_scope(token, device)
+        unit = ext_unit(scope, device)
+    except HTTPException:
+        await websocket.close(code=4401)
+        return
+    await websocket.send_text(
+        json.dumps({"t": "cfg", "rotate": CAMERA_ROTATE, "device": unit}, separators=(",", ":"))
+    )
+    last_jpeg_ts = -1.0
+    last_overlay = ""
+    try:
+        while True:
+            t0 = time.monotonic()
+            with lock:
+                jpeg = latest.get(unit)
+                jpeg_ts = latest_ts.get(unit, 0.0)
+            if jpeg is not None and jpeg_ts > 0 and jpeg_ts != last_jpeg_ts:
+                await websocket.send_bytes(b"\x01" + jpeg)
+                last_jpeg_ts = jpeg_ts
+                if face_engine:
+                    ov = face_engine.live_overlay(unit)
+                    blob = json.dumps({"t": "faces", **ov}, separators=(",", ":"))
+                    if blob != last_overlay:
+                        last_overlay = blob
+                        await websocket.send_text(blob)
+            elapsed = time.monotonic() - t0
+            await asyncio.sleep(max(0.0, 0.005 - elapsed))
+    except WebSocketDisconnect:
+        return
+    except Exception:
+        return
+
+
+@app.websocket("/ws/ext/audio")
+async def ws_ext_audio(websocket: WebSocket, device: str = "bodycam-01", raw: int = 0):
+    await websocket.accept()
+    token = websocket.query_params.get("token") or websocket.headers.get("x-api-token") or _bearer(
+        websocket.headers.get("authorization")
+    )
+    try:
+        scope = resolve_api_scope(token, device)
+        unit = ext_unit(scope, device)
+    except HTTPException:
+        await websocket.close(code=4401)
+        return
+    ring = audio_raw if raw else audio_live
+    last_seq = 0
+    primed = False
+    try:
+        while True:
+            with lock:
+                buf = list(ring.get(unit, ()))
+            if buf:
+                if not primed:
+                    last_seq = buf[-1][0] - 1
+                    primed = True
+                elif buf[-1][0] - last_seq > 5:
+                    last_seq = buf[-1][0] - 1
+                for seq, chunk in buf:
+                    if seq > last_seq:
+                        await websocket.send_bytes(chunk)
+                        last_seq = seq
+            await asyncio.sleep(0.004)
+    except WebSocketDisconnect:
+        return
+    except Exception:
+        return
 
 
 @app.get("/")
