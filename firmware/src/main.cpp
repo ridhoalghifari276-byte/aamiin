@@ -109,16 +109,17 @@ static void applyCamNight(bool on) {
     s->set_raw_gma(s, 1);
     s->set_dcw(s, 1);
   } else {
-    // firmware.zip daytime capture: auto AE/AWB, no forced gain-ceiling.
+    // Outdoor / running: short exposure so motion does not smear, AGC for
+    // brightness instead of dropping the frame rate (aec2).
     s->set_gain_ctrl(s, 1);
     s->set_exposure_ctrl(s, 1);
     s->set_aec2(s, 0);
-    s->set_gainceiling(s, GAINCEILING_2X);
+    s->set_gainceiling(s, GAINCEILING_16X);
     s->set_agc_gain(s, 0);
-    s->set_aec_value(s, 300);
-    s->set_ae_level(s, 0);
+    s->set_aec_value(s, 180);
+    s->set_ae_level(s, -1);
     s->set_brightness(s, 0);
-    s->set_contrast(s, 0);
+    s->set_contrast(s, 1);
     s->set_saturation(s, 0);
     s->set_whitebal(s, 1);
     s->set_awb_gain(s, 1);
@@ -129,6 +130,8 @@ static void applyCamNight(bool on) {
     s->set_hmirror(s, CAM_HMIRROR);
     s->set_raw_gma(s, 1);
     s->set_lenc(s, 1);
+    s->set_bpc(s, 0);
+    s->set_wpc(s, 1);
     s->set_dcw(s, 1);
   }
   nightIr(on);
@@ -388,6 +391,7 @@ static void loadServerHost() {
 static void startWebSocket() {
   if (WiFi.status() != WL_CONNECTED) return;
   if (wsStarted) return;
+  if (!serverHost.length()) return;
 
   String path = String(SERVER_WS_PATH) +
                 "?device=" + deviceId +
@@ -462,17 +466,32 @@ static bool sendAudioChunk() {
   return false;
 }
 
-static bool sendVideoFrame() {
-  if (!wsConnected || !visualOn()) return false;
+static void drainCamFb() {
+  camera_fb_t *fb = esp_camera_fb_get();
+  if (fb) esp_camera_fb_return(fb);
+}
 
+static bool sendVideoFrame() {
+  // Grab + free the sensor buffer BEFORE sendBIN. Holding the FB across a
+  // WebSocket write is what caused cam_hal FB-OVF and NO SIGNAL.
   camera_fb_t *fb = esp_camera_fb_get();
   if (!fb) {
     ++txVideoDrops;
     return false;
   }
-
-  bool ok = sendWsPacket(0x01, fb->buf, fb->len);
+  size_t len = fb->len;
+  bool copy_ok = wsConnected && visualOn() && txPacket &&
+                 len > 128 && len + 1 <= txPacketCap;
+  if (copy_ok) {
+    txPacket[0] = 0x01;
+    memcpy(txPacket + 1, fb->buf, len);
+  }
   esp_camera_fb_return(fb);
+  if (!copy_ok) {
+    ++txVideoDrops;
+    return false;
+  }
+  bool ok = streamWs.sendBIN(txPacket, len + 1);
   if (ok) ++txVideoFrames;
   else ++txVideoDrops;
   return ok;
@@ -512,11 +531,18 @@ static void audioCaptureTask(void *) {
     esp_err_t e = i2s_read(I2S_NUM_0, raw, sizeof(raw), &bytes, pdMS_TO_TICKS(100));
     if (e != ESP_OK || bytes < sizeof(int32_t)) continue;
     size_t n = bytes / sizeof(int32_t);
+    // Outdoor wind rumble sits below ~100 Hz. Cut it on-device so the
+    // live feed is speech, not road/wind noise. R ≈ 0.961 at 16 kHz.
+    static int32_t hpX = 0;
+    static int32_t hpY = 0;
     for (size_t i = 0; i < n; i++) {
       int32_t s = raw[i] >> MIC_SHIFT;
-      if (s > 32767) s = 32767;
-      if (s < -32768) s = -32768;
-      pcm[i] = (int16_t)s;
+      int32_t y = s - hpX + ((hpY * 246) >> 8);
+      hpX = s;
+      hpY = y;
+      if (y > 32767) y = 32767;
+      if (y < -32768) y = -32768;
+      pcm[i] = (int16_t)y;
     }
     ringPush(pcm, n);
   }
@@ -590,7 +616,7 @@ static bool initCam() {
   c.pixel_format = PIXFORMAT_JPEG;
   c.frame_size = FRAMESIZE_VGA;
   c.jpeg_quality = JPEG_QUALITY;
-  c.fb_count = 2;
+  c.fb_count = 3;
   c.grab_mode = CAMERA_GRAB_LATEST;
   c.fb_location = CAMERA_FB_IN_PSRAM;
 
@@ -603,14 +629,22 @@ static bool initCam() {
   sensor_t *s = esp_camera_sensor_get();
   if (s) {
     s->set_brightness(s, 0);
-    s->set_contrast(s, 0);
+    s->set_contrast(s, 1);
     s->set_saturation(s, 0);
     s->set_framesize(s, FRAMESIZE_VGA);
+    s->set_quality(s, JPEG_QUALITY);
     s->set_vflip(s, CAM_VFLIP);
     s->set_hmirror(s, CAM_HMIRROR);
+    s->set_gainceiling(s, GAINCEILING_16X);
+    s->set_aec2(s, 0);
+    s->set_ae_level(s, -1);
+    s->set_whitebal(s, 1);
+    s->set_awb_gain(s, 1);
+    s->set_dcw(s, 1);
+    s->set_special_effect(s, 0);
   }
 
-  Serial.printf("[CAM] VGA %dx%d JPEG q=%d @ %d FPS (firmware.zip capture)\n",
+  Serial.printf("[CAM] VGA %dx%d JPEG q=%d @ %d FPS (outdoor / run-stable)\n",
                 STREAM_WIDTH, STREAM_HEIGHT, JPEG_QUALITY, STREAM_FPS);
   return true;
 }
@@ -761,6 +795,7 @@ static void streamTxTask(void *) {
 
     if (WiFi.status() != WL_CONNECTED) {
       stopWebSocket();
+      drainCamFb();
       vTaskDelay(pdMS_TO_TICKS(200));
       continue;
     }
@@ -768,17 +803,21 @@ static void streamTxTask(void *) {
     startWebSocket();
 
     if (!wsConnected) {
+      drainCamFb();
       vTaskDelay(pdMS_TO_TICKS(50));
       continue;
     }
 
     uint32_t now = millis();
-    if (visualOn() && (int32_t)(now - nextFrame) >= 0) {
-      nextFrame += framePeriod;
-      if ((int32_t)(now - nextFrame) > (int32_t)(framePeriod * 2)) {
-        nextFrame = now + framePeriod;
-      }
+    if ((int32_t)(now - nextFrame) >= 0) {
+      uint32_t t0 = now;
       sendVideoFrame();
+      now = millis();
+      nextFrame = t0 + framePeriod;
+      if ((int32_t)(now - nextFrame) >= 0) {
+        // WAN slower than the target FPS: send the next (latest) frame now.
+        nextFrame = now;
+      }
     }
 
     now = millis();
@@ -813,17 +852,9 @@ void setup() {
   if (!initCam()) rgb(255, 0, 255);
   nightVision = false;
   applyCamNight(false);
-  initMic();
-  loadServerHost();
-  discoverServer();
 
-  streamEnabled = true;
-  nightVision = false;
-  applyCamNight(false);
-  btnIgnoreUntil = millis() + 1200;
-  stateLed();
-  postDeviceState();
-
+  // Drain the sensor immediately so DMA cannot overflow while we wait on
+  // the public gateway (discoverServer used to block with nobody grabbing).
   txPacketCap = 96 * 1024;
   txPacket = (uint8_t *)heap_caps_malloc(txPacketCap, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
   if (!txPacket) {
@@ -834,9 +865,20 @@ void setup() {
     txPacketCap = 0;
     Serial.println("[WS] tx buffer alloc failed");
   }
+  streamEnabled = true;
+  xTaskCreatePinnedToCore(streamTxTask, "streamtx", 12288, nullptr, 4, nullptr, 1);
+
+  initMic();
+  loadServerHost();
+  discoverServer();
+
+  nightVision = false;
+  applyCamNight(false);
+  btnIgnoreUntil = millis() + 1200;
+  stateLed();
+  postDeviceState();
 
   xTaskCreatePinnedToCore(audioTxTask, "audiotx", 8192, nullptr, 5, nullptr, 0);
-  xTaskCreatePinnedToCore(streamTxTask, "streamtx", 12288, nullptr, 4, nullptr, 1);
   xTaskCreatePinnedToCore(houseKeepTask, "house", 8192, nullptr, 1, nullptr, 0);
 
   led(false);

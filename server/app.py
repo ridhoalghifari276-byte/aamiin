@@ -530,33 +530,32 @@ def ensure_record_session(device: str, session_id: str | None, mode: str | None)
 
 
 class VoiceChain:
-    """Hard noise gate: speech passes, pauses are digital zeros.
+    """Outdoor bodycam voice: cut wind rumble, keep speech, duck noise.
 
-    The louder someone talks, the louder a leftover tail is. Ducking that
-    tail 28 dB still leaves a hum that tracks how hard they spoke. The only
-    level that cannot do that is zero. No AGC, no 3-pole high-pass (both
-    rang after a shout and scaled with it). Gate math is 20 ms blocks so a
-    125 ms device packet cannot retune the hangover.
+    Hard-zero + OPEN_RMS=1000 swallowed quiet speech and chopped words.
+    Outdoor running needs the opposite: a ~100 Hz high-pass, a low open
+    threshold, hang between syllables, and a floor duck (not digital mute).
     """
 
     BLOCK = 320
-    OPEN_RMS = 1000.0
-    # Below this fraction of the recent peak it is the decaying tail of the
-    # last shout, not a new word — even if it is still loud in absolute RMS.
-    TAIL_FRAC = 0.35
-    HANG_BLOCKS = 16  # 320 ms, covers gaps between words, not a pause
+    OPEN_RMS = 220.0
+    HANG_BLOCKS = 12  # 240 ms covers gaps between words
+    TARGET = 4800.0
+    HP_R = 0.961  # ~100 Hz at 16 kHz
     CEILING = 26000.0
+    NOISE_DUCK = 0.12
 
     def __init__(self, rate: int = SAMPLE_RATE):
         self.pending = np.zeros(0, dtype=np.float32)
+        self.hp_x = 0.0
+        self.hp_y = 0.0
         self.peak = 0.0
         self.hang = 0
-        self.gate = 0.0
-        # Names the tuner still prints.
-        self.gain = 1.0
-        self.duck = 0.0
+        self.gate = 1.0
+        self.gain = 2.2
+        self.duck = 1.0
         self.speech = 0.0
-        self.floor = 0.0
+        self.floor = 80.0
 
     def process(self, pcm: bytes) -> bytes:
         if not pcm or len(pcm) < 4:
@@ -564,7 +563,7 @@ class VoiceChain:
         x = np.frombuffer(pcm, dtype="<i2")
         if x.size == 0:
             return pcm
-        y = x.astype(np.float32)
+        y = self._hpf(x.astype(np.float32))
         if self.pending.size:
             y = np.concatenate((self.pending, y))
         full = (y.size // self.BLOCK) * self.BLOCK
@@ -574,54 +573,55 @@ class VoiceChain:
         out = np.empty(full, dtype=np.float32)
         for i in range(0, full, self.BLOCK):
             out[i : i + self.BLOCK] = self._gate(y[i : i + self.BLOCK])
-        if self.gate <= 0.0:
-            # Drop a leftover fragment so it cannot play as a pitched tail
-            # the next time a packet arrives.
-            self.pending = np.zeros(0, dtype=np.float32)
-        return np.clip(out, -32768, 32767).astype("<i2").tobytes()
+        return np.clip(out, -self.CEILING, self.CEILING).astype("<i2").tobytes()
+
+    def _hpf(self, x: np.ndarray) -> np.ndarray:
+        y = np.empty_like(x)
+        px, py = self.hp_x, self.hp_y
+        r = self.HP_R
+        for i, v in enumerate(x):
+            ny = float(v) - px + r * py
+            y[i] = ny
+            px, py = float(v), ny
+        self.hp_x, self.hp_y = px, py
+        return y
 
     def _gate(self, y: np.ndarray) -> np.ndarray:
         n = y.size
-        rms = float(np.sqrt(np.mean(y * y)))
+        rms = float(np.sqrt(np.mean(y * y))) + 1e-6
+        if rms < self.floor:
+            self.floor += (rms - self.floor) * 0.18
+        else:
+            self.floor += (rms - self.floor) * 0.012
+        self.floor = max(40.0, min(self.floor, 900.0))
+
         if rms > self.peak:
             self.peak = rms
         else:
-            self.peak *= 0.97
+            self.peak *= 0.96
 
-        is_speech = (
-            rms >= self.OPEN_RMS
-            and rms >= self.TAIL_FRAC * max(self.peak, self.OPEN_RMS)
-        )
+        open_at = max(self.OPEN_RMS, self.floor * 2.4)
+        is_speech = rms >= open_at
         if is_speech:
             self.hang = self.HANG_BLOCKS
             self.speech = rms
+            want = 1.0
+            want_g = min(5.5, max(1.6, self.TARGET / rms))
         elif self.hang > 0:
             self.hang -= 1
+            want = 1.0
+            want_g = self.gain
         else:
-            self.peak *= 0.80
+            want = self.NOISE_DUCK
+            want_g = 1.3
 
-        want = 1.0 if (is_speech or self.hang > 0) else 0.0
-        if want > self.gate:
-            gate_n = self.gate + (1.0 - self.gate) * 0.75
-            if gate_n > 0.98:
-                gate_n = 1.0
-        elif want <= 0.0:
-            gate_n = self.gate * 0.15
-            if gate_n < 0.01:
-                gate_n = 0.0
-        else:
-            gate_n = self.gate
-
+        alpha = 0.55 if want > self.gate else 0.22
+        gate_n = self.gate + (want - self.gate) * alpha
+        self.gain += (want_g - self.gain) * 0.08
         self.duck = gate_n
-        self.gain = 1.0
-        self.floor = rms
-        if gate_n <= 0.0:
-            self.gate = 0.0
-            return np.zeros(n, dtype=np.float32)
-
         ramp = np.linspace(self.gate, gate_n, n, dtype=np.float32)
         self.gate = gate_n
-        return y * ramp
+        return y * ramp * self.gain
 
 
 class GapFiller:
@@ -716,9 +716,11 @@ _gap_fillers: dict[str, GapFiller] = {}
 
 
 def clean_pcm(device: str, data: bytes) -> bytes:
-    # firmware.zip posted the mic samples as-is. The noise gate (OPEN_RMS=1000)
-    # was swallowing quiet speech, which is why live audio sounded empty/choppy.
-    return data
+    chain = _voice_chains.get(device)
+    if chain is None:
+        chain = VoiceChain()
+        _voice_chains[device] = chain
+    return chain.process(data)
 
 
 def append_pcm(device: str, data: bytes, session_id: str | None, session_mode: str | None = None):

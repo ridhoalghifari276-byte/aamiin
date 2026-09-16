@@ -49,13 +49,13 @@
 #define CAM_HMIRROR     0
 
 // ============================================================
-// VIDEO - same capture as firmware.zip: VGA JPEG q=12 @ 12 FPS.
-// Transport stays WebSocket (0x01 + JPEG). Audio stays on /ws/audio.
+// VIDEO — outdoor bodycam. Small JPEGs so FPS stays steady while running
+// over public Wi-Fi. q=12 overflowed the camera (FB-OVF / NO SIGNAL).
 // ============================================================
 #define STREAM_WIDTH    640
 #define STREAM_HEIGHT   480
-#define JPEG_QUALITY    12
-#define STREAM_FPS      12
+#define JPEG_QUALITY    28
+#define STREAM_FPS      15
 
 // ============================================================
 // INMP441
