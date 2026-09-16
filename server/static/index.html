@@ -1,0 +1,2623 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>BODYCAM // COMMAND CENTER</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@500;700&family=Rajdhani:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <style>
+    :root {
+      --bg0: #05080d;
+      --bg1: #0a121c;
+      --panel: rgba(8, 18, 28, 0.92);
+      --line: #1a3a4a;
+      --cyan: #2ee6d6;
+      --cyan-dim: #1a8f85;
+      --amber: #f0b429;
+      --red: #ff4d6a;
+      --green: #3dff9a;
+      --text: #d7f6f2;
+      --muted: #6f93a0;
+      --hud: rgba(46, 230, 214, 0.12);
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body { height: 100%; }
+    body {
+      font-family: "Rajdhani", system-ui, sans-serif;
+      color: var(--text);
+      background:
+        radial-gradient(1200px 600px at 10% -10%, rgba(46, 230, 214, 0.08), transparent 55%),
+        radial-gradient(900px 500px at 100% 0%, rgba(240, 180, 41, 0.05), transparent 50%),
+        linear-gradient(180deg, var(--bg1), var(--bg0));
+      overflow: hidden;
+    }
+    body::before {
+      content: "";
+      pointer-events: none;
+      position: fixed; inset: 0;
+      background: repeating-linear-gradient(
+        0deg,
+        transparent,
+        transparent 2px,
+        rgba(0, 0, 0, 0.12) 2px,
+        rgba(0, 0, 0, 0.12) 4px
+      );
+      opacity: 0.35;
+      z-index: 50;
+    }
+
+    .shell {
+      height: 100%;
+      display: grid;
+      grid-template-rows: 64px 1fr 28px;
+      position: relative;
+      z-index: 1;
+    }
+
+    /* TOP BAR */
+    .topbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 1rem;
+      padding: 0 1.25rem;
+      border-bottom: 1px solid var(--line);
+      background: linear-gradient(180deg, rgba(10, 22, 32, 0.95), rgba(5, 10, 16, 0.85));
+      backdrop-filter: blur(8px);
+    }
+    .brand {
+      display: flex;
+      align-items: baseline;
+      gap: 0.75rem;
+    }
+    .brand h1 {
+      font-family: "Orbitron", sans-serif;
+      font-size: 1rem;
+      letter-spacing: 0.18em;
+      color: var(--cyan);
+      text-transform: uppercase;
+    }
+    .brand .tag {
+      font-size: 0.75rem;
+      letter-spacing: 0.2em;
+      color: var(--muted);
+      text-transform: uppercase;
+    }
+    .top-meta {
+      display: flex;
+      align-items: center;
+      gap: 1rem;
+      font-size: 0.85rem;
+      letter-spacing: 0.08em;
+      color: var(--muted);
+    }
+    .clock {
+      font-family: "Orbitron", sans-serif;
+      color: var(--text);
+      font-size: 0.95rem;
+      letter-spacing: 0.12em;
+    }
+    .sys-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.4rem;
+      border: 1px solid var(--line);
+      padding: 0.25rem 0.65rem;
+      background: var(--hud);
+      color: var(--cyan);
+      text-transform: uppercase;
+      font-size: 0.72rem;
+      letter-spacing: 0.14em;
+    }
+    .sys-pill .dot {
+      width: 7px; height: 7px; border-radius: 50%;
+      background: var(--green);
+      box-shadow: 0 0 10px var(--green);
+      animation: blink 1.6s ease-in-out infinite;
+    }
+    @keyframes blink {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.35; }
+    }
+
+    /* MAIN */
+    .main {
+      display: grid;
+      grid-template-columns: 220px 1fr 300px;
+      min-height: 0;
+      height: 100%;
+    }
+    .main[data-view="videos"],
+    .main[data-view="faces"],
+    .main[data-view="registry"] {
+      grid-template-columns: 220px 1fr;
+    }
+    .main[data-view="videos"] .rail-right,
+    .main[data-view="faces"] .rail-right,
+    .main[data-view="registry"] .rail-right,
+    .main[data-view="videos"] .stage,
+    .main[data-view="faces"] .stage,
+    .main[data-view="registry"] .stage { display: none; }
+    .page-view {
+      display: none !important;
+      min-height: 0;
+      overflow: auto;
+      padding: 1rem 1.25rem;
+    }
+    .page-view h2 {
+      font-family: "Orbitron", sans-serif;
+      font-size: 0.78rem;
+      letter-spacing: 0.18em;
+      color: var(--cyan);
+      text-transform: uppercase;
+      margin-bottom: 0.65rem;
+    }
+    .main[data-view="videos"] #view-videos,
+    .main[data-view="faces"] #view-faces,
+    .main[data-view="registry"] #view-registry {
+      display: block !important;
+    }
+    .side-nav { display: flex; flex-direction: column; gap: 0.4rem; }
+    .nav-btn {
+      text-align: left;
+      font-family: "Rajdhani", sans-serif;
+      font-weight: 600;
+      font-size: 0.82rem;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      border: 1px solid var(--line);
+      background: rgba(0, 0, 0, 0.25);
+      color: var(--muted);
+      padding: 0.65rem 0.7rem;
+      cursor: pointer;
+    }
+    .nav-btn.active {
+      border-color: var(--cyan);
+      color: var(--cyan);
+      background: rgba(46, 230, 214, 0.1);
+    }
+    .device-chips {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.4rem;
+      margin: 0.55rem 0 0.85rem;
+    }
+    .chip {
+      font-family: "Rajdhani", sans-serif;
+      font-weight: 600;
+      font-size: 0.75rem;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      border: 1px solid var(--line);
+      background: rgba(0, 0, 0, 0.3);
+      color: var(--muted);
+      padding: 0.35rem 0.65rem;
+      cursor: pointer;
+    }
+    .chip.on {
+      border-color: var(--cyan);
+      color: var(--cyan);
+      background: rgba(46, 230, 214, 0.12);
+    }
+    .page-hint {
+      color: var(--muted);
+      font-size: 0.82rem;
+      margin-bottom: 0.35rem;
+    }
+    .device-meta {
+      display: block;
+      color: var(--muted);
+      font-size: 0.7rem;
+      margin-top: 0.2rem;
+    }
+    @media (max-width: 1100px) {
+      .main { grid-template-columns: 200px 1fr; }
+      .rail-right { display: none; }
+    }
+    @media (max-width: 760px) {
+      .main { grid-template-columns: 1fr; }
+      .rail-left { display: none; }
+      body { overflow: auto; }
+      .shell { height: auto; min-height: 100%; }
+    }
+
+    .rail {
+      border-right: 1px solid var(--line);
+      background: var(--panel);
+      padding: 0.85rem;
+      overflow: auto;
+      min-height: 0;
+    }
+    .rail-right {
+      border-right: none;
+      border-left: 1px solid var(--line);
+    }
+    .rail h2 {
+      font-family: "Orbitron", sans-serif;
+      font-size: 0.68rem;
+      letter-spacing: 0.2em;
+      color: var(--cyan-dim);
+      margin-bottom: 0.75rem;
+      text-transform: uppercase;
+    }
+
+    .device-list { display: flex; flex-direction: column; gap: 0.5rem; }
+    .device-card {
+      border: 1px solid var(--line);
+      background: rgba(0, 0, 0, 0.25);
+      padding: 0.65rem 0.7rem;
+      cursor: pointer;
+      transition: border-color 0.2s, background 0.2s, transform 0.15s;
+      position: relative;
+      overflow: hidden;
+    }
+    .device-card::before {
+      content: "";
+      position: absolute; left: 0; top: 0; bottom: 0;
+      width: 3px;
+      background: var(--muted);
+    }
+    .device-card.online::before { background: var(--green); }
+    .device-card.in-strip {
+      border-color: rgba(46, 230, 214, 0.28);
+      background: rgba(46, 230, 214, 0.06);
+    }
+    .device-card.shown {
+      border-color: var(--cyan-dim);
+      background: rgba(46, 230, 214, 0.08);
+    }
+    .device-card.active {
+      border-color: var(--cyan);
+      box-shadow: inset 0 0 0 1px rgba(46, 230, 214, 0.25);
+    }
+    .device-card:hover { transform: translateX(2px); }
+    .device-card .id {
+      font-family: "Orbitron", sans-serif;
+      font-size: 0.72rem;
+      letter-spacing: 0.06em;
+      color: var(--text);
+    }
+    .device-card .row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-top: 0.35rem;
+      gap: 0.4rem;
+    }
+    .device-card .state {
+      font-size: 0.72rem;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      color: var(--muted);
+    }
+    .device-card.online .state { color: var(--green); }
+    .list-divider {
+      margin: 0.35rem 0 0.15rem;
+      padding: 0.55rem 0 0.35rem;
+      border-top: 1px solid var(--cyan-dim);
+      border-bottom: 1px solid var(--line);
+      font-family: "Orbitron", sans-serif;
+      font-size: 0.52rem;
+      letter-spacing: 0.16em;
+      text-transform: uppercase;
+      color: var(--cyan-dim);
+      line-height: 1.4;
+    }
+    .list-divider span {
+      display: block;
+      color: var(--muted);
+      letter-spacing: 0.1em;
+      margin-top: 0.2rem;
+      font-family: "Rajdhani", sans-serif;
+      font-size: 0.72rem;
+      text-transform: none;
+    }
+    .toggle-show {
+      border: 1px solid var(--line);
+      background: transparent;
+      color: var(--muted);
+      font-family: inherit;
+      font-size: 0.68rem;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      padding: 0.15rem 0.45rem;
+      cursor: pointer;
+    }
+    .toggle-show.on {
+      color: var(--cyan);
+      border-color: var(--cyan-dim);
+      background: rgba(46, 230, 214, 0.1);
+    }
+
+    .hint {
+      margin-top: 0.85rem;
+      font-size: 0.78rem;
+      color: var(--muted);
+      line-height: 1.35;
+    }
+
+    /* STAGE */
+    .stage {
+      min-height: 0;
+      padding: 0.85rem;
+      display: flex;
+      flex-direction: column;
+      gap: 0.75rem;
+      overflow: hidden;
+      height: 100%;
+    }
+    .stage-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 0.75rem;
+      flex-shrink: 0;
+    }
+    .stage-head .title {
+      font-family: "Orbitron", sans-serif;
+      font-size: 0.72rem;
+      letter-spacing: 0.18em;
+      color: var(--amber);
+      text-transform: uppercase;
+    }
+    .wall {
+      flex: 1 1 auto;
+      min-height: 360px;
+      display: grid;
+      grid-template-columns: 1fr;
+      grid-template-rows: 1fr;
+      height: 100%;
+    }
+
+    .feed {
+      position: relative;
+      background: #000;
+      border: 1px solid var(--line);
+      min-height: 0;
+      height: 100%;
+      width: 100%;
+      overflow: hidden;
+      isolation: isolate;
+    }
+    .feed.active { border-color: var(--cyan); }
+    .feed img,
+    .feed canvas.feed-video {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      object-fit: contain;
+      object-position: center;
+      display: block;
+      background: #000;
+      z-index: 0;
+    }
+    .feed.blackout img,
+    .feed.blackout canvas.feed-video { visibility: hidden; }
+    .feed.blackout .feed-empty {
+      display: grid;
+      background: #000;
+      z-index: 2;
+    }
+    .feed.nightvision .feed-tag .live {
+      color: #9cff7a;
+      border-color: rgba(156, 255, 122, 0.45);
+    }
+    /* Night vision is a GPU filter now: the server no longer re-encodes live frames. */
+    .feed.nightvision canvas.feed-video {
+      filter: grayscale(1) brightness(1.3) contrast(1.2) sepia(1) hue-rotate(65deg) saturate(3.2);
+    }
+    .face-layer {
+      position: absolute;
+      inset: 0;
+      z-index: 3;
+      pointer-events: none;
+      overflow: hidden;
+    }
+    .face-box {
+      position: absolute;
+      border: 2px solid var(--cyan);
+      box-shadow: 0 0 0 1px rgba(0,0,0,0.4);
+    }
+    .face-box span {
+      position: absolute;
+      left: -2px;
+      top: -1.35em;
+      background: rgba(0, 8, 12, 0.85);
+      border: 1px solid rgba(46, 230, 214, 0.45);
+      color: var(--cyan);
+      font-family: "Orbitron", sans-serif;
+      font-size: 0.58rem;
+      letter-spacing: 0.08em;
+      padding: 0.12rem 0.35rem;
+      white-space: nowrap;
+      max-width: 220px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .feed-empty {
+      position: absolute; inset: 0;
+      z-index: 1;
+      display: grid;
+      place-items: center;
+      text-align: center;
+      color: var(--muted);
+      padding: 1.5rem;
+      background:
+        linear-gradient(135deg, rgba(46, 230, 214, 0.03), transparent 40%),
+        #000;
+      pointer-events: none;
+    }
+    .feed-empty.hidden { display: none; }
+    .feed-empty strong {
+      display: block;
+      font-family: "Orbitron", sans-serif;
+      font-size: 0.75rem;
+      letter-spacing: 0.16em;
+      color: var(--cyan-dim);
+      margin-bottom: 0.4rem;
+    }
+
+    /* Preview strip under main feed */
+    .strip-wrap {
+      flex-shrink: 0;
+      border-top: 1px solid var(--line);
+      padding-top: 0.65rem;
+    }
+    .strip-label {
+      font-family: "Orbitron", sans-serif;
+      font-size: 0.58rem;
+      letter-spacing: 0.18em;
+      color: var(--cyan-dim);
+      text-transform: uppercase;
+      margin-bottom: 0.45rem;
+    }
+    .stream-strip {
+      display: grid;
+      grid-template-columns: repeat(8, minmax(0, 1fr));
+      gap: 0.45rem;
+    }
+    @media (max-width: 1100px) {
+      .stream-strip { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+    }
+    @media (max-width: 700px) {
+      .stream-strip { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    }
+    .stream-card {
+      position: relative;
+      aspect-ratio: 4 / 3;
+      border: 1px solid var(--line);
+      background: #000;
+      overflow: hidden;
+      cursor: pointer;
+      transition: border-color 0.15s, transform 0.15s;
+    }
+    .stream-card:hover {
+      border-color: var(--cyan-dim);
+      transform: translateY(-1px);
+    }
+    .stream-card.active {
+      border-color: var(--cyan);
+      box-shadow: 0 0 0 1px rgba(46, 230, 214, 0.35);
+    }
+    .stream-card img {
+      width: 100%;
+      height: 100%;
+      object-fit: contain;
+      object-position: center;
+      display: block;
+      background: #000;
+    }
+    .stream-card .card-tag {
+      position: absolute;
+      left: 4px; top: 4px;
+      z-index: 2;
+      font-family: "Orbitron", sans-serif;
+      font-size: 0.48rem;
+      letter-spacing: 0.08em;
+      color: var(--cyan);
+      background: rgba(0, 0, 0, 0.65);
+      border: 1px solid rgba(46, 230, 214, 0.3);
+      padding: 0.12rem 0.3rem;
+      max-width: calc(100% - 8px);
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .stream-card .card-live {
+      position: absolute;
+      right: 4px; top: 4px;
+      z-index: 2;
+      font-size: 0.48rem;
+      letter-spacing: 0.1em;
+      color: var(--green);
+      background: rgba(0, 0, 0, 0.65);
+      border: 1px solid rgba(61, 255, 154, 0.3);
+      padding: 0.12rem 0.28rem;
+    }
+    .stream-card.showing img { visibility: hidden; }
+    .stream-card.showing .card-live { display: none; }
+    .stream-card .eye-layer {
+      display: none;
+      position: absolute;
+      inset: 0;
+      z-index: 3;
+      background: #05080d;
+      align-items: center;
+      justify-content: center;
+      flex-direction: column;
+      gap: 0.35rem;
+      color: var(--cyan);
+    }
+    .stream-card.showing .eye-layer { display: flex; }
+    .stream-card .eye-layer svg {
+      width: 28px;
+      height: 28px;
+      stroke: var(--cyan);
+      fill: none;
+      stroke-width: 1.6;
+    }
+    .stream-card .eye-layer span {
+      font-family: "Orbitron", sans-serif;
+      font-size: 0.5rem;
+      letter-spacing: 0.16em;
+      text-transform: uppercase;
+    }
+    .strip-empty {
+      grid-column: 1 / -1;
+      color: var(--muted);
+      font-size: 0.78rem;
+      padding: 0.75rem 0.2rem;
+    }
+
+    .hud-corners::after,
+    .hud-corners::before {
+      content: "";
+      position: absolute;
+      width: 18px; height: 18px;
+      border: 2px solid var(--cyan);
+      opacity: 0.55;
+      pointer-events: none;
+      z-index: 3;
+    }
+    .hud-corners::before { top: 8px; left: 8px; border-right: 0; border-bottom: 0; }
+    .hud-corners::after { bottom: 8px; right: 8px; border-left: 0; border-top: 0; }
+
+    .feed-tag {
+      position: absolute;
+      top: 10px; left: 12px;
+      z-index: 4;
+      display: flex;
+      gap: 0.45rem;
+      align-items: center;
+      pointer-events: none;
+    }
+    .feed-tag .name {
+      font-family: "Orbitron", sans-serif;
+      font-size: 0.62rem;
+      letter-spacing: 0.14em;
+      color: var(--cyan);
+      background: rgba(0, 0, 0, 0.55);
+      border: 1px solid rgba(46, 230, 214, 0.35);
+      padding: 0.2rem 0.45rem;
+    }
+    .feed-tag .live {
+      font-size: 0.62rem;
+      letter-spacing: 0.14em;
+      color: var(--green);
+      background: rgba(0, 0, 0, 0.55);
+      border: 1px solid rgba(61, 255, 154, 0.35);
+      padding: 0.2rem 0.45rem;
+    }
+
+    /* ABSOLUTE OVERLAY BOTTOM */
+    .feed-overlay {
+      position: absolute;
+      left: 0; right: 0; bottom: 0;
+      z-index: 5;
+      padding: 0.65rem 0.75rem 0.75rem;
+      background: linear-gradient(180deg, transparent, rgba(0, 8, 12, 0.92) 35%);
+      display: flex;
+      flex-direction: column;
+      gap: 0.45rem;
+      opacity: 0;
+      transform: translateY(8px);
+      transition: opacity 0.2s, transform 0.2s;
+      pointer-events: none;
+    }
+    /* Always show overlay on main feed */
+    .feed .feed-overlay {
+      opacity: 1;
+      transform: translateY(0);
+      pointer-events: auto;
+    }
+
+    .spectrum-wrap {
+      height: 42px;
+      border: 1px solid rgba(46, 230, 214, 0.2);
+      background: rgba(0, 20, 24, 0.55);
+      position: relative;
+      overflow: hidden;
+    }
+    .spectrum-wrap canvas {
+      width: 100%;
+      height: 100%;
+      display: block;
+    }
+    .spectrum-label {
+      position: absolute;
+      top: 4px; left: 8px;
+      font-size: 0.62rem;
+      letter-spacing: 0.16em;
+      color: var(--cyan-dim);
+      text-transform: uppercase;
+      pointer-events: none;
+    }
+
+    .overlay-bar {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.4rem;
+      align-items: center;
+    }
+    .ov-btn {
+      font-family: "Rajdhani", sans-serif;
+      font-weight: 600;
+      font-size: 0.78rem;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      border: 1px solid rgba(46, 230, 214, 0.35);
+      background: rgba(0, 12, 16, 0.75);
+      color: var(--text);
+      padding: 0.35rem 0.65rem;
+      cursor: pointer;
+      backdrop-filter: blur(4px);
+      transition: border-color 0.15s, color 0.15s, background 0.15s;
+    }
+    .ov-btn:hover { border-color: var(--cyan); color: var(--cyan); }
+    .ov-btn.on {
+      border-color: var(--green);
+      color: var(--green);
+      background: rgba(61, 255, 154, 0.1);
+    }
+    .ov-btn.rec {
+      border-color: rgba(255, 77, 106, 0.45);
+    }
+    .ov-btn.rec-on {
+      border-color: var(--red);
+      color: var(--red);
+      background: rgba(255, 77, 106, 0.12);
+      animation: blink 1.2s ease-in-out infinite;
+    }
+    .ov-status {
+      margin-left: auto;
+      font-size: 0.72rem;
+      letter-spacing: 0.1em;
+      color: var(--muted);
+      text-transform: uppercase;
+    }
+    .ov-status.hot { color: var(--red); }
+
+    /* RIGHT RAIL — unit archive tabs */
+    .unit-panel {
+      display: flex;
+      flex-direction: column;
+      height: 100%;
+      min-height: 0;
+    }
+    .unit-panel-head {
+      margin-bottom: 0.65rem;
+    }
+    .unit-panel-head h2 {
+      margin-bottom: 0.25rem;
+    }
+    .unit-focus-id {
+      font-family: "Orbitron", sans-serif;
+      font-size: 0.68rem;
+      letter-spacing: 0.1em;
+      color: var(--cyan);
+    }
+    .intel-tabs {
+      display: grid;
+      grid-template-columns: 1fr 1fr 1fr;
+      gap: 0.3rem;
+      margin-bottom: 0.65rem;
+    }
+    .intel-tab {
+      font-family: "Rajdhani", sans-serif;
+      font-weight: 600;
+      font-size: 0.68rem;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      border: 1px solid var(--line);
+      background: rgba(0, 0, 0, 0.3);
+      color: var(--muted);
+      padding: 0.4rem 0.25rem;
+      cursor: pointer;
+      line-height: 1.2;
+    }
+    .intel-tab .cnt {
+      display: block;
+      font-family: "Orbitron", sans-serif;
+      font-size: 0.62rem;
+      color: var(--cyan-dim);
+      margin-top: 0.15rem;
+    }
+    .intel-tab.active {
+      border-color: var(--cyan-dim);
+      color: var(--cyan);
+      background: rgba(46, 230, 214, 0.1);
+    }
+    .intel-tab.active .cnt { color: var(--cyan); }
+    .tab-panels {
+      flex: 1;
+      min-height: 0;
+      overflow: auto;
+    }
+    .tab-panel { display: none; }
+    .tab-panel.active { display: block; }
+    .panel-status {
+      font-size: 0.78rem;
+      color: var(--muted);
+      margin-bottom: 0.55rem;
+      letter-spacing: 0.04em;
+      min-height: 1.1em;
+    }
+    .panel-status.on { color: var(--green); }
+    .panel-status.active { color: var(--red); }
+    .face-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 0.45rem;
+    }
+    #view-faces .face-grid,
+    #view-registry .face-grid,
+    .capture-grid {
+      grid-template-columns: repeat(8, minmax(0, 1fr));
+    }
+    @media (max-width: 1200px) {
+      #view-faces .face-grid,
+      #view-registry .face-grid,
+      .capture-grid { grid-template-columns: repeat(6, minmax(0, 1fr)); }
+    }
+    @media (max-width: 800px) {
+      #view-faces .face-grid,
+      #view-registry .face-grid,
+      .capture-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+    }
+    .face-card {
+      border: 1px solid var(--line);
+      background: rgba(0, 0, 0, 0.3);
+      overflow: hidden;
+      font-size: 0.7rem;
+    }
+    .face-card img {
+      width: 100%;
+      aspect-ratio: 1;
+      object-fit: cover;
+      display: block;
+      background: #000;
+    }
+    .face-card .meta { padding: 0.3rem 0.4rem; color: var(--muted); }
+    .face-card input {
+      width: 100%;
+      margin-top: 0.2rem;
+      background: rgba(0, 0, 0, 0.4);
+      border: 1px solid var(--line);
+      color: var(--text);
+      padding: 0.15rem 0.3rem;
+      font-family: inherit;
+      font-size: 0.7rem;
+    }
+    .enroll-box {
+      border: 1px solid var(--line);
+      background: rgba(0, 0, 0, 0.28);
+      padding: 0.85rem 0.9rem;
+      margin: 0.75rem 0 1rem;
+      max-width: 520px;
+    }
+    .enroll-box h3 {
+      font-family: "Orbitron", sans-serif;
+      font-size: 0.62rem;
+      letter-spacing: 0.16em;
+      color: var(--amber);
+      text-transform: uppercase;
+      margin-bottom: 0.55rem;
+    }
+    .enroll-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.5rem;
+      align-items: center;
+    }
+    .enroll-row input[type="text"] {
+      flex: 1 1 160px;
+      min-width: 140px;
+      background: rgba(0, 0, 0, 0.45);
+      border: 1px solid var(--line);
+      color: var(--text);
+      padding: 0.4rem 0.5rem;
+      font-family: inherit;
+      font-size: 0.85rem;
+    }
+    .enroll-row input[type="file"] {
+      flex: 1 1 180px;
+      color: var(--muted);
+      font-size: 0.78rem;
+    }
+    .enroll-preview {
+      margin-top: 0.55rem;
+      width: 96px;
+      height: 96px;
+      object-fit: cover;
+      border: 1px solid var(--line);
+      background: #000;
+      display: none;
+    }
+    .enroll-preview.show { display: block; }
+    #enroll-status { margin-top: 0.45rem; font-size: 0.78rem; color: var(--muted); }
+    #enroll-status.ok { color: var(--green); }
+    #enroll-status.err { color: var(--red); }
+    .rec-list { list-style: none; display: flex; flex-direction: column; gap: 0.45rem; }
+    .rec-list li {
+      border: 1px solid var(--line);
+      background: rgba(0, 0, 0, 0.25);
+      padding: 0.5rem 0.55rem;
+      font-size: 0.78rem;
+    }
+    .rec-list li.playable {
+      cursor: pointer;
+      transition: border-color 0.15s, background 0.15s;
+    }
+    .rec-list li.playable:hover {
+      border-color: var(--cyan-dim);
+      background: rgba(46, 230, 214, 0.08);
+    }
+    .rec-list .title { font-weight: 600; letter-spacing: 0.06em; }
+    .rec-list .meta { color: var(--muted); margin: 0.15rem 0 0.3rem; }
+    .rec-list .actions { display: flex; flex-wrap: wrap; gap: 0.45rem; align-items: center; }
+    .rec-list a { color: var(--cyan); text-decoration: none; }
+    .rec-list .view-hint {
+      margin-left: auto;
+      font-size: 0.68rem;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      color: var(--cyan-dim);
+    }
+    #panel-video .rec-list {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+      gap: 1rem;
+    }
+    #panel-video .rec-list li {
+      padding: 0;
+      overflow: hidden;
+      background: #0a0a0a;
+    }
+    #panel-video .rec-list li.empty-tab {
+      grid-column: 1 / -1;
+      padding: 0.75rem 0.2rem;
+      border: none;
+      background: transparent;
+    }
+    .yt-thumb {
+      position: relative;
+      width: 100%;
+      aspect-ratio: 16 / 9;
+      background: #111;
+      overflow: hidden;
+    }
+    .yt-thumb img {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      display: block;
+      background: #111;
+    }
+    .yt-thumb .ph {
+      width: 100%;
+      height: 100%;
+      display: grid;
+      place-items: center;
+      color: var(--muted);
+      font-size: 0.78rem;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+    }
+    .yt-thumb .dur {
+      position: absolute;
+      right: 6px;
+      bottom: 6px;
+      background: rgba(0, 0, 0, 0.85);
+      color: #fff;
+      font-size: 0.72rem;
+      font-weight: 600;
+      padding: 1px 5px;
+      border-radius: 2px;
+    }
+    .yt-info { padding: 0.55rem 0.7rem 0.7rem; }
+    .yt-info .title { font-size: 0.88rem; }
+    .yt-info .meta { margin: 0.2rem 0 0.35rem; }
+    .empty-tab {
+      color: var(--muted);
+      font-size: 0.78rem;
+      padding: 0.75rem 0.2rem;
+      border: none;
+      background: transparent;
+    }
+
+    /* Media viewer modal */
+    .media-modal {
+      display: none;
+      position: fixed;
+      inset: 0;
+      z-index: 100;
+      align-items: center;
+      justify-content: center;
+      padding: 1.25rem;
+      background: rgba(2, 6, 10, 0.82);
+      backdrop-filter: blur(6px);
+    }
+    .media-modal.open { display: flex; }
+    #live-speaker {
+      position: absolute;
+      width: 0;
+      height: 0;
+      opacity: 0;
+      pointer-events: none;
+    }
+    .media-modal-box {
+      width: min(920px, 100%);
+      max-height: min(90vh, 720px);
+      display: flex;
+      flex-direction: column;
+      border: 1px solid var(--line);
+      background: linear-gradient(180deg, #0c1620, #070c12);
+      box-shadow: 0 0 0 1px rgba(46, 230, 214, 0.12), 0 24px 60px rgba(0, 0, 0, 0.55);
+    }
+    .media-modal-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 0.75rem;
+      padding: 0.75rem 1rem;
+      border-bottom: 1px solid var(--line);
+    }
+    .media-modal-head h3 {
+      font-family: "Orbitron", sans-serif;
+      font-size: 0.72rem;
+      letter-spacing: 0.16em;
+      color: var(--cyan);
+      text-transform: uppercase;
+    }
+    .media-modal-head .meta {
+      color: var(--muted);
+      font-size: 0.78rem;
+      margin-top: 0.2rem;
+    }
+    .media-modal-close {
+      border: 1px solid var(--line);
+      background: transparent;
+      color: var(--text);
+      font-family: "Orbitron", sans-serif;
+      font-size: 0.65rem;
+      letter-spacing: 0.12em;
+      padding: 0.35rem 0.55rem;
+      cursor: pointer;
+    }
+    .media-modal-close:hover { border-color: var(--cyan-dim); color: var(--cyan); }
+    .media-modal-body {
+      padding: 1rem;
+      min-height: 0;
+      overflow: auto;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: #000;
+    }
+    .media-modal-body video,
+    .media-modal-body audio {
+      width: auto;
+      max-width: 100%;
+      height: auto;
+      max-height: 60vh;
+      outline: none;
+      object-fit: contain;
+      background: #000;
+    }
+    .media-modal-foot {
+      display: flex;
+      gap: 0.75rem;
+      flex-wrap: wrap;
+      padding: 0.75rem 1rem;
+      border-top: 1px solid var(--line);
+    }
+    .media-modal-foot a {
+      color: var(--cyan);
+      text-decoration: none;
+      font-size: 0.78rem;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+    }
+
+    .foot {
+      border-top: 1px solid var(--line);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 1rem;
+      font-size: 0.7rem;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      color: var(--muted);
+      background: rgba(5, 10, 16, 0.9);
+    }
+    .foot a { color: var(--cyan); text-decoration: none; }
+    .empty-wall {
+      flex: 1;
+      border: 1px dashed var(--line);
+      display: grid;
+      place-items: center;
+      text-align: center;
+      color: var(--muted);
+      padding: 2rem;
+      min-height: 280px;
+    }
+    .empty-wall strong {
+      display: block;
+      font-family: "Orbitron", sans-serif;
+      color: var(--cyan-dim);
+      letter-spacing: 0.16em;
+      font-size: 0.8rem;
+      margin-bottom: 0.5rem;
+    }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <header class="topbar">
+      <div class="brand">
+        <h1>Command Center</h1>
+        <span class="tag">ESP32-S3 Bodycam Net</span>
+      </div>
+      <div class="top-meta">
+        <span class="sys-pill"><span class="dot"></span><span id="net-status">Link standby</span></span>
+        <span id="online-count">0 ONLINE</span>
+        <span class="clock" id="clock">--:--:--</span>
+      </div>
+    </header>
+
+    <div class="main" data-view="live" id="app-main">
+      <aside class="rail rail-left">
+        <h2>Navigasi</h2>
+        <nav class="side-nav">
+          <button type="button" class="nav-btn active" data-view="live">Live Camera</button>
+          <button type="button" class="nav-btn" data-view="videos">Video rekaman</button>
+          <button type="button" class="nav-btn" data-view="faces">Wajah tercapture</button>
+          <button type="button" class="nav-btn" data-view="registry">Wajah terdaftar</button>
+        </nav>
+        <p class="hint">GPIO 1 rekam audio (gambar live mati). GPIO 3 rekam video + suara. GPIO 14 night vision. GPIO 21 stop/lanjut livestream (layar hitam).</p>
+      </aside>
+
+      <section class="stage">
+        <div class="stage-head">
+          <div class="title">Primary Feed</div>
+          <div id="focus-label" class="ov-status">NO UNIT SELECTED</div>
+        </div>
+        <div id="wall" class="wall"></div>
+        <div class="strip-wrap">
+          <div class="strip-label">Online Preview · Max 8</div>
+          <div id="stream-strip" class="stream-strip"></div>
+        </div>
+      </section>
+
+      <section class="page-view" id="view-videos">
+        <h2>Video &amp; audio rekaman</h2>
+        <p class="page-hint">Rekaman dipisah per perangkat. Pilih unit untuk melihat file-nya.</p>
+        <div class="device-chips" id="archive-devices"></div>
+        <div class="unit-focus-id" id="archive-unit">—</div>
+        <div id="audio-status" class="panel-status">Tidak merekam audio</div>
+        <div id="video-status" class="panel-status">Tidak merekam video</div>
+        <div class="intel-tabs" style="max-width:420px;margin:0.75rem 0">
+          <button type="button" class="intel-tab active" data-tab="video" role="tab">Video <span class="cnt" id="cnt-video">0</span></button>
+          <button type="button" class="intel-tab" data-tab="audio" role="tab">Audio <span class="cnt" id="cnt-audio">0</span></button>
+        </div>
+        <div id="panel-video" class="tab-panel active" data-panel="video"><ul id="video-list" class="rec-list"></ul></div>
+        <div id="panel-audio" class="tab-panel" data-panel="audio"><ul id="audio-list" class="rec-list"></ul></div>
+      </section>
+
+      <section class="page-view" id="view-faces">
+        <h2>Wajah yang tercapture</h2>
+        <p class="page-hint">Wajah tercapture dipisah per perangkat. Pilih unit di bawah.</p>
+        <div class="device-chips" id="face-devices"></div>
+        <div id="face-live" class="panel-status">Deteksi: …</div>
+        <div id="face-grid" class="face-grid capture-grid"></div>
+      </section>
+
+      <section class="page-view" id="view-registry">
+        <h2>Wajah yang terdaftar</h2>
+        <p class="hint">Database wajah terdaftar bersifat global (satu daftar untuk semua perangkat). Upload foto + nama, atau beri nama pada wajah tercapture, agar dikenali di semua kamera live.</p>
+        <form class="enroll-box" id="enroll-form">
+          <h3>Daftarkan dari foto</h3>
+          <div class="enroll-row">
+            <input type="text" id="enroll-name" name="label" placeholder="Nama" maxlength="80" autocomplete="off" required />
+            <input type="file" id="enroll-file" name="file" accept="image/jpeg,image/png,image/webp,image/jpg" required />
+            <button type="submit" class="ov-btn" id="enroll-btn">Daftarkan</button>
+          </div>
+          <img id="enroll-preview" class="enroll-preview" alt="preview" />
+          <div id="enroll-status"></div>
+        </form>
+        <div id="registry-grid" class="face-grid capture-grid"></div>
+      </section>
+
+      <aside class="rail rail-right">
+        <div class="unit-panel">
+          <div class="unit-panel-head">
+            <h2>Device Online</h2>
+            <div class="unit-focus-id" id="device-focus-id">—</div>
+          </div>
+          <div id="device-list" class="device-list"></div>
+          <p class="hint">Unit yang sedang uplink. Klik untuk fokus ke kamera utamanya.</p>
+        </div>
+      </aside>
+    </div>
+
+    <footer class="foot">
+      <span>SECURE OPS // MJPEG + PCM + FACE</span>
+      <span>
+        <a id="mjpeg-link" href="/api/v1/mjpeg?device=bodycam-01" target="_blank" rel="noopener">raw stream</a>
+        · <a href="/health" target="_blank" rel="noopener">health</a>
+      </span>
+    </footer>
+  </div>
+
+  <div id="media-modal" class="media-modal" role="dialog" aria-modal="true" aria-hidden="true">
+    <div class="media-modal-box">
+      <div class="media-modal-head">
+        <div>
+          <h3 id="media-modal-title">Playback</h3>
+          <div class="meta" id="media-modal-meta"></div>
+        </div>
+        <button type="button" class="media-modal-close" id="media-modal-close">Close</button>
+      </div>
+      <div class="media-modal-body" id="media-modal-body"></div>
+      <div class="media-modal-foot" id="media-modal-foot"></div>
+    </div>
+  </div>
+
+  <audio id="live-speaker" autoplay playsinline></audio>
+
+  <script>
+    const SAMPLE_RATE = 16000;
+    // Bump when the worklet changes: the page is served no-store but the
+    // module is not, and a stale jitter buffer is hard to diagnose.
+    const PCM_WORKLET_URL = "/static/pcm-player-worklet.js?v=10";
+    const BARS = 48;
+
+    const deviceListEl = document.getElementById("device-list");
+    const wallEl = document.getElementById("wall");
+    const streamStripEl = document.getElementById("stream-strip");
+    const clockEl = document.getElementById("clock");
+    const onlineCountEl = document.getElementById("online-count");
+    const netStatusEl = document.getElementById("net-status");
+    const focusLabel = document.getElementById("focus-label");
+    const mjpegLink = document.getElementById("mjpeg-link");
+    const faceLive = document.getElementById("face-live");
+    const faceGrid = document.getElementById("face-grid");
+    const audioStatus = document.getElementById("audio-status");
+    const videoStatus = document.getElementById("video-status");
+    const audioList = document.getElementById("audio-list");
+    const videoList = document.getElementById("video-list");
+    const archiveUnit = document.getElementById("archive-unit");
+    const cntAudio = document.getElementById("cnt-audio");
+    const cntVideo = document.getElementById("cnt-video");
+    const registryGrid = document.getElementById("registry-grid");
+    const appMain = document.getElementById("app-main");
+    const deviceFocusId = document.getElementById("device-focus-id");
+    const archiveDevicesEl = document.getElementById("archive-devices");
+    const faceDevicesEl = document.getElementById("face-devices");
+
+    const MAX_STRIP = 8;
+    let currentDevice = new URLSearchParams(location.search).get("device") || "bodycam-01";
+    let archiveDevice = currentDevice;
+    let facesDevice = currentDevice;
+    let onlineDevices = [];
+    let knownDevices = new Set([currentDevice]);
+    let stripIds = [];
+    let speakerOn = false;
+    let faceOn = true;
+    let uiRecMode = null;
+    let deviceRecMode = null;
+    let deviceStreamOn = true;
+    let deviceVisualOn = true;
+    let deviceNightOn = false;
+    let autoSpeakerFromDevice = false;
+    let lastFaceIds = "";
+    let lastStripKey = "";
+    let lastVisualLive = null;
+    let lastFrameAge = 99;
+    let deviceInfoMap = {};
+    let pendingJpeg = null;
+    let jpegBusy = false;
+    let liveFps = 0;
+    let fpsFrames = 0;
+    let fpsTick = 0;
+    let lastFrameAt = 0;
+
+    function effectiveRecMode() {
+      return uiRecMode || deviceRecMode;
+    }
+
+    // Per-device stream state
+    const feeds = new Map(); // id -> { img, empty, statusEl, spectrum, ... }
+
+    // Audio
+    let audioCtx = null;
+    let audioAbort = null;
+    let analyser = null;
+    let gainNode = null;
+    let pcmNode = null;
+    let nextPlayTime = 0;
+    let pcmLeftover = new Uint8Array(0);
+    let pcmQueue = new Int16Array(0);
+    let startedPlayback = false;
+    let liveWs = null;
+    let audioWs = null;
+    let liveBlobUrl = null;
+    let liveRotate = 0;
+    const liveSpeakerEl = document.getElementById("live-speaker");
+    let spectrumRaf = 0;
+    let spectrumData = null;
+
+    function tickClock() {
+      const d = new Date();
+      clockEl.textContent = d.toLocaleTimeString("en-GB", { hour12: false });
+    }
+    setInterval(tickClock, 1000);
+    tickClock();
+
+    function streamUrl(device) {
+      return "/api/v1/latest.jpg?device=" + encodeURIComponent(device) + "&annotate=0&t=" + Date.now();
+    }
+    function latestUrl(device) {
+      return "/api/v1/latest.jpg?device=" + encodeURIComponent(device) + "&annotate=0&t=" + Date.now();
+    }
+    function currentView() {
+      return appMain ? appMain.dataset.view : "live";
+    }
+    function rememberDevice(id) {
+      if (id) knownDevices.add(id);
+    }
+    function deviceChipIds() {
+      return [...knownDevices].sort();
+    }
+    function renderDeviceChips(el, selected, onPick) {
+      if (!el) return;
+      const ids = deviceChipIds();
+      if (!ids.length) {
+        el.innerHTML = '<span class="page-hint">Belum ada perangkat</span>';
+        return;
+      }
+      el.innerHTML = "";
+      ids.forEach((id) => {
+        const btn = document.createElement("button");
+        btn.type = "button";
+        btn.className = "chip" + (id === selected ? " on" : "");
+        btn.textContent = id;
+        btn.addEventListener("click", () => onPick(id));
+        el.appendChild(btn);
+      });
+    }
+
+    function isVisualLive() {
+      if (effectiveRecMode() === "audio") return false;
+      if (!deviceStreamOn) return false;
+      if (deviceVisualOn === false && effectiveRecMode() !== "video") return false;
+      return true;
+    }
+
+    function applyVisualMode() {
+      const f = feeds.get(currentDevice);
+      if (!f) return;
+      const live = isVisualLive();
+      f.root.classList.toggle("blackout", !live);
+      f.root.classList.toggle("nightvision", !!deviceNightOn);
+      if (f.faceLayer) f.faceLayer.style.display = live ? "" : "none";
+      if (!live) {
+        f.img.removeAttribute("src");
+        if (f.liveCanvas) {
+          const ctx = f.liveCanvas.getContext("2d");
+          if (ctx) ctx.clearRect(0, 0, f.liveCanvas.width, f.liveCanvas.height);
+        }
+        f.empty.classList.remove("hidden");
+        const audioHold = effectiveRecMode() === "audio";
+        f.empty.innerHTML = audioHold
+          ? "<strong>REC AUDIO</strong><span>Gambar live dimatikan, audio tetap direkam</span>"
+          : "<strong>STREAM OFF</strong><span>GPIO 21 — layar hitam. Tekan lagi untuk live.</span>";
+        f.liveEl.textContent = audioHold ? "AUDIO" : "OFF";
+      } else {
+        f.liveEl.textContent = (deviceNightOn ? "NIGHT " : "LIVE ") + (liveFps ? (liveFps + " FPS") : "");
+      }
+      lastVisualLive = live;
+    }
+
+    function stopLiveCall() {
+      if (liveWs) {
+        try { liveWs.close(); } catch (_) {}
+        liveWs = null;
+      }
+      if (liveBlobUrl) {
+        URL.revokeObjectURL(liveBlobUrl);
+        liveBlobUrl = null;
+      }
+      pendingJpeg = null;
+      jpegBusy = false;
+    }
+
+    function liveBadge() {
+      if (lastFrameAt && performance.now() - lastFrameAt > 2000) return "NO SIGNAL";
+      return (deviceNightOn ? "NIGHT " : "LIVE ") + (liveFps ? (liveFps + " FPS") : "");
+    }
+
+    // Without this the canvas keeps the last frame and the FPS number freezes,
+    // which reads as a slow live feed instead of a dead one.
+    setInterval(() => {
+      if (!lastFrameAt) return;
+      if (performance.now() - lastFrameAt <= 2000) return;
+      liveFps = 0;
+      fpsFrames = 0;
+      const f = feeds.get(currentDevice);
+      if (f && f.liveEl) f.liveEl.textContent = "NO SIGNAL";
+    }, 1000);
+
+    async function pumpLiveJpeg() {
+      const f = feeds.get(currentDevice);
+      if (!f || !pendingJpeg) {
+        jpegBusy = false;
+        return;
+      }
+      if (!isVisualLive()) {
+        pendingJpeg = null;
+        jpegBusy = false;
+        applyVisualMode();
+        return;
+      }
+      jpegBusy = true;
+      const bytes = pendingJpeg;
+      pendingJpeg = null;
+      try {
+        const bmp = await createImageBitmap(new Blob([bytes], { type: "image/jpeg" }));
+        const c = f.liveCanvas;
+        if (c) {
+          // Mount orientation is applied here, not on the server, so live frames
+          // never get decoded + re-encoded on the way to the browser.
+          const swap = liveRotate === 90 || liveRotate === 270;
+          const cw = swap ? bmp.height : bmp.width;
+          const ch = swap ? bmp.width : bmp.height;
+          if (c.width !== cw || c.height !== ch) {
+            c.width = cw;
+            c.height = ch;
+          }
+          const ctx = c.getContext("2d");
+          if (liveRotate) {
+            ctx.save();
+            ctx.translate(cw / 2, ch / 2);
+            ctx.rotate(liveRotate * Math.PI / 180);
+            ctx.drawImage(bmp, -bmp.width / 2, -bmp.height / 2);
+            ctx.restore();
+          } else {
+            ctx.drawImage(bmp, 0, 0);
+          }
+        } else {
+          const url = URL.createObjectURL(new Blob([bytes], { type: "image/jpeg" }));
+          const prev = liveBlobUrl;
+          liveBlobUrl = url;
+          f.img.src = url;
+          if (prev && prev !== url) URL.revokeObjectURL(prev);
+        }
+        bmp.close();
+        f.empty.classList.add("hidden");
+        fpsFrames += 1;
+        const now = performance.now();
+        lastFrameAt = now;
+        if (!fpsTick) fpsTick = now;
+        if (now - fpsTick >= 1000) {
+          liveFps = fpsFrames;
+          fpsFrames = 0;
+          fpsTick = now;
+        }
+        f.liveEl.textContent = liveBadge();
+      } catch (_) {}
+      jpegBusy = false;
+      if (pendingJpeg) pumpLiveJpeg();
+    }
+
+    function applyLiveJpeg(bytes) {
+      pendingJpeg = bytes;
+      if (!jpegBusy) pumpLiveJpeg();
+    }
+
+    function startLiveCall(device) {
+      stopLiveCall();
+      fpsFrames = 0;
+      liveFps = 0;
+      fpsTick = 0;
+      if (!device) return;
+      const proto = location.protocol === "https:" ? "wss" : "ws";
+      const ws = new WebSocket(
+        proto + "://" + location.host + "/ws/live?device=" + encodeURIComponent(device)
+      );
+      liveWs = ws;
+      ws.binaryType = "arraybuffer";
+      ws.onmessage = (ev) => {
+        if (typeof ev.data === "string") {
+          try {
+            const msg = JSON.parse(ev.data);
+            if (msg && msg.t === "cfg") {
+              liveRotate = ((msg.rotate || 0) % 360 + 360) % 360;
+              return;
+            }
+            if (msg && msg.t === "faces") {
+              if (typeof msg.enabled === "boolean") {
+                faceOn = msg.enabled;
+                updateFeedControls();
+              }
+              drawFaceOverlay(msg);
+            }
+          } catch (_) {}
+          return;
+        }
+        const buf = new Uint8Array(ev.data);
+        if (buf.length < 2) return;
+        // Video only: voice has its own socket so it never queues behind a JPEG.
+        if (buf[0] === 1) applyLiveJpeg(buf.subarray(1));
+      };
+      ws.onerror = () => {
+        if (!isVisualLive()) return;
+        const f = feeds.get(device);
+        if (f && !f.img.getAttribute("src")) f.img.src = streamUrl(device);
+      };
+    }
+
+    function coverBox(img, x, y, bw, bh, iw, ih) {
+      const cw = img.clientWidth, ch = img.clientHeight;
+      if (!cw || !ch || !iw || !ih) return null;
+      const scale = Math.min(cw / iw, ch / ih);
+      const dw = iw * scale, dh = ih * scale;
+      const ox = (cw - dw) / 2, oy = (ch - dh) / 2;
+      return {
+        left: ox + x * scale,
+        top: oy + y * scale,
+        width: bw * scale,
+        height: bh * scale,
+      };
+    }
+
+    function drawFaceOverlay(st) {
+      const f = feeds.get(currentDevice);
+      if (!f || !f.faceLayer) return;
+      f.faceLayer.innerHTML = "";
+      if (!faceOn || !st) return;
+      const boxes = st.bboxes || [];
+      const names = st.names || [];
+      const fw = (st.frame && st.frame[0]) || (f.liveCanvas && f.liveCanvas.width) || f.img.naturalWidth || 0;
+      const fh = (st.frame && st.frame[1]) || (f.liveCanvas && f.liveCanvas.height) || f.img.naturalHeight || 0;
+      const target = f.liveCanvas || f.img;
+      boxes.forEach((b, i) => {
+        const mapped = coverBox(target, b[0], b[1], b[2], b[3], fw, fh);
+        if (!mapped) return;
+        const el = document.createElement("div");
+        el.className = "face-box";
+        el.style.left = mapped.left + "px";
+        el.style.top = mapped.top + "px";
+        el.style.width = mapped.width + "px";
+        el.style.height = mapped.height + "px";
+        const label = names[i] || "UNKNOWN";
+        el.innerHTML = "<span>" + label + "</span>";
+        f.faceLayer.appendChild(el);
+      });
+    }
+    function fileUrl(rel, download) {
+      let u = "/api/v1/recordings/file?path=" + encodeURIComponent(rel);
+      if (download) u += "&download=1";
+      return u;
+    }
+
+    function stopAudioSocket() {
+      if (!audioWs) return;
+      const ws = audioWs;
+      audioWs = null;
+      ws.onclose = null;
+      try { ws.close(); } catch (_) {}
+    }
+
+    function startAudioSocket(device) {
+      stopAudioSocket();
+      if (!device) return;
+      const proto = location.protocol === "https:" ? "wss" : "ws";
+      const ws = new WebSocket(
+        proto + "://" + location.host + "/ws/liveaudio?device=" + encodeURIComponent(device)
+      );
+      ws.binaryType = "arraybuffer";
+      audioWs = ws;
+      ws.onmessage = (ev) => {
+        if (typeof ev.data === "string") return;
+        feedPcmBytes(new Uint8Array(ev.data));
+      };
+      ws.onclose = () => {
+        if (audioWs !== ws) return;
+        audioWs = null;
+        if (speakerOn) setTimeout(() => { if (speakerOn) startAudioSocket(currentDevice); }, 700);
+      };
+    }
+
+    function stopSpeaker() {
+      stopAudioSocket();
+      if (audioAbort) { audioAbort.abort(); audioAbort = null; }
+      if (spectrumRaf) { cancelAnimationFrame(spectrumRaf); spectrumRaf = 0; }
+      pcmLeftover = new Uint8Array(0);
+      pcmQueue = new Int16Array(0);
+      nextPlayTime = 0;
+      startedPlayback = false;
+      if (pcmNode) {
+        try { pcmNode.disconnect(); } catch (_) {}
+        pcmNode = null;
+      }
+      if (liveSpeakerEl) {
+        try { liveSpeakerEl.pause(); } catch (_) {}
+        liveSpeakerEl.srcObject = null;
+      }
+      analyser = null;
+      gainNode = null;
+      if (audioCtx) { try { audioCtx.close(); } catch (_) {} audioCtx = null; }
+      drawIdleSpectrum();
+    }
+
+    function appendSamples(arr) {
+      const out = new Int16Array(pcmQueue.length + arr.length);
+      out.set(pcmQueue);
+      out.set(arr, pcmQueue.length);
+      pcmQueue = out;
+    }
+    function takeSamples(n) {
+      if (pcmQueue.length < n) return null;
+      const chunk = pcmQueue.subarray(0, n);
+      pcmQueue = pcmQueue.slice(n);
+      return chunk;
+    }
+
+    function enqueuePcm(int16) {
+      if (!audioCtx || !int16.length) return;
+      if (pcmNode) {
+        pcmNode.port.postMessage({ type: "push", samples: int16 });
+        return;
+      }
+      const f32 = new Float32Array(int16.length);
+      for (let i = 0; i < int16.length; i++) {
+        let v = int16[i] / 32768 * 1.5;
+        if (v > 1) v = 1;
+        if (v < -1) v = -1;
+        f32[i] = v;
+      }
+      const buf = audioCtx.createBuffer(1, f32.length, SAMPLE_RATE);
+      buf.copyToChannel(f32, 0);
+      const src = audioCtx.createBufferSource();
+      src.buffer = buf;
+      src.connect(gainNode || audioCtx.destination);
+      const now = audioCtx.currentTime;
+      if (nextPlayTime < now + 0.01) nextPlayTime = now + 0.01;
+      if (nextPlayTime > now + 0.08) nextPlayTime = now + 0.015;
+      src.start(nextPlayTime);
+      nextPlayTime += buf.duration;
+    }
+
+    function feedPcmBytes(chunk) {
+      if (!chunk || chunk.length < 2) return;
+      const usable = chunk.length - (chunk.length % 2);
+      if (usable < 2) return;
+      const copy = chunk.slice(0, usable);
+      const i16 = new Int16Array(copy.buffer, copy.byteOffset, usable / 2);
+      enqueuePcm(i16);
+    }
+
+    function getActiveSpectrumCanvas() {
+      const f = feeds.get(currentDevice);
+      return f ? f.canvas : null;
+    }
+
+    function drawIdleSpectrum() {
+      const canvas = getActiveSpectrumCanvas();
+      if (!canvas) return;
+      const ctx = canvas.getContext("2d");
+      const w = canvas.width = canvas.clientWidth * devicePixelRatio;
+      const h = canvas.height = canvas.clientHeight * devicePixelRatio;
+      ctx.clearRect(0, 0, w, h);
+      ctx.fillStyle = "rgba(46,230,214,0.15)";
+      const barW = w / BARS;
+      for (let i = 0; i < BARS; i++) {
+        const bh = h * (0.08 + 0.05 * Math.sin(i * 0.4));
+        ctx.fillRect(i * barW + 1, h - bh, Math.max(1, barW - 2), bh);
+      }
+    }
+
+    function spectrumLoop() {
+      const canvas = getActiveSpectrumCanvas();
+      if (!canvas || !analyser) {
+        drawIdleSpectrum();
+        return;
+      }
+      const ctx = canvas.getContext("2d");
+      const w = canvas.width = canvas.clientWidth * devicePixelRatio;
+      const h = canvas.height = canvas.clientHeight * devicePixelRatio;
+      if (!spectrumData) spectrumData = new Uint8Array(analyser.frequencyBinCount);
+      analyser.getByteFrequencyData(spectrumData);
+      ctx.clearRect(0, 0, w, h);
+      const barW = w / BARS;
+      for (let i = 0; i < BARS; i++) {
+        const idx = Math.floor(i * spectrumData.length / BARS);
+        const v = spectrumData[idx] / 255;
+        const bh = Math.max(2, v * h * 0.95);
+        const g = ctx.createLinearGradient(0, h - bh, 0, h);
+        g.addColorStop(0, "#2ee6d6");
+        g.addColorStop(1, "#f0b429");
+        ctx.fillStyle = g;
+        ctx.fillRect(i * barW + 1, h - bh, Math.max(1, barW - 2), bh);
+      }
+      spectrumRaf = requestAnimationFrame(spectrumLoop);
+    }
+
+    async function startSpeaker(device) {
+      stopSpeaker();
+      const AudioCtx = window.AudioContext || window.webkitAudioContext;
+      // Run at the output device's native rate and resample inside the worklet.
+      // Forcing a 16 kHz context makes Windows resample in the driver, which
+      // adds latency and glitches on its own.
+      try {
+        audioCtx = new AudioCtx({ latencyHint: "interactive" });
+      } catch (_) {
+        audioCtx = new AudioCtx();
+      }
+      if (audioCtx.state === "suspended") await audioCtx.resume();
+      analyser = audioCtx.createAnalyser();
+      analyser.fftSize = 256;
+      analyser.smoothingTimeConstant = 0.78;
+      if (liveSpeakerEl) {
+        liveSpeakerEl.pause();
+        liveSpeakerEl.srcObject = null;
+      }
+      try {
+        await audioCtx.audioWorklet.addModule(PCM_WORKLET_URL);
+        pcmNode = new AudioWorkletNode(audioCtx, "bodycam-pcm-player", {
+          numberOfInputs: 0,
+          numberOfOutputs: 1,
+          outputChannelCount: [1],
+          processorOptions: {
+            srcRate: SAMPLE_RATE,
+            targetMs: 280,
+            maxTargetMs: 560,
+            maxMs: 800,
+            makeup: 1.0,
+          },
+        });
+        pcmNode.connect(analyser);
+        analyser.connect(audioCtx.destination);
+        spectrumData = new Uint8Array(analyser.frequencyBinCount);
+        spectrumLoop();
+        startAudioSocket(device);
+        return;
+      } catch (err) {
+        console.warn("worklet fallback:", err);
+        pcmNode = null;
+      }
+      gainNode = audioCtx.createGain();
+      gainNode.gain.value = 1.5;
+      gainNode.connect(analyser);
+      analyser.connect(audioCtx.destination);
+      spectrumData = new Uint8Array(analyser.frequencyBinCount);
+      spectrumLoop();
+      startAudioSocket(device);
+    }
+
+    async function setSpeaker(on) {
+      speakerOn = on;
+      updateFeedControls();
+      if (on) await startSpeaker(currentDevice);
+      else stopSpeaker();
+    }
+
+    async function setFaceEnabled(on) {
+      faceOn = on;
+      updateFeedControls();
+      try {
+        await fetch(
+          "/api/v1/faces/enable?device=" + encodeURIComponent(currentDevice) + "&enabled=" + (on ? 1 : 0),
+          { method: "POST" }
+        );
+      } catch (_) {}
+    }
+
+    async function startUiRecord(mode) {
+      if (uiRecMode) await stopUiRecord();
+      const res = await fetch(
+        "/api/v1/record/start?device=" + encodeURIComponent(currentDevice) + "&mode=" + mode,
+        { method: "POST" }
+      );
+      const data = await res.json();
+      if (!data.ok) throw new Error(data.error || "start failed");
+      uiRecMode = mode;
+      updateFeedControls();
+      const el = mode === "audio" ? audioStatus : videoStatus;
+      el.classList.add("active");
+      el.textContent = "REC " + mode.toUpperCase() + " // memori (" + data.session_id + ")";
+    }
+
+    async function stopUiRecord() {
+      const res = await fetch(
+        "/api/v1/record/stop?device=" + encodeURIComponent(currentDevice),
+        { method: "POST" }
+      );
+      const data = await res.json();
+      const prev = uiRecMode;
+      uiRecMode = null;
+      updateFeedControls();
+      audioStatus.classList.remove("active");
+      videoStatus.classList.remove("active");
+      if (data.ok && data.recording) {
+        const el = (data.recording.mode || prev) === "video" ? videoStatus : audioStatus;
+        el.textContent = "SELESAI · " + (data.recording.duration_sec || "?") + "s";
+      } else {
+        audioStatus.textContent = "Tidak merekam audio";
+        videoStatus.textContent = "Tidak merekam video";
+      }
+      refreshRecordings();
+    }
+
+    async function toggleRec(mode) {
+      try {
+        if (effectiveRecMode() === mode) {
+          await stopUiRecord();
+          return;
+        }
+        await startUiRecord(mode);
+      } catch (e) {
+        const el = mode === "video" ? videoStatus : audioStatus;
+        el.textContent = "Gagal: " + e.message;
+      }
+    }
+
+    function updateFeedControls() {
+      const rec = effectiveRecMode();
+      feeds.forEach((f, id) => {
+        const isFocus = id === currentDevice;
+        f.root.classList.toggle("active", isFocus);
+        f.root.classList.toggle("show-controls", isFocus);
+        if (!isFocus) return;
+        f.btnSpeaker.classList.toggle("on", speakerOn);
+        f.btnSpeaker.textContent = speakerOn ? "Speaker ON" : "Speaker";
+        f.btnRecA.classList.toggle("rec-on", rec === "audio");
+        f.btnRecV.classList.toggle("rec-on", rec === "video");
+        f.btnRecA.textContent = rec === "audio" ? "Stop Audio" : "Rec Audio";
+        f.btnRecV.textContent = rec === "video" ? "Stop Video" : "Rec Video";
+        f.btnFace.classList.toggle("on", faceOn);
+        f.btnFace.textContent = faceOn ? "Face ON" : "Face OFF";
+        let status = "STANDBY";
+        if (rec) status = "REC " + rec.toUpperCase() + (deviceRecMode === rec ? " (ESP)" : "");
+        else if (speakerOn) status = "AUDIO MONITOR";
+        if (deviceStreamOn) status += " · STREAM";
+        else status += " · BLACK";
+        if (deviceNightOn) status += " · NV";
+        f.statusEl.textContent = status;
+        f.statusEl.classList.toggle("hot", !!rec);
+      });
+      applyVisualMode();
+      focusLabel.textContent = currentDevice ? ("FOCUS // " + currentDevice) : "NO UNIT SELECTED";
+      if (archiveUnit) archiveUnit.textContent = (archiveDevice || currentDevice || "—");
+      if (deviceFocusId) deviceFocusId.textContent = currentDevice || "—";
+      renderDeviceChips(archiveDevicesEl, archiveDevice, (id) => {
+        archiveDevice = id;
+        rememberDevice(id);
+        refreshRecordings();
+      });
+      renderDeviceChips(faceDevicesEl, facesDevice, (id) => {
+        facesDevice = id;
+        rememberDevice(id);
+        lastFaceIds = "";
+        refreshFaces();
+      });
+    }
+
+    async function syncFromDeviceState(st) {
+      if (!st) return;
+      if ("stream" in st) deviceStreamOn = !!st.stream;
+      if ("visual" in st) deviceVisualOn = !!st.visual;
+      if ("nightvision" in st) deviceNightOn = !!st.nightvision;
+      deviceInfoMap[st.device || currentDevice] = Object.assign(
+        {},
+        deviceInfoMap[st.device || currentDevice] || {},
+        st
+      );
+      if ("video" in st || "audio" in st) {
+        const mode = st.video ? "video" : st.audio ? "audio" : null;
+        deviceRecMode = mode;
+      }
+
+      if (!speakerOn) {
+        autoSpeakerFromDevice = true;
+        await setSpeaker(true);
+      } else {
+        updateFeedControls();
+      }
+    }
+
+    function createFeed(deviceId) {
+      const root = document.createElement("div");
+      root.className = "feed hud-corners active show-controls";
+      root.dataset.device = deviceId;
+
+      const tag = document.createElement("div");
+      tag.className = "feed-tag";
+      tag.innerHTML = '<span class="name">' + deviceId + '</span><span class="live" data-live>LINK…</span>';
+
+      const img = document.createElement("img");
+      img.alt = "stream " + deviceId;
+      img.style.display = "none";
+
+      const liveCanvas = document.createElement("canvas");
+      liveCanvas.className = "feed-video";
+
+      const faceLayer = document.createElement("div");
+      faceLayer.className = "face-layer";
+
+      const empty = document.createElement("div");
+      empty.className = "feed-empty";
+      empty.innerHTML = "<strong>AWAITING SIGNAL</strong><span>Menunggu frame dari " + deviceId + "</span>";
+
+      const overlay = document.createElement("div");
+      overlay.className = "feed-overlay";
+      overlay.innerHTML =
+        '<div class="spectrum-wrap">' +
+          '<span class="spectrum-label">Voice Spectrum</span>' +
+          '<canvas></canvas>' +
+        '</div>' +
+        '<div class="overlay-bar">' +
+          '<button type="button" class="ov-btn" data-act="speaker">Speaker</button>' +
+          '<button type="button" class="ov-btn rec" data-act="rec-audio">Rec Audio</button>' +
+          '<button type="button" class="ov-btn rec" data-act="rec-video">Rec Video</button>' +
+          '<button type="button" class="ov-btn" data-act="face">Face ON</button>' +
+          '<span class="ov-status" data-status>STANDBY</span>' +
+        '</div>';
+
+      root.appendChild(tag);
+      root.appendChild(liveCanvas);
+      root.appendChild(img);
+      root.appendChild(faceLayer);
+      root.appendChild(empty);
+      root.appendChild(overlay);
+
+      const liveEl = tag.querySelector("[data-live]");
+      const canvas = overlay.querySelector("canvas");
+      const btnSpeaker = overlay.querySelector('[data-act="speaker"]');
+      const btnRecA = overlay.querySelector('[data-act="rec-audio"]');
+      const btnRecV = overlay.querySelector('[data-act="rec-video"]');
+      const btnFace = overlay.querySelector('[data-act="face"]');
+      const statusEl = overlay.querySelector("[data-status]");
+
+      img.addEventListener("load", () => {
+        if (!isVisualLive()) return;
+        empty.classList.add("hidden");
+        liveEl.textContent = liveBadge();
+      });
+      img.addEventListener("error", () => {
+        if (!isVisualLive()) return;
+        empty.classList.remove("hidden");
+        liveEl.textContent = "NO SIG";
+      });
+
+      btnSpeaker.addEventListener("click", (e) => {
+        e.stopPropagation();
+        setSpeaker(!speakerOn);
+      });
+      btnRecA.addEventListener("click", (e) => {
+        e.stopPropagation();
+        toggleRec("audio");
+      });
+      btnRecV.addEventListener("click", (e) => {
+        e.stopPropagation();
+        toggleRec("video");
+      });
+      btnFace.addEventListener("click", (e) => {
+        e.stopPropagation();
+        setFaceEnabled(!faceOn);
+      });
+
+      const entry = { root, img, liveCanvas, empty, liveEl, canvas, btnSpeaker, btnRecA, btnRecV, btnFace, statusEl, faceLayer };
+      feeds.set(deviceId, entry);
+      return entry;
+    }
+
+    function computeStripIds() {
+      const online = [...onlineDevices].sort();
+      let strip = online.slice(0, MAX_STRIP);
+      if (currentDevice && online.includes(currentDevice) && !strip.includes(currentDevice)) {
+        strip = [currentDevice, ...online.filter((id) => id !== currentDevice)].slice(0, MAX_STRIP);
+      }
+      return strip;
+    }
+
+    function listOverflowIds() {
+      const stripSet = new Set(stripIds);
+      const overflowOnline = onlineDevices.filter((id) => !stripSet.has(id)).sort();
+      const idle = [...knownDevices].filter((id) => !onlineDevices.includes(id)).sort();
+      return [...overflowOnline, ...idle];
+    }
+
+    function makeDeviceCard(id, opts) {
+      const online = onlineDevices.includes(id);
+      const active = id === currentDevice;
+      const inStrip = !!opts.inStrip;
+      const st = deviceInfoMap[id] || {};
+      const card = document.createElement("div");
+      card.className =
+        "device-card" +
+        (online ? " online" : "") +
+        (inStrip ? " in-strip" : "") +
+        (active ? " active" : "");
+      let state = "Idle";
+      if (st.video) state = "REC VIDEO";
+      else if (st.audio) state = "REC AUDIO";
+      else if (st.nightvision && (st.stream || st.visual)) state = "NIGHT VISION";
+      else if (st.stream || st.visual) state = "LIVE STREAM";
+      else if (online) state = "STREAM OFF";
+      else state = "Idle";
+      const bits = [];
+      if (st.ip) bits.push(st.ip);
+      if (st.rssi != null) bits.push(st.rssi + " dBm");
+      card.innerHTML =
+        '<div class="id">' + id + "</div>" +
+        '<div class="row"><span class="state">' + state + "</span></div>" +
+        (bits.length ? '<span class="device-meta">' + bits.join(" · ") + "</span>" : "");
+      card.addEventListener("click", () => focusDevice(id));
+      return card;
+    }
+
+    function renderDeviceList() {
+      deviceListEl.innerHTML = "";
+      const strip = stripIds.slice();
+      const overflow = listOverflowIds();
+
+      if (!strip.length && !overflow.length) {
+        deviceListEl.innerHTML =
+          '<div class="hint">Belum ada unit terdeteksi. Nyalakan bodycam agar muncul di sini &amp; preview strip.</div>';
+        return;
+      }
+
+      strip.forEach((id) => deviceListEl.appendChild(makeDeviceCard(id, { inStrip: true })));
+
+      if (strip.length) {
+        const div = document.createElement("div");
+        div.className = "list-divider";
+        div.innerHTML =
+          "Preview strip · ≤" + MAX_STRIP +
+          "<span>" +
+          (overflow.length
+            ? "Garis ini memisahkan unit di strip vs overflow / idle di bawah."
+            : "Semua unit online saat ini ada di preview strip.") +
+          "</span>";
+        deviceListEl.appendChild(div);
+      }
+
+      overflow.forEach((id) => deviceListEl.appendChild(makeDeviceCard(id, { inStrip: false })));
+    }
+
+    function closeMediaModal() {
+      const modal = document.getElementById("media-modal");
+      const body = document.getElementById("media-modal-body");
+      const foot = document.getElementById("media-modal-foot");
+      modal.classList.remove("open");
+      modal.setAttribute("aria-hidden", "true");
+      body.querySelectorAll("video, audio").forEach((el) => {
+        try { el.pause(); } catch (_) {}
+        el.removeAttribute("src");
+        try { el.load(); } catch (_) {}
+      });
+      body.innerHTML = "";
+      foot.innerHTML = "";
+    }
+
+    function openMediaModal(rec) {
+      const modal = document.getElementById("media-modal");
+      const title = document.getElementById("media-modal-title");
+      const meta = document.getElementById("media-modal-meta");
+      const body = document.getElementById("media-modal-body");
+      const foot = document.getElementById("media-modal-foot");
+      const mode = (rec.mode || "").toUpperCase() || "REC";
+      const when = rec.ended ? new Date(rec.ended * 1000).toLocaleString() : "-";
+      title.textContent = mode + " · " + (rec.duration_sec || 0) + "s";
+      meta.textContent = (rec.device || currentDevice || "") + " · " + when;
+
+      body.innerHTML = "";
+      foot.innerHTML = "";
+      const audioSrc = rec.m4a || rec.wav;
+      if (rec.mp4) {
+        const v = document.createElement("video");
+        v.controls = true;
+        v.autoplay = true;
+        v.playsInline = true;
+        v.preload = "auto";
+        v.src = fileUrl(rec.mp4);
+        v.addEventListener("loadedmetadata", () => {
+          if (v.duration && isFinite(v.duration)) {
+            title.textContent = mode + " · " + Math.round(v.duration) + "s";
+          }
+        });
+        v.addEventListener("error", () => {
+          body.innerHTML = '<div class="empty-tab">MP4 tidak bisa diputar. Coba Download MP4.</div>';
+        });
+        body.appendChild(v);
+        v.play().catch(() => {});
+      } else if (audioSrc) {
+        const a = document.createElement("audio");
+        a.controls = true;
+        a.autoplay = true;
+        a.preload = "auto";
+        a.src = fileUrl(audioSrc);
+        a.addEventListener("error", () => {
+          body.innerHTML =
+            '<div class="empty-tab">Audio tidak bisa diputar di browser. Unduh M4A/WAV di bawah.' +
+            (rec.pcm_bytes != null ? " (" + rec.pcm_bytes + " byte PCM)</div>" : "</div>");
+        });
+        a.addEventListener("loadedmetadata", () => {
+          if (a.duration && isFinite(a.duration)) {
+            title.textContent = mode + " · " + Math.round(a.duration) + "s";
+          }
+        });
+        body.appendChild(a);
+        a.play().catch(() => {});
+      } else {
+        body.innerHTML = '<div class="empty-tab">File rekaman tidak tersedia</div>';
+      }
+
+      function addDl(rel, label) {
+        const el = document.createElement("a");
+        el.href = fileUrl(rel, true);
+        el.textContent = label;
+        el.addEventListener("click", (e) => e.stopPropagation());
+        foot.appendChild(el);
+      }
+      if (rec.m4a) addDl(rec.m4a, "Download M4A");
+      if (rec.wav) addDl(rec.wav, "Download WAV");
+      if (rec.mp4) addDl(rec.mp4, "Download MP4");
+
+      modal.classList.add("open");
+      modal.setAttribute("aria-hidden", "false");
+    }
+
+    function fmtDuration(sec) {
+      sec = Math.max(0, Math.round(Number(sec) || 0));
+      const m = Math.floor(sec / 60);
+      const s = sec % 60;
+      return m + ":" + String(s).padStart(2, "0");
+    }
+
+    function recThumbUrl(r) {
+      if (r.thumb) return fileUrl(r.thumb);
+      if (r.session_id && r.mp4) {
+        return "/api/v1/recordings/thumb?session_id=" + encodeURIComponent(r.session_id);
+      }
+      return "";
+    }
+
+    function renderRecItems(listEl, items, emptyText, asThumbs) {
+      listEl.innerHTML = "";
+      if (!items.length) {
+        listEl.innerHTML = '<li class="empty-tab">' + emptyText + "</li>";
+        return;
+      }
+      items.forEach((r) => {
+        const li = document.createElement("li");
+        const when = r.ended ? new Date(r.ended * 1000).toLocaleString() : "-";
+        const canPlay = !!(r.wav || r.mp4 || r.m4a);
+        if (canPlay) li.classList.add("playable");
+        const actions =
+          '<div class="actions">' +
+            (r.m4a ? '<a href="' + fileUrl(r.m4a, true) + '">M4A</a>' : "") +
+            (r.wav ? '<a href="' + fileUrl(r.wav, true) + '">WAV</a>' : "") +
+            (r.mp4 ? '<a href="' + fileUrl(r.mp4, true) + '">MP4</a>' : "") +
+            (canPlay ? '<span class="view-hint">View ▶</span>' : "") +
+          "</div>";
+        if (asThumbs) {
+          const thumb = recThumbUrl(r);
+          li.innerHTML =
+            '<div class="yt-thumb">' +
+              (thumb
+                ? '<img src="' + thumb + '" alt="" loading="lazy" />'
+                : '<div class="ph">No preview</div>') +
+              '<span class="dur">' + fmtDuration(r.duration_sec) + "</span>" +
+            "</div>" +
+            '<div class="yt-info">' +
+              '<div class="title">' + (r.mode || "").toUpperCase() + " · " + fmtDuration(r.duration_sec) + "</div>" +
+              '<div class="meta">' + (r.device || "") + " · " + when + "</div>" +
+              actions +
+            "</div>";
+        } else {
+          li.innerHTML =
+            '<div class="title">' + (r.mode || "").toUpperCase() + " · " + (r.duration_sec || 0) + "s</div>" +
+            '<div class="meta">' + (r.device || "") + " · " + when + "</div>" +
+            actions;
+        }
+        if (canPlay) {
+          li.addEventListener("click", (e) => {
+            if (e.target.closest("a")) return;
+            openMediaModal(r);
+          });
+        }
+        li.querySelectorAll("a").forEach((a) => {
+          a.addEventListener("click", (e) => e.stopPropagation());
+        });
+        listEl.appendChild(li);
+      });
+    }
+
+    function renderMainFeed() {
+      const keepSpeaker = speakerOn;
+      lastVisualLive = null;
+      wallEl.innerHTML = "";
+      feeds.clear();
+      if (!currentDevice) {
+        wallEl.innerHTML =
+          '<div class="empty-wall"><strong>NO PRIMARY FEED</strong>' +
+          '<span>Pilih unit dari preview strip atau list.</span></div>';
+        return;
+      }
+      const f = createFeed(currentDevice);
+      wallEl.appendChild(f.root);
+      updateFeedControls();
+      drawIdleSpectrum();
+      startLiveCall(currentDevice);
+      if (keepSpeaker) startSpeaker(currentDevice);
+    }
+
+    function eyeSvg() {
+      return '<svg viewBox="0 0 24 24" aria-hidden="true">' +
+        '<path d="M1 12s4-7 11-7 11 7 11 7-4 7-11 7S1 12 1 12z"/>' +
+        '<circle cx="12" cy="12" r="3"/>' +
+        "</svg>";
+    }
+
+    function renderStrip() {
+      const key = stripIds.join("|") + "::" + currentDevice;
+      if (key === lastStripKey && streamStripEl.children.length) {
+        [...streamStripEl.querySelectorAll(".stream-card")].forEach((card) => {
+          const id = card.dataset.device;
+          const showing = id === currentDevice;
+          card.classList.toggle("showing", showing);
+          card.classList.toggle("active", showing);
+          const img = card.querySelector("img");
+          const live = card.querySelector(".card-live");
+          if (showing) {
+            if (img) img.removeAttribute("src");
+            if (live) live.style.display = "none";
+          } else {
+            if (img && (!img.getAttribute("src") || img.dataset.needSnap === "1")) {
+              img.src = streamUrl(id);
+              img.dataset.needSnap = "0";
+            }
+            if (live) live.style.display = "";
+          }
+        });
+        return;
+      }
+      lastStripKey = key;
+      streamStripEl.innerHTML = "";
+      if (!stripIds.length) {
+        streamStripEl.innerHTML = '<div class="strip-empty">Belum ada unit online untuk preview</div>';
+        return;
+      }
+      stripIds.forEach((id) => {
+        const showing = id === currentDevice;
+        const card = document.createElement("div");
+        card.className = "stream-card" + (showing ? " showing active" : "");
+        card.dataset.device = id;
+        card.innerHTML =
+          '<span class="card-tag">' + id + "</span>" +
+          '<span class="card-live"' + (showing ? ' style="display:none"' : "") + ">LIVE</span>" +
+          '<img alt="preview ' + id + '" ' + (showing ? "" : 'src="' + streamUrl(id) + '" ') + "/>" +
+          '<div class="eye-layer">' + eyeSvg() + "<span>Showing</span></div>";
+        card.addEventListener("click", () => focusDevice(id));
+        streamStripEl.appendChild(card);
+      });
+    }
+
+    function renderWall() {
+      stripIds = computeStripIds();
+      lastStripKey = "";
+      renderMainFeed();
+      renderStrip();
+      renderDeviceList();
+    }
+
+    function focusDevice(id) {
+      if (!id) return;
+      if (id === currentDevice) {
+        renderStrip();
+        return;
+      }
+      currentDevice = id;
+      archiveDevice = id;
+      facesDevice = id;
+      lastFaceIds = "";
+      lastVisualLive = null;
+      deviceRecMode = null;
+      autoSpeakerFromDevice = false;
+      knownDevices.add(id);
+
+      const url = new URL(location.href);
+      url.searchParams.set("device", id);
+      history.replaceState(null, "", url);
+      mjpegLink.href = "/api/v1/mjpeg?device=" + encodeURIComponent(id) + "&annotate=1";
+
+      stripIds = computeStripIds();
+      lastStripKey = "";
+      renderMainFeed();
+      renderStrip();
+      renderDeviceList();
+
+      setFaceEnabled(faceOn);
+      refreshFaces();
+      refreshRecordings();
+      fetch("/api/v1/device/state?device=" + encodeURIComponent(id), { cache: "no-store" })
+        .then((r) => r.json())
+        .then((st) => syncFromDeviceState(st))
+        .catch(() => {});
+    }
+
+    async function refreshDevices() {
+      try {
+        const res = await fetch("/health", { cache: "no-store" });
+        if (!res.ok) throw new Error("health failed");
+        const data = await res.json();
+        onlineDevices = Array.isArray(data.devices) ? data.devices : [];
+        const ages = data.last_frame_age || {};
+        lastFrameAge = Number(ages[currentDevice] != null ? ages[currentDevice] : 99);
+        onlineDevices.forEach((id) => knownDevices.add(id));
+        onlineCountEl.textContent = onlineDevices.length + " ONLINE";
+        netStatusEl.textContent = onlineDevices.length ? "Uplink active" : "Link standby";
+
+        if (!currentDevice && onlineDevices.length) currentDevice = onlineDevices[0];
+        if (!archiveDevice && currentDevice) archiveDevice = currentDevice;
+        if (!facesDevice && currentDevice) facesDevice = currentDevice;
+
+        const next = computeStripIds();
+        const changed = next.join("|") !== stripIds.join("|");
+        stripIds = next;
+        if (changed) lastStripKey = "";
+        if (!feeds.has(currentDevice)) renderMainFeed();
+        renderStrip();
+        renderDeviceList();
+
+        const stMap = data.device_state || {};
+        deviceInfoMap = stMap;
+        Object.keys(stMap).forEach(rememberDevice);
+        if (stMap[currentDevice]) await syncFromDeviceState(stMap[currentDevice]);
+      } catch (_) {
+        netStatusEl.textContent = "Link lost";
+        onlineCountEl.textContent = "0 ONLINE";
+      }
+    }
+
+    async function refreshFaces() {
+      try {
+        const unit = facesDevice || currentDevice;
+        archiveUnit.textContent = archiveDevice || currentDevice || "—";
+        const res = await fetch(
+          "/api/v1/faces?device=" + encodeURIComponent(unit) + "&limit=80",
+          { cache: "no-store" }
+        );
+        const data = await res.json();
+        (data.devices || []).forEach(rememberDevice);
+        renderDeviceChips(faceDevicesEl, unit, (id) => {
+          facesDevice = id;
+          rememberDevice(id);
+          lastFaceIds = "";
+          refreshFaces();
+        });
+        const st = data.status || {};
+        const n = (st.bboxes || []).length;
+        faceLive.classList.toggle("on", !!st.enabled && n > 0);
+        faceLive.textContent = st.enabled
+          ? (n ? ("TRACK " + n + " FACE @ " + unit) : ("SCAN ACTIVE @ " + unit))
+          : ("SCAN OFF @ " + unit);
+        if (typeof st.enabled === "boolean" && unit === currentDevice) {
+          faceOn = st.enabled;
+          updateFeedControls();
+        }
+        if (unit === currentDevice) drawFaceOverlay(st);
+        const items = (data.items || []).filter((i) => !(i.label || "").trim());
+        const ids = items.map((i) => i.id).join(",");
+        if (ids === lastFaceIds) return;
+        lastFaceIds = ids;
+        faceGrid.innerHTML = "";
+        if (!items.length) {
+          faceGrid.innerHTML = '<div class="empty-tab" style="grid-column:1/-1">Belum ada face capture untuk ' + unit + "</div>";
+          return;
+        }
+        items.forEach((item) => {
+          const card = document.createElement("div");
+          card.className = "face-card";
+          const when = item.ts ? new Date(item.ts * 1000).toLocaleString() : "";
+          card.innerHTML =
+            '<a href="' + fileUrl(item.full) + '" target="_blank" rel="noopener">' +
+            '<img src="' + fileUrl(item.face) + '" alt="face" loading="lazy" /></a>' +
+            '<div class="meta">' + (item.device || unit) + "<br/>" + when +
+            '<input type="text" data-id="' + item.id + '" placeholder="Nama untuk daftar…" value="' +
+            (item.label || "").replace(/"/g, "&quot;") + '" />' +
+            '<button type="button" class="ov-btn" data-register="' + item.id + '" style="margin-top:0.35rem;width:100%">Daftarkan</button>' +
+            '<button type="button" class="ov-btn rec" data-delete="' + item.id + '" style="margin-top:0.25rem;width:100%">Hapus</button></div>';
+          faceGrid.appendChild(card);
+        });
+      } catch (_) {}
+    }
+
+    faceGrid.addEventListener("change", async (e) => {
+      const inp = e.target;
+      if (!inp.matches("input[data-id]")) return;
+      try {
+        await fetch("/api/v1/faces/" + encodeURIComponent(inp.dataset.id), {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ label: inp.value.trim() || null }),
+        });
+        refreshRegistry();
+      } catch (_) {}
+    });
+    faceGrid.addEventListener("click", async (e) => {
+      const del = e.target.closest("[data-delete]");
+      if (del) {
+        try {
+          await fetch("/api/v1/faces/" + encodeURIComponent(del.dataset.delete), { method: "DELETE" });
+          lastFaceIds = "";
+          refreshFaces();
+        } catch (_) {}
+        return;
+      }
+      const btn = e.target.closest("[data-register]");
+      if (!btn) return;
+      const inp = btn.parentElement.querySelector("input[data-id]");
+      const label = (inp && inp.value.trim()) || "";
+      if (!label) {
+        if (inp) inp.focus();
+        return;
+      }
+      try {
+        await fetch("/api/v1/faces/" + encodeURIComponent(btn.dataset.register) + "/register", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ label }),
+        });
+        lastFaceIds = "";
+        refreshFaces();
+        refreshRegistry();
+      } catch (_) {}
+    });
+
+    async function refreshRegistry() {
+      if (!registryGrid) return;
+      try {
+        const res = await fetch("/api/v1/faces/registered", { cache: "no-store" });
+        const data = await res.json();
+        const items = data.items || [];
+        registryGrid.innerHTML = "";
+        if (!items.length) {
+          registryGrid.innerHTML = '<div class="empty-tab" style="grid-column:1/-1">Belum ada wajah terdaftar. Upload foto di atas, atau beri nama di halaman Wajah tercapture.</div>';
+          return;
+        }
+        items.forEach((item) => {
+          const card = document.createElement("div");
+          card.className = "face-card";
+          const devices = (item.devices && item.devices.length) ? item.devices.join(", ") : (item.device || "");
+          card.innerHTML =
+            '<img src="' + fileUrl(item.face) + '" alt="' + (item.label || "") + '" />' +
+            '<div class="meta"><strong>' + (item.label || "") + "</strong><br/>" +
+            item.count + " sampel" + (devices ? "<br/>" + devices : "") +
+            '<button type="button" class="ov-btn" data-unreg="' + encodeURIComponent(item.label) + '" style="margin-top:0.35rem;width:100%">Hapus daftar</button></div>';
+          registryGrid.appendChild(card);
+        });
+      } catch (_) {}
+    }
+    registryGrid.addEventListener("click", async (e) => {
+      const btn = e.target.closest("[data-unreg]");
+      if (!btn) return;
+      try {
+        await fetch("/api/v1/faces/registered/" + btn.dataset.unreg, { method: "DELETE" });
+        lastFaceIds = "";
+        refreshFaces();
+        refreshRegistry();
+      } catch (_) {}
+    });
+
+    (function setupEnrollForm() {
+      const form = document.getElementById("enroll-form");
+      const fileEl = document.getElementById("enroll-file");
+      const nameEl = document.getElementById("enroll-name");
+      const preview = document.getElementById("enroll-preview");
+      const statusEl = document.getElementById("enroll-status");
+      const btn = document.getElementById("enroll-btn");
+      if (!form || !fileEl) return;
+
+      fileEl.addEventListener("change", () => {
+        const f = fileEl.files && fileEl.files[0];
+        if (!f) {
+          preview.classList.remove("show");
+          preview.removeAttribute("src");
+          return;
+        }
+        preview.src = URL.createObjectURL(f);
+        preview.classList.add("show");
+      });
+
+      form.addEventListener("submit", async (e) => {
+        e.preventDefault();
+        const f = fileEl.files && fileEl.files[0];
+        const name = (nameEl.value || "").trim();
+        statusEl.className = "";
+        if (!name) {
+          statusEl.textContent = "Isi nama.";
+          statusEl.classList.add("err");
+          return;
+        }
+        if (!f) {
+          statusEl.textContent = "Pilih foto.";
+          statusEl.classList.add("err");
+          return;
+        }
+        const fd = new FormData();
+        fd.append("file", f);
+        fd.append("label", name);
+        fd.append("device", currentDevice);
+        btn.disabled = true;
+        statusEl.textContent = "Mendaftarkan…";
+        try {
+          const res = await fetch("/api/v1/faces/enroll", { method: "POST", body: fd });
+          const data = await res.json().catch(() => ({}));
+          if (!res.ok) {
+            throw new Error(data.detail || ("HTTP " + res.status));
+          }
+          statusEl.textContent = "Terdaftar: " + name;
+          statusEl.classList.add("ok");
+          form.reset();
+          preview.classList.remove("show");
+          preview.removeAttribute("src");
+          lastFaceIds = "";
+          refreshRegistry();
+        } catch (err) {
+          statusEl.textContent = "Gagal: " + (err.message || err);
+          statusEl.classList.add("err");
+        } finally {
+          btn.disabled = false;
+        }
+      });
+    })();
+
+    async function refreshRecordings() {
+      try {
+        const unit = archiveDevice || currentDevice;
+        archiveUnit.textContent = unit || "—";
+        const res = await fetch(
+          "/api/v1/recordings?device=" + encodeURIComponent(unit),
+          { cache: "no-store" }
+        );
+        const data = await res.json();
+        (data.devices || []).forEach(rememberDevice);
+        renderDeviceChips(archiveDevicesEl, unit, (id) => {
+          archiveDevice = id;
+          rememberDevice(id);
+          refreshRecordings();
+        });
+        const items = data.items || [];
+        const audios = items.filter((r) => (r.mode || "") === "audio");
+        const videos = items.filter((r) => (r.mode || "") === "video");
+        cntAudio.textContent = String(audios.length);
+        cntVideo.textContent = String(videos.length);
+
+        if (data.active && !uiRecMode && unit === currentDevice) {
+          const el = data.active.mode === "video" ? videoStatus : audioStatus;
+          audioStatus.classList.toggle("active", data.active.mode === "audio");
+          videoStatus.classList.toggle("active", data.active.mode === "video");
+          el.textContent =
+            "DEVICE REC " + data.active.mode + " · " + data.active.elapsed_sec + "s @ " + unit;
+          if (data.active.mode !== "audio" && !String(audioStatus.textContent).startsWith("SELESAI")) {
+            audioStatus.textContent = "Tidak merekam audio";
+          }
+          if (data.active.mode !== "video" && !String(videoStatus.textContent).startsWith("SELESAI")) {
+            videoStatus.textContent = "Tidak merekam video";
+          }
+        } else if (!uiRecMode && !deviceRecMode) {
+          audioStatus.classList.remove("active");
+          videoStatus.classList.remove("active");
+          if (!String(audioStatus.textContent).startsWith("SELESAI")) {
+            audioStatus.textContent = "Tidak merekam audio · " + unit;
+          }
+          if (!String(videoStatus.textContent).startsWith("SELESAI")) {
+            videoStatus.textContent = "Tidak merekam video · " + unit;
+          }
+        }
+
+        renderRecItems(audioList, audios.slice(0, 40), "Belum ada audio record untuk " + unit, false);
+        renderRecItems(videoList, videos.slice(0, 40), "Belum ada video record untuk " + unit, true);
+      } catch (_) {}
+    }
+
+    document.querySelectorAll(".nav-btn").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const view = btn.dataset.view;
+        appMain.dataset.view = view;
+        document.querySelectorAll(".nav-btn").forEach((b) => b.classList.toggle("active", b.dataset.view === view));
+        if (view === "faces") refreshFaces();
+        if (view === "registry") refreshRegistry();
+        if (view === "videos") refreshRecordings();
+      });
+    });
+
+    // Tabs
+    document.querySelectorAll(".intel-tab").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const tab = btn.dataset.tab;
+        document.querySelectorAll(".intel-tab").forEach((b) => b.classList.toggle("active", b === btn));
+        document.querySelectorAll(".tab-panel").forEach((p) => {
+          p.classList.toggle("active", p.dataset.panel === tab);
+        });
+      });
+    });
+
+    document.getElementById("media-modal-close").addEventListener("click", closeMediaModal);
+    document.getElementById("media-modal").addEventListener("click", (e) => {
+      if (e.target.id === "media-modal") closeMediaModal();
+    });
+    document.addEventListener("keydown", (e) => {
+      if (e.key === "Escape") closeMediaModal();
+    });
+
+    // boot
+    renderWall();
+    renderDeviceList();
+    refreshDevices();
+    setFaceEnabled(faceOn);
+    autoSpeakerFromDevice = true;
+    setSpeaker(true).catch(() => {});
+    document.addEventListener("pointerdown", () => {
+      if (audioCtx && audioCtx.state === "suspended") audioCtx.resume();
+      if (liveSpeakerEl && liveSpeakerEl.srcObject) liveSpeakerEl.play().catch(() => {});
+      if (!speakerOn) setSpeaker(true);
+    });
+    setInterval(() => {
+      if (document.hidden) return;
+      refreshDevices();
+    }, 2500);
+    setInterval(() => {
+      if (document.hidden || currentView() !== "videos") return;
+      refreshRecordings();
+    }, 5000);
+    setInterval(() => {
+      if (document.hidden || currentView() !== "faces") return;
+      refreshFaces();
+    }, 3000);
+    setInterval(() => {
+      if (document.hidden || currentView() !== "registry") return;
+      refreshRegistry();
+    }, 10000);
+    setInterval(() => {
+      if (document.hidden || currentView() !== "live") return;
+      streamStripEl.querySelectorAll(".stream-card:not(.showing) img").forEach((img) => {
+        const id = img.closest(".stream-card") && img.closest(".stream-card").dataset.device;
+        if (id) img.src = streamUrl(id);
+      });
+    }, 1200);
+    window.addEventListener("resize", () => {
+      if (analyser) return;
+      drawIdleSpectrum();
+    });
+  </script>
+</body>
+</html>

@@ -1,0 +1,34 @@
+services:
+  ai-service:
+    build:
+      context: ../ai-service
+    container_name: bodycam-ai
+    restart: unless-stopped
+    environment:
+      INSIGHTFACE_ROOT: /app/models/insightface
+      INSIGHTFACE_MODEL: buffalo_l
+    volumes:
+      - insightface:/app/models/insightface
+    expose:
+      - "8001"
+
+  bodycam:
+    build: .
+    container_name: bodycam-gateway
+    restart: unless-stopped
+    depends_on:
+      - ai-service
+    environment:
+      BODYCAM_TOKEN: X01040688
+      DATA_DIR: /data
+      AI_URL: http://ai-service:8001
+      # ESP32-S3-CAM dipasang horizontal → putar frame agar tegak (0/90/180/270)
+      CAMERA_ROTATE: "270"
+    ports:
+      - "8089:8080"
+      - "2222:8080"
+    volumes:
+      - ./data:/data
+
+volumes:
+  insightface:
