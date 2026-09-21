@@ -47,6 +47,7 @@ bool portalLoad(PortalConfig &cfg) {
   cfg.ssid = portalPrefs.getString("ssid", "");
   cfg.pass = portalPrefs.getString("pass", "");
   cfg.deviceId = portalPrefs.getString("devid", DEVICE_ID);
+  cfg.pttToken = portalPrefs.getString("ptt", "");
   portalPrefs.end();
 
   if (!cfg.ssid.length() && strlen(WIFI_SSID) > 0) {
@@ -62,6 +63,7 @@ void portalSave(const PortalConfig &cfg) {
   portalPrefs.putString("ssid", cfg.ssid);
   portalPrefs.putString("pass", cfg.pass);
   portalPrefs.putString("devid", cfg.deviceId);
+  portalPrefs.putString("ptt", cfg.pttToken);
   portalPrefs.end();
 }
 
@@ -70,6 +72,7 @@ void portalClear() {
   portalPrefs.remove("ssid");
   portalPrefs.remove("pass");
   portalPrefs.remove("devid");
+  portalPrefs.remove("ptt");
   portalPrefs.end();
 }
 
@@ -200,6 +203,10 @@ static void sendForm(bool doScan) {
   body += F("<input name=\"password\" type=\"password\" placeholder=\"kosongkan jika WiFi terbuka\" value=\"");
   body += htmlEscape(portalLive->pass);
   body += F("\">");
+  body += F("<label>Token radio PQTALKIE (opsional)</label>");
+  body += F("<input name=\"ptt_token\" placeholder=\"tempel token dari https://45.250.101.16:3443\" value=\"");
+  body += htmlEscape(portalLive->pttToken);
+  body += F("\">");
   body += F("<button type=\"submit\">Simpan &amp; Hubungkan</button></form>");
   body += F("<a class=\"btn\" href=\"/\">Scan ulang WiFi</a>");
   body += F("<p class=\"hint\">Hubungkan HP/laptop ke WiFi <b>BODYCAM-SETUP</b>. "
@@ -220,6 +227,16 @@ static void handleSave() {
   String ssid = picked.length() ? picked : custom;
   String pass = portalHttp.arg("password");
   String id = normalizeDeviceId(portalHttp.arg("device_id"));
+  String ptt = portalHttp.arg("ptt_token");
+  ptt.trim();
+  for (size_t i = 0; i < ptt.length(); i++) {
+    char c = ptt[i];
+    if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+          (c >= '0' && c <= '9') || c == '_' || c == '-')) {
+      ptt = "";
+      break;
+    }
+  }
 
   if (!ssid.length() || !id.length()) {
     portalFlash = "ID perangkat dan nama WiFi wajib diisi.";
@@ -230,6 +247,7 @@ static void handleSave() {
   portalLive->ssid = ssid;
   portalLive->pass = pass;
   portalLive->deviceId = id;
+  portalLive->pttToken = ptt;
 
   Serial.printf("[PORTAL] trying '%s' as %s\n", ssid.c_str(), id.c_str());
   WiFi.begin(ssid.c_str(), pass.c_str());

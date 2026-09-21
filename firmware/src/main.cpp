@@ -12,6 +12,7 @@
 #include <freertos/semphr.h>
 #include "config.h"
 #include "portal.h"
+#include "gps.h"
 
 // ============================================================
 // ESP32 BODYCAM
@@ -24,6 +25,8 @@ static volatile bool streamEnabled = false;
 static volatile bool audioEnabled = false;
 static volatile bool videoEnabled = false;
 static volatile bool nightVision = false;
+static volatile bool pttHeld = false;
+static volatile bool sosActive = false;
 static volatile bool stateDirty = false;
 
 static Adafruit_NeoPixel pixel(1, RGB_LED, NEO_GRB + NEO_KHZ800);
@@ -45,6 +48,7 @@ static portMUX_TYPE ringMux = portMUX_INITIALIZER_UNLOCKED;
 // Server address is discovered at runtime: the laptop's DHCP lease changes.
 static String serverHost = SERVER_HOST;
 static String deviceId = DEVICE_ID;
+static String pttToken;
 static Preferences prefs;
 
 static String baseUrl() {
@@ -138,7 +142,8 @@ static void applyCamNight(bool on) {
 }
 
 static void stateLed() {
-  if (nightVision && !videoEnabled && !audioEnabled) rgb(20, 180, 40);
+  if (sosActive) rgb(255, 0, 60);
+  else if (pttHeld) rgb(255, 120, 0);
   else if (!streamEnabled && !audioEnabled && !videoEnabled) rgb(0, 0, 0);
   else if (videoEnabled) rgb(255, 0, 0);
   else if (audioEnabled) rgb(0, 0, 255);
@@ -239,9 +244,14 @@ static void postDeviceState() {
                 ",\"audio\":" + (audioEnabled ? "true" : "false") +
                 ",\"video\":" + (videoEnabled ? "true" : "false") +
                 ",\"visual\":" + (visualOn() ? "true" : "false") +
-                ",\"nightvision\":" + (nightVision ? "true" : "false") +
+                ",\"nightvision\":false" +
+                ",\"ptt\":" + (pttHeld ? "true" : "false") +
+                ",\"sos\":" + (sosActive ? "true" : "false") +
+                (pttToken.length() ? (String(",\"ptt_token\":\"") + pttToken + "\"") : String()) +
                 ",\"rssi\":" + String(WiFi.RSSI()) +
-                ",\"ip\":\"" + WiFi.localIP().toString() + "\"}";
+                ",\"ip\":\"" + WiFi.localIP().toString() + "\"";
+  gpsAppendJson(body);
+  body += "}";
   postJson("/api/v1/device/state", body);
 }
 
@@ -522,7 +532,7 @@ static void audioCaptureTask(void *) {
   int32_t raw[RAW_N];
   int16_t pcm[RAW_N];
   for (;;) {
-    bool need = streamEnabled || audioEnabled || videoEnabled;
+    bool need = streamEnabled || audioEnabled || videoEnabled || pttHeld;
     if (!need || !audioRing) {
       vTaskDelay(pdMS_TO_TICKS(40));
       continue;
@@ -669,7 +679,9 @@ static void provisionNetwork() {
     portalRun(net);  // saves then restarts
   }
   deviceId = net.deviceId;
-  Serial.printf("[BODYCAM] device id = %s\n", deviceId.c_str());
+  pttToken = net.pttToken;
+  Serial.printf("[BODYCAM] device id = %s ptt_token=%s\n",
+                deviceId.c_str(), pttToken.length() ? "yes" : "no");
 }
 
 struct BtnDebounce {
@@ -718,7 +730,7 @@ static void audioTxTask(void *) {
     startAudioWebSocket();
     audioWs.loop();
 
-    if (!(streamEnabled || audioEnabled || videoEnabled)) {
+    if (!(streamEnabled || audioEnabled || videoEnabled || pttHeld)) {
       vTaskDelay(pdMS_TO_TICKS(20));
       continue;
     }
@@ -766,10 +778,13 @@ static void houseKeepTask(void *) {
     if (now - lastHb >= 5000) {
       lastHb = now;
       postDeviceState();
-      Serial.printf("[STAT] ws=%d aws=%d nv=%d audio=%lu drops=%lu video=%lu drops=%lu ring=%u RSSI=%d\n",
+      Serial.printf("[STAT] ws=%d aws=%d ptt=%d sos=%d gps=%d sats=%d audio=%lu drops=%lu video=%lu drops=%lu ring=%u RSSI=%d\n",
                     wsConnected,
                     audioWsConnected,
-                    (int)nightVision,
+                    (int)pttHeld,
+                    (int)sosActive,
+                    (int)gpsHasFix(),
+                    gpsSatellites(),
                     (unsigned long)txAudioPackets,
                     (unsigned long)txAudioDrops,
                     (unsigned long)txVideoFrames,
@@ -842,10 +857,11 @@ void setup() {
 
   pinMode(BTN_AUDIO, INPUT_PULLUP);
   pinMode(BTN_VIDEO, INPUT_PULLUP);
-  pinMode(BTN_STREAM, INPUT_PULLUP);
-  pinMode(BTN_POWER, INPUT_PULLUP);
+  pinMode(BTN_PTT, INPUT_PULLUP);
+  pinMode(BTN_SOS, INPUT_PULLUP);
   pinMode(NIGHT_IR_PIN, OUTPUT);
   nightIr(false);
+  gpsBegin();
 
   provisionNetwork();
 
@@ -890,14 +906,18 @@ void setup() {
 void loop() {
   static BtnDebounce bAudio = {BTN_AUDIO, false, false, 0};
   static BtnDebounce bVideo = {BTN_VIDEO, false, false, 0};
-  static BtnDebounce bNight = {BTN_STREAM, false, false, 0};
   static bool seeded = false;
   static bool powerDown = false;
   static uint32_t powerAt = 0;
+  static bool pttArmed = false;
+  static bool pttRawLast = false;
+  static uint32_t pttEdgeAt = 0;
   if (!seeded) {
     btnSeed(bAudio);
     btnSeed(bVideo);
-    btnSeed(bNight);
+    pttRawLast = digitalRead(BTN_PTT) == LOW;
+    pttArmed = !pttRawLast;  // pin held at boot is not PTT
+    pttEdgeAt = millis();
     seeded = true;
   }
 
@@ -933,18 +953,25 @@ void loop() {
                   (int)videoEnabled, visualOn(), (int)streamEnabled);
   }
 
-  // GPIO 14: night vision only on a real press (not a pin that is low at boot).
-  if (btnPressed(bNight)) {
-    nightVision = !nightVision;
-    applyCamNight(nightVision);
+  // GPIO 14: hold-to-talk (PQTALKIE). Replaces night vision.
+  bool pttRaw = digitalRead(BTN_PTT) == LOW;
+  if (!pttArmed) {
+    if (!pttRaw) pttArmed = true;
+  } else if (pttRaw != pttRawLast) {
+    pttRawLast = pttRaw;
+    pttEdgeAt = millis();
+  } else if ((millis() - pttEdgeAt) >= 40 && pttRaw != pttHeld) {
+    pttHeld = pttRaw;
+    if (pttHeld) ringClear();
     stateDirty = true;
     stateLed();
-    Serial.printf("[BTN] nightvision=%d\n", (int)nightVision);
+    Serial.printf("[BTN] ptt=%d\n", (int)pttHeld);
   }
 
-  // GPIO 21: short press toggles livestream. Hold 3s clears Wi-Fi and
-  // reopens the captive portal after reboot.
-  bool pwr = digitalRead(BTN_POWER) == LOW;
+  // GPIO 21: short press = SOS on PQTALKIE. Hold 3s clears Wi-Fi / portal.
+  // Livestream stays on while the unit is powered — this button no longer
+  // toggles the picture.
+  bool pwr = digitalRead(BTN_SOS) == LOW;
   if (pwr) {
     if (!powerDown) {
       powerDown = true;
@@ -960,10 +987,10 @@ void loop() {
     uint32_t held = millis() - powerAt;
     powerDown = false;
     if (held >= 40 && held < POWER_HOLD_MS) {
-      streamEnabled = !streamEnabled;
+      sosActive = !sosActive;
       stateDirty = true;
       stateLed();
-      Serial.printf("[BTN] stream=%d (GPIO21)\n", (int)streamEnabled);
+      Serial.printf("[BTN] sos=%d (GPIO21)\n", (int)sosActive);
     }
   }
 

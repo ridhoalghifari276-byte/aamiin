@@ -12,6 +12,7 @@ import cv2
 import numpy as np
 
 from faces import FaceEngine
+import pqtalkie
 
 app = FastAPI(title="ESP32-S3 Bodycam Gateway")
 app.add_middleware(
@@ -823,6 +824,7 @@ def append_pcm(device: str, data: bytes, session_id: str | None, session_mode: s
         if sess and len(sess.pcm) < sess.max_pcm_bytes:
             remain = sess.max_pcm_bytes - len(sess.pcm)
             sess.pcm.extend(data[:remain])
+    pqtalkie.feed_device_pcm(device, data)
 
 
 def store_live_frame(device: str, data: bytes) -> float:
@@ -905,6 +907,8 @@ def load_index():
         print("[api] external live API enabled at /api/v1/ext", flush=True)
     else:
         print("[api] BODYCAM_API_TOKEN not set — /api/v1/ext is closed", flush=True)
+    print(f"[ptt] PQTALKIE {pqtalkie.PQTALKIE_URL}", flush=True)
+    pqtalkie.warm_default()
 
 
 @app.get("/health")
@@ -985,11 +989,28 @@ async def post_device_state(
             "video": bool(body.get("video")),
             "visual": bool(body.get("visual", body.get("stream") or body.get("video"))),
             "nightvision": bool(body.get("nightvision")),
+            "ptt": bool(body.get("ptt")),
+            "sos": bool(body.get("sos")),
             "rssi": body.get("rssi"),
             "ip": body.get("ip"),
+            "gps": bool(body.get("gps")),
+            "lat": body.get("lat"),
+            "lon": body.get("lon"),
+            "alt": body.get("alt"),
+            "spd": body.get("spd"),
+            "crs": body.get("crs"),
+            "sats": body.get("sats"),
+            "gps_age_ms": body.get("gps_age_ms"),
             "ts": time.time(),
         }
         touch_device(x_device_id)
+    pqtalkie.set_device_tx(x_device_id, bool(body.get("ptt")))
+    pqtalkie.set_device_sos(x_device_id, bool(body.get("sos")))
+    if body.get("lat") is not None and body.get("lon") is not None:
+        pqtalkie.set_device_location(x_device_id, body.get("lat"), body.get("lon"))
+    tok = (body.get("ptt_token") or "").strip()
+    if tok:
+        pqtalkie.set_device_token(x_device_id, tok)
     return {"ok": True, "device": x_device_id, "state": device_state[x_device_id]}
 
 
@@ -1004,9 +1025,31 @@ def get_device_state(device: str = "bodycam-01"):
             "video": False,
             "visual": False,
             "nightvision": False,
+            "ptt": False,
+            "sos": False,
+            "gps": False,
+            "lat": None,
+            "lon": None,
             "device": device,
         }
-    return {**st, "device": device}
+    return {**st, "device": device, "ptt_radio": pqtalkie.status(device)}
+
+
+@app.post("/api/v1/ptt-token")
+async def set_ptt_token(req: Request):
+    """Save the PQTALKIE kiosk token from the radio web for this bodycam."""
+    body = await req.json()
+    device = (body.get("device") or "").strip()
+    token = (body.get("token") or "").strip()
+    if not device:
+        raise HTTPException(400, "device required")
+    pqtalkie.set_device_token(device, token)
+    return {"ok": True, "device": device, "ptt_radio": pqtalkie.status(device)}
+
+
+@app.get("/api/v1/ptt")
+def get_ptt(device: str | None = None):
+    return {"ok": True, "ptt": pqtalkie.status(device)}
 
 
 @app.post("/api/v1/frame")
@@ -1690,6 +1733,11 @@ def ext_catalog():
             "video_ws": "WS /ws/ext/live?device=bodycam-01&token=<token>",
             "audio_ws": "WS /ws/ext/audio?device=bodycam-01&token=<token>",
         },
+        "gps": {
+            "modules": "NEO-6M / NEO-7M / NEO-M8N NMEA 9600 on ESP UART1 (GPIO 38 RX, GPIO 39 TX)",
+            "fields": "lat, lon, alt, spd (km/h), crs, sats, gps (fix), gps_age_ms",
+            "where": "GET /api/v1/ext/devices  and  GET /api/v1/ext/state?device=bodycam-01",
+        },
         "examples": {
             "list": f"curl -H 'X-Api-Token: TOKEN' {host}/api/v1/ext/devices",
             "snapshot": f"curl -H 'X-Api-Token: TOKEN' -o live.jpg '{host}/api/v1/ext/latest.jpg?device=bodycam-01'",
@@ -1732,7 +1780,17 @@ def ext_devices(
                     "audio": bool(st.get("audio")),
                     "video": bool(st.get("video")),
                     "nightvision": bool(st.get("nightvision")),
+                    "ptt": bool(st.get("ptt")),
+                    "sos": bool(st.get("sos")),
                     "rssi": st.get("rssi"),
+                    "gps": bool(st.get("gps")),
+                    "lat": st.get("lat"),
+                    "lon": st.get("lon"),
+                    "alt": st.get("alt"),
+                    "spd": st.get("spd"),
+                    "crs": st.get("crs"),
+                    "sats": st.get("sats"),
+                    "gps_age_ms": st.get("gps_age_ms"),
                 },
             })
     return {"ok": True, "devices": items}

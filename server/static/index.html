@@ -261,6 +261,30 @@
     }
 
     .device-list { display: flex; flex-direction: column; gap: 0.5rem; }
+    .ptt-token-form {
+      display: flex;
+      flex-direction: column;
+      gap: 0.35rem;
+      margin: 0.7rem 0 0.4rem;
+    }
+    .ptt-token-form label {
+      font-size: 0.62rem;
+      letter-spacing: 0.14em;
+      text-transform: uppercase;
+      color: var(--cyan-dim);
+    }
+    .ptt-token-form input {
+      background: rgba(0,0,0,0.35);
+      border: 1px solid var(--line);
+      color: inherit;
+      padding: 0.4rem 0.5rem;
+      font-size: 0.78rem;
+    }
+    .ptt-token-form button {
+      align-self: flex-start;
+      font-size: 0.72rem;
+      padding: 0.3rem 0.6rem;
+    }
     .device-card {
       border: 1px solid var(--line);
       background: rgba(0, 0, 0, 0.25);
@@ -1186,7 +1210,13 @@
             <div class="unit-focus-id" id="device-focus-id">—</div>
           </div>
           <div id="device-list" class="device-list"></div>
-          <p class="hint">Unit yang sedang uplink. Klik untuk fokus ke kamera utamanya.</p>
+          <form id="ptt-token-form" class="ptt-token-form">
+            <label>Tautan radio PQTALKIE</label>
+            <input id="ptt-token-input" type="text" autocomplete="off" placeholder="https://45.250.101.16:3443/r/…" />
+            <button type="submit">Simpan tautan</button>
+            <span id="ptt-token-msg" class="hint"></span>
+          </form>
+          <p class="hint">GPIO 14 = PTT (tahan bicara). GPIO 21 = SOS (tekan singkat). Tahan GPIO 21 3 detik = reset Wi-Fi. Live video tetap jalan.</p>
         </div>
       </aside>
     </div>
@@ -1224,6 +1254,39 @@
     const BARS = 48;
 
     const deviceListEl = document.getElementById("device-list");
+    const pttTokenForm = document.getElementById("ptt-token-form");
+    const pttTokenInput = document.getElementById("ptt-token-input");
+    const pttTokenMsg = document.getElementById("ptt-token-msg");
+    if (pttTokenForm) {
+      pttTokenForm.addEventListener("submit", async (ev) => {
+        ev.preventDefault();
+        const token = (pttTokenInput.value || "").trim();
+        pttTokenMsg.textContent = "menyimpan…";
+        try {
+          const res = await fetch("/api/v1/ptt-token", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ device: currentDevice, token }),
+          });
+          const data = await res.json();
+          if (!res.ok) throw new Error(data.detail || res.status);
+          const radio = data.ptt_radio || {};
+          if (radio.error) {
+            pttTokenMsg.textContent = "radio: " + radio.error;
+          } else if (!token) {
+            pttTokenMsg.textContent = "token dihapus";
+          } else {
+            const bits = [];
+            if (radio.label) bits.push(radio.label);
+            if (radio.user) bits.push(radio.user);
+            if (radio.channelId != null) bits.push("ch " + radio.channelId);
+            pttTokenMsg.textContent = (bits.join(" · ") || "tautan tersimpan") + " — GPIO 14 PTT";
+          }
+        } catch (err) {
+          pttTokenMsg.textContent = String(err.message || err);
+        }
+      });
+    }
     const wallEl = document.getElementById("wall");
     const streamStripEl = document.getElementById("stream-strip");
     const clockEl = document.getElementById("clock");
@@ -1993,14 +2056,21 @@
         (active ? " active" : "");
       let state = "Idle";
       if (st.video) state = "REC VIDEO";
+      else if (st.sos) state = "SOS";
       else if (st.audio) state = "REC AUDIO";
-      else if (st.nightvision && (st.stream || st.visual)) state = "NIGHT VISION";
+      else if (st.ptt) state = "PTT";
       else if (st.stream || st.visual) state = "LIVE STREAM";
       else if (online) state = "STREAM OFF";
       else state = "Idle";
       const bits = [];
       if (st.ip) bits.push(st.ip);
       if (st.rssi != null) bits.push(st.rssi + " dBm");
+      if (st.gps && st.lat != null && st.lon != null) {
+        bits.push(Number(st.lat).toFixed(5) + ", " + Number(st.lon).toFixed(5)
+          + (st.sats != null ? " · " + st.sats + " sat" : ""));
+      } else if (online) {
+        bits.push("GPS --");
+      }
       card.innerHTML =
         '<div class="id">' + id + "</div>" +
         '<div class="row"><span class="state">' + state + "</span></div>" +

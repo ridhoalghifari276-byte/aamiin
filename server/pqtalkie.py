@@ -1,0 +1,457 @@
+"""Bridge bodycam PTT (GPIO hold-to-talk) into PQTALKIE radio.
+
+PQTALKIE kiosk flow (from https://45.250.101.16:3443):
+  POST /api/auth/kiosk  {token: <kiosk token from the web>}
+  socket.io auth {token: jwt}
+  emit ptt:join / ptt:request / ptt:audio (WAV 16 kHz) / ptt:release
+"""
+from __future__ import annotations
+
+import base64
+import json
+import os
+import struct
+import threading
+import time
+
+import httpx
+
+PQTALKIE_URL = (os.getenv("PQTALKIE_URL") or "https://45.250.101.16:3443").rstrip("/")
+PQTALKIE_INSECURE = os.getenv("PQTALKIE_INSECURE", "1") not in ("0", "false", "False")
+SAMPLE_RATE = 16000
+
+
+def normalize_kiosk_token(raw: str) -> str:
+    """Accept a raw kiosk slug or the full tautan /r/... from the radio web."""
+    raw = (raw or "").strip().strip("\"'")
+    if not raw:
+        return ""
+    s = raw.replace("https://", "").replace("http://", "")
+    parts = [p for p in s.split("/") if p]
+    return parts[-1].split("?")[0].strip() if parts else ""
+
+
+DEFAULT_TOKEN = normalize_kiosk_token(
+    os.getenv("PQTALKIE_TOKEN") or os.getenv("PQTALKIE_KIOSK") or ""
+)
+
+
+def _env_tokens() -> dict[str, str]:
+    raw = (os.getenv("PQTALKIE_TOKENS") or "").strip()
+    if not raw:
+        return {}
+    try:
+        if raw.startswith("{"):
+            return {
+                str(k).strip(): normalize_kiosk_token(str(v))
+                for k, v in json.loads(raw).items()
+                if normalize_kiosk_token(str(v))
+            }
+    except Exception:
+        pass
+    out: dict[str, str] = {}
+    for part in raw.split(","):
+        if ":" not in part:
+            continue
+        k, v = part.split(":", 1)
+        k, v = k.strip(), v.strip()
+        if k and v:
+            out[k] = v
+    return out
+
+
+def pcm_wav(pcm: bytes, rate: int = SAMPLE_RATE) -> bytes:
+    n = len(pcm)
+    hdr = b"RIFF" + struct.pack("<I", 36 + n) + b"WAVEfmt "
+    hdr += struct.pack("<IHHIIHH", 16, 1, 1, rate, rate * 2, 2, 16)
+    hdr += b"data" + struct.pack("<I", n)
+    return hdr + pcm
+
+
+class TalkieBridge:
+    def __init__(self, device: str):
+        self.device = device
+        self.kiosk_token = ""
+        self.jwt = ""
+        self.channel_id: int | None = None
+        self.label = ""
+        self.user_name = ""
+        self.tx = False
+        self.sos = False
+        self.sos_want = False
+        self.alert_id = None
+        self.lat = None
+        self.lon = None
+        self._loc_sent = 0.0
+        self.ok = False
+        self.last_err = ""
+        self._sio = None
+        self._lock = threading.Lock()
+        self._pending = bytearray()
+
+    def set_token(self, token: str):
+        token = normalize_kiosk_token(token)
+        with self._lock:
+            if token == self.kiosk_token:
+                return
+            self.kiosk_token = token
+        if token:
+            threading.Thread(target=self._connect, name=f"ptt-{self.device}", daemon=True).start()
+        else:
+            self._disconnect()
+
+    def set_tx(self, on: bool):
+        on = bool(on)
+        with self._lock:
+            if on == self.tx:
+                return
+            self.tx = on
+            self._pending.clear()
+        if on:
+            self._emit_request()
+        else:
+            self._emit_release()
+
+    def set_sos(self, on: bool):
+        on = bool(on)
+        with self._lock:
+            self.sos_want = on
+            if on == self.sos and (bool(self.alert_id) == on):
+                return
+        threading.Thread(target=self._sos_apply, name=f"sos-{self.device}", daemon=True).start()
+
+    def set_location(self, lat, lon):
+        try:
+            lat_f = float(lat)
+            lon_f = float(lon)
+        except (TypeError, ValueError):
+            return
+        if lat_f < -90 or lat_f > 90 or lon_f < -180 or lon_f > 180:
+            return
+        with self._lock:
+            self.lat = lat_f
+            self.lon = lon_f
+            alert_id = self.alert_id
+            sos = self.sos
+            last = self._loc_sent
+        now = time.monotonic()
+        if sos and alert_id and (now - last) >= 4.0:
+            threading.Thread(
+                target=self._sos_location, args=(alert_id, lat_f, lon_f), daemon=True
+            ).start()
+
+    def _wait_ready(self, seconds: float = 8.0) -> bool:
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            with self._lock:
+                if self.ok and self.jwt:
+                    return True
+            time.sleep(0.2)
+        with self._lock:
+            return bool(self.ok and self.jwt)
+
+    def feed_pcm(self, pcm: bytes):
+        if not pcm:
+            return
+        with self._lock:
+            if not self.tx or not self.ok:
+                return
+            self._pending.extend(pcm)
+            # PQTALKIE radio uses ~200 ms @ 16 kHz.
+            need = SAMPLE_RATE * 2 // 5
+            chunk = bytes(self._pending[:need]) if len(self._pending) >= need else b""
+            if chunk:
+                del self._pending[:need]
+        if chunk:
+            self._emit_audio(chunk)
+
+    def snapshot(self) -> dict:
+        with self._lock:
+            return {
+                "device": self.device,
+                "ready": self.ok,
+                "tx": self.tx,
+                "sos": self.sos,
+                "alertId": self.alert_id,
+                "channelId": self.channel_id,
+                "label": self.label,
+                "user": self.user_name,
+                "has_token": bool(self.kiosk_token),
+                "error": self.last_err,
+            }
+
+    def _post(self, path: str, body: dict, token: str | None = None) -> dict:
+        headers = {"Content-Type": "application/json", "Accept": "application/json"}
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        url = PQTALKIE_URL + path
+        with httpx.Client(verify=not PQTALKIE_INSECURE, timeout=8.0) as c:
+            r = c.post(url, headers=headers, json=body)
+            r.raise_for_status()
+            if not r.content:
+                return {}
+            return r.json()
+
+    def _connect(self):
+        try:
+            data = None
+            last = None
+            for path in ("/api/auth/kiosk", "/auth/kiosk"):
+                try:
+                    data = self._post(path, {"token": self.kiosk_token})
+                    break
+                except Exception as e:
+                    last = e
+            if data is None:
+                raise last or RuntimeError("kiosk auth failed")
+            jwt = (data.get("token") or "").strip()
+            cid = data.get("channelId")
+            if not jwt or cid is None:
+                raise RuntimeError("kiosk response missing token/channelId")
+            user = data.get("user") or {}
+            with self._lock:
+                self.jwt = jwt
+                self.channel_id = int(cid)
+                self.label = str(data.get("label") or "")
+                self.user_name = str(user.get("name") or "")
+                self.last_err = ""
+            self._socket_connect()
+        except Exception as e:
+            with self._lock:
+                self.ok = False
+                self.last_err = str(e)
+            print(f"[ptt] {self.device} kiosk failed: {e}", flush=True)
+
+    def _socket_connect(self):
+        try:
+            import socketio
+        except ImportError:
+            with self._lock:
+                self.ok = False
+                self.last_err = "python-socketio not installed"
+            print("[ptt] pip install python-socketio websocket-client", flush=True)
+            return
+        self._disconnect()
+        sio = socketio.Client(ssl_verify=not PQTALKIE_INSECURE, reconnection=True)
+        jwt = self.jwt
+        cid = self.channel_id
+
+        @sio.event
+        def connect():
+            sio.emit("ptt:join", {"channelId": cid})
+            with self._lock:
+                self.ok = True
+                self.last_err = ""
+                want_sos = self.sos_want
+            print(f"[ptt] {self.device} joined channel {cid}", flush=True)
+            if want_sos:
+                threading.Thread(target=self._sos_apply, name=f"sos-{self.device}", daemon=True).start()
+
+        @sio.event
+        def disconnect():
+            with self._lock:
+                self.ok = False
+            print(f"[ptt] {self.device} socket disconnected", flush=True)
+
+        self._sio = sio
+        sio.connect(
+            PQTALKIE_URL,
+            auth={"token": jwt},
+            transports=["websocket"],
+            socketio_path="socket.io",
+            wait_timeout=10,
+        )
+
+    def _disconnect(self):
+        sio = self._sio
+        self._sio = None
+        if not sio:
+            return
+        try:
+            if self.channel_id is not None:
+                sio.emit("ptt:leave", {"channelId": self.channel_id})
+        except Exception:
+            pass
+        try:
+            sio.disconnect()
+        except Exception:
+            pass
+        with self._lock:
+            self.ok = False
+
+    def _emit_request(self):
+        sio = self._sio
+        cid = self.channel_id
+        if not sio or cid is None:
+            return
+        try:
+            sio.emit("ptt:request", {"channelId": cid})
+            print(f"[ptt] {self.device} TX start", flush=True)
+        except Exception as e:
+            with self._lock:
+                self.last_err = str(e)
+
+    def _emit_release(self):
+        sio = self._sio
+        cid = self.channel_id
+        if not sio or cid is None:
+            return
+        try:
+            sio.emit("ptt:release", {"channelId": cid})
+            print(f"[ptt] {self.device} TX stop", flush=True)
+        except Exception as e:
+            with self._lock:
+                self.last_err = str(e)
+
+    def _emit_audio(self, pcm: bytes):
+        sio = self._sio
+        cid = self.channel_id
+        if not sio or cid is None:
+            return
+        wav = pcm_wav(pcm)
+        chunk = base64.b64encode(wav).decode("ascii")
+        try:
+            sio.emit("ptt:audio", {"channelId": cid, "chunk": chunk, "mime": "audio/wav"})
+        except Exception:
+            pass
+
+    def _sos_apply(self):
+        if not self._wait_ready():
+            with self._lock:
+                self.last_err = "radio not connected"
+            print(f"[sos] {self.device} radio not connected", flush=True)
+            return
+        with self._lock:
+            want = self.sos_want
+            jwt = self.jwt
+            cid = self.channel_id
+            alert_id = self.alert_id
+            lat, lon = self.lat, self.lon
+        try:
+            if want:
+                if alert_id:
+                    with self._lock:
+                        self.sos = True
+                    if lat is not None and lon is not None:
+                        self._sos_location(alert_id, lat, lon)
+                    return
+                data = None
+                last = None
+                body = {"envelope": {}, "channelId": int(cid) if cid is not None else None}
+                for path in ("/api/emergency/alerts", "/emergency/alerts"):
+                    try:
+                        data = self._post(path, body, jwt)
+                        break
+                    except Exception as e:
+                        last = e
+                if not data or not data.get("id"):
+                    raise last or RuntimeError("SOS create failed")
+                aid = data["id"]
+                with self._lock:
+                    self.sos = True
+                    self.alert_id = aid
+                    self.last_err = ""
+                print(f"[sos] {self.device} ON alert={aid}", flush=True)
+                if lat is not None and lon is not None:
+                    self._sos_location(aid, lat, lon)
+            else:
+                if not alert_id:
+                    with self._lock:
+                        self.sos = False
+                    return
+                last = None
+                for path in (
+                    f"/api/emergency/alerts/{alert_id}/resolve",
+                    f"/emergency/alerts/{alert_id}/resolve",
+                ):
+                    try:
+                        self._post(path, {}, jwt)
+                        last = None
+                        break
+                    except Exception as e:
+                        last = e
+                if last:
+                    raise last
+                with self._lock:
+                    self.sos = False
+                    self.alert_id = None
+                    self.last_err = ""
+                print(f"[sos] {self.device} OFF", flush=True)
+        except Exception as e:
+            with self._lock:
+                self.last_err = str(e)
+            print(f"[sos] {self.device} failed: {e}", flush=True)
+
+    def _sos_location(self, alert_id, lat: float, lon: float):
+        jwt = self.jwt
+        env = {"lat": lat, "lng": lon, "accuracy": 15, "ts": int(time.time() * 1000)}
+        last = None
+        for path in (
+            f"/api/emergency/alerts/{alert_id}/location",
+            f"/emergency/alerts/{alert_id}/location",
+        ):
+            try:
+                self._post(path, {"envelope": env}, jwt)
+                with self._lock:
+                    self._loc_sent = time.monotonic()
+                return
+            except Exception as e:
+                last = e
+        if last:
+            print(f"[sos] {self.device} location failed: {last}", flush=True)
+
+
+_bridges: dict[str, TalkieBridge] = {}
+_mux = threading.Lock()
+_env = _env_tokens()
+
+
+def bridge_for(device: str) -> TalkieBridge:
+    with _mux:
+        b = _bridges.get(device)
+        if b is None:
+            b = TalkieBridge(device)
+            _bridges[device] = b
+            tok = _env.get(device) or DEFAULT_TOKEN
+            if tok:
+                b.set_token(tok)
+        return b
+
+
+def warm_default():
+    """Join the configured kiosk so GPIO PTT is ready before the first press."""
+    if not DEFAULT_TOKEN and not _env:
+        return
+    for d in ("bodycam-01", "bodycam-02", "bodycam-03"):
+        bridge_for(d)
+
+
+def set_device_token(device: str, token: str):
+    bridge_for(device).set_token(token)
+
+
+def set_device_tx(device: str, on: bool):
+    bridge_for(device).set_tx(on)
+
+
+def set_device_sos(device: str, on: bool):
+    bridge_for(device).set_sos(on)
+
+
+def set_device_location(device: str, lat, lon):
+    b = _bridges.get(device)
+    if b:
+        b.set_location(lat, lon)
+
+
+def feed_device_pcm(device: str, pcm: bytes):
+    b = _bridges.get(device)
+    if b:
+        b.feed_pcm(pcm)
+
+
+def status(device: str | None = None) -> dict:
+    with _mux:
+        if device:
+            return bridge_for(device).snapshot()
+        return {d: b.snapshot() for d, b in _bridges.items()}

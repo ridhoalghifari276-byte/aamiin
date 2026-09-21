@@ -6,6 +6,7 @@ struct PortalConfig {
   String ssid;
   String pass;
   String deviceId;
+  String pttToken;
 };
 
 bool portalLoad(PortalConfig &cfg);

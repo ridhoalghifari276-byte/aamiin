@@ -81,11 +81,24 @@
 // ============================================================
 #define BTN_AUDIO       1   // toggle audio record (live picture off)
 #define BTN_VIDEO       3   // toggle video+audio record
-#define BTN_STREAM      14  // toggle night vision
-#define BTN_POWER       21  // short: livestream on/off. hold 3s: reset Wi-Fi / portal
+#define BTN_PTT         14  // hold-to-talk → PQTALKIE (was night vision)
+#define BTN_SOS         21  // short: SOS on PQTALKIE. hold 3s: reset Wi-Fi / portal
+#define BTN_POWER       BTN_SOS
 
 // Optional IR / white illuminator (safe if unconnected).
 #define NIGHT_IR_PIN    40
+
+// ============================================================
+// GPS — UART1, NEO-6M / NEO-7M / NEO-M8N (NMEA 9600)
+// GPIO 38/39 are free on ESP32-S3-CAM N16R8 (not camera, I2S, USB, or PSRAM).
+//   GPS VCC -> 3.3V (5V only if the module is 5V-tolerant)
+//   GPS GND -> GND
+//   GPS TX  -> GPIO 38 (ESP RX)
+//   GPS RX  -> GPIO 39 (ESP TX, optional)
+// ============================================================
+#define GPS_RX          38
+#define GPS_TX          39
+#define GPS_BAUD        9600
 
 // ============================================================
 // LED

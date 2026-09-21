@@ -6,7 +6,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY models ./models
-COPY app.py faces.py ./
+COPY app.py faces.py pqtalkie.py ./
 COPY static ./static
 ENV FACE_MODEL=/app/models/face_detection_yunet_2023mar.onnx
 ENV FACE_RECOG_MODEL=/app/models/face_recognition_sface_2021dec.onnx

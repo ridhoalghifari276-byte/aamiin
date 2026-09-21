@@ -92,7 +92,10 @@ class FaceEngine:
                 str(model), "", (DETECT_W, DETECT_H), SCORE_LIVE, 0.3, 5000,
             )
             print(f"[face] YuNet fallback: {model}", flush=True)
-            self._hog = cv2.HOGDescriptor((96, 96), (16, 16), (8, 8), (8, 8), 9)
+            try:
+                self._hog = cv2.HOGDescriptor((96, 96), (16, 16), (8, 8), (8, 8), 9)
+            except Exception:
+                self._hog = None
             sface = _resolve_model(SFACE_NAME, "FACE_RECOG_MODEL")
             if sface and hasattr(cv2, "FaceRecognizerSF"):
                 try:
