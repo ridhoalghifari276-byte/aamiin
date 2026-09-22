@@ -101,16 +101,16 @@
 // GPS — UART1 receive-only (NMEA 9600)
 //   GPS VCC -> 3.3V
 //   GPS GND -> GND
-//   GPS TX  -> GPIO 43 (ESP RX). GPS RX is not wired.
+//   GPS TX  -> GPIO 2 (ESP RX). GPS RX is not wired.
 // ============================================================
-#define GPS_RX          43
+#define GPS_RX          2
 #define GPS_TX          -1
 #define GPS_BAUD        9600
 
 // ============================================================
 // LED
 // ============================================================
-#define STATUS_LED      2
+#define STATUS_LED      -1  // GPIO 2 is GPS RX; status is RGB on 48
 #define RGB_LED         48
 #define USE_RGB_LED     1
 #define POWER_HOLD_MS   3000

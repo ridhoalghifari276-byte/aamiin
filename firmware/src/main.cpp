@@ -67,8 +67,12 @@ static uint32_t txVideoDrops = 0;
 static uint32_t lastStats = 0;
 
 static void led(bool on) {
+#if STATUS_LED >= 0
   pinMode(STATUS_LED, OUTPUT);
   digitalWrite(STATUS_LED, on ? HIGH : LOW);
+#else
+  (void)on;
+#endif
 }
 
 static void rgb(uint8_t r, uint8_t g, uint8_t b) {
@@ -858,7 +862,6 @@ void setup() {
   Serial.begin(115200);
   delay(300);
 
-  pinMode(STATUS_LED, OUTPUT);
   led(true);
 #if USE_RGB_LED
   pixel.begin();
