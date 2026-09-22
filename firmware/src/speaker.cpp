@@ -13,7 +13,7 @@
 // when HT downlink starts pushing PCM. Use a FreeRTOS mutex instead.
 
 static const size_t SPK_RING = 8000;  // 0.5 s s16le mono
-static const int SPK_GAIN = 8;       // radio chunks are often quiet vs mic
+static const int SPK_GAIN = 16;      // radio chunks are often quiet vs mic
 static int16_t *spkRing = nullptr;
 static volatile size_t spkW = 0;
 static volatile size_t spkR = 0;

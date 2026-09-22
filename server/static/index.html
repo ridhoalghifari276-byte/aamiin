@@ -1322,7 +1322,7 @@
     const SAMPLE_RATE = 16000;
     // Bump when the worklet changes: the page is served no-store but the
     // module is not, and a stale jitter buffer is hard to diagnose.
-    const PCM_WORKLET_URL = "/static/pcm-player-worklet.js?v=10";
+    const PCM_WORKLET_URL = "/static/pcm-player-worklet.js?v=12";
     const BARS = 48;
 
     const deviceListEl = document.getElementById("device-list");
@@ -1777,13 +1777,16 @@
 
     function enqueuePcm(int16) {
       if (!audioCtx || !int16.length) return;
+      // Copy — posting a view into a WS ArrayBuffer can detach / go silent.
+      const samples = new Int16Array(int16.length);
+      samples.set(int16);
       if (pcmNode) {
-        pcmNode.port.postMessage({ type: "push", samples: int16 });
+        pcmNode.port.postMessage({ type: "push", samples }, [samples.buffer]);
         return;
       }
-      const f32 = new Float32Array(int16.length);
-      for (let i = 0; i < int16.length; i++) {
-        let v = int16[i] / 32768 * 1.5;
+      const f32 = new Float32Array(samples.length);
+      for (let i = 0; i < samples.length; i++) {
+        let v = samples[i] / 32768 * 2.5;
         if (v > 1) v = 1;
         if (v < -1) v = -1;
         f32[i] = v;
@@ -1870,9 +1873,14 @@
       analyser = audioCtx.createAnalyser();
       analyser.fftSize = 256;
       analyser.smoothingTimeConstant = 0.78;
+      // Dual sink: AudioContext.destination + <audio> element. Some Windows
+      // setups show a live spectrum but mute destination-only graphs.
+      const mediaDest = audioCtx.createMediaStreamDestination();
       if (liveSpeakerEl) {
-        liveSpeakerEl.pause();
-        liveSpeakerEl.srcObject = null;
+        liveSpeakerEl.srcObject = mediaDest.stream;
+        liveSpeakerEl.muted = false;
+        liveSpeakerEl.volume = 1;
+        liveSpeakerEl.play().catch(() => {});
       }
       try {
         await audioCtx.audioWorklet.addModule(PCM_WORKLET_URL);
@@ -1885,11 +1893,12 @@
             targetMs: 280,
             maxTargetMs: 560,
             maxMs: 800,
-            makeup: 1.0,
+            makeup: 2.8,
           },
         });
         pcmNode.connect(analyser);
         analyser.connect(audioCtx.destination);
+        analyser.connect(mediaDest);
         spectrumData = new Uint8Array(analyser.frequencyBinCount);
         spectrumLoop();
         startAudioSocket(device);
@@ -1899,9 +1908,10 @@
         pcmNode = null;
       }
       gainNode = audioCtx.createGain();
-      gainNode.gain.value = 1.5;
+      gainNode.gain.value = 2.5;
       gainNode.connect(analyser);
       analyser.connect(audioCtx.destination);
+      analyser.connect(mediaDest);
       spectrumData = new Uint8Array(analyser.frequencyBinCount);
       spectrumLoop();
       startAudioSocket(device);
@@ -3058,6 +3068,7 @@
       if (audioCtx && audioCtx.state === "suspended") audioCtx.resume();
       if (liveSpeakerEl && liveSpeakerEl.srcObject) liveSpeakerEl.play().catch(() => {});
       if (!speakerOn) setSpeaker(true);
+      else if (speakerOn && !audioWs) startAudioSocket(currentDevice);
     });
     document.addEventListener("visibilitychange", () => {
       if (document.hidden) {

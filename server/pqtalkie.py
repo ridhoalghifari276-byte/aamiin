@@ -79,6 +79,24 @@ def wav_to_pcm(raw: bytes) -> bytes:
     return raw
 
 
+def amplify_s16le(pcm: bytes, gain: int = 12) -> bytes:
+    """Boost quiet PQTALKIE downlink before it hits the bodycam speaker."""
+    if not pcm or gain <= 1:
+        return pcm
+    n = len(pcm) - (len(pcm) % 2)
+    if n < 2:
+        return pcm
+    out = bytearray(n)
+    for i in range(0, n, 2):
+        v = int.from_bytes(pcm[i : i + 2], "little", signed=True) * gain
+        if v > 32767:
+            v = 32767
+        elif v < -32768:
+            v = -32768
+        out[i : i + 2] = int(v).to_bytes(2, "little", signed=True)
+    return bytes(out)
+
+
 def pcm_wav(pcm: bytes, rate: int = SAMPLE_RATE) -> bytes:
     n = len(pcm)
     hdr = b"RIFF" + struct.pack("<I", 36 + n) + b"WAVEfmt "
@@ -340,6 +358,7 @@ class TalkieBridge:
             pcm = wav_to_pcm(raw)
             if not pcm:
                 return
+            pcm = amplify_s16le(pcm, 12)
             with self._lock:
                 self.rx_chunks += 1
                 self.rx_bytes += len(pcm)
