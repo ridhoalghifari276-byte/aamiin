@@ -2,16 +2,22 @@
 #include "config.h"
 #include <driver/i2s.h>
 #include <esp_heap_caps.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
 #include <string.h>
 
 // Playback only. Mic stays on I2S_NUM_0 and is not touched here.
+//
+// IMPORTANT: never touch SPIRAM inside portENTER_CRITICAL — that disables the
+// flash/PSRAM cache and causes "Cache error / MMU entry fault" on ESP32-S3
+// when HT downlink starts pushing PCM. Use a FreeRTOS mutex instead.
 
-static const size_t SPK_RING = 16000;  // 1 s of s16le mono
+static const size_t SPK_RING = 8000;  // 0.5 s s16le mono
 static int16_t *spkRing = nullptr;
 static volatile size_t spkW = 0;
 static volatile size_t spkR = 0;
 static volatile bool muted = false;
-static portMUX_TYPE spkMux = portMUX_INITIALIZER_UNLOCKED;
+static SemaphoreHandle_t spkMu = nullptr;
 
 static size_t spkCountUnsafe() {
   return (spkW + SPK_RING - spkR) % SPK_RING;
@@ -22,37 +28,39 @@ void speakerMute(bool on) {
 }
 
 void speakerPush(const uint8_t *pcm, size_t bytes) {
-  if (!spkRing || !pcm || bytes < 2) return;
+  if (!spkRing || !spkMu || !pcm || bytes < 2) return;
   const int16_t *src = (const int16_t *)pcm;
   size_t n = bytes / 2;
-  portENTER_CRITICAL(&spkMux);
+  if (xSemaphoreTake(spkMu, pdMS_TO_TICKS(20)) != pdTRUE) return;
   for (size_t i = 0; i < n; i++) {
     size_t next = (spkW + 1) % SPK_RING;
     if (next == spkR) spkR = (spkR + 1) % SPK_RING;
     spkRing[spkW] = src[i];
     spkW = next;
   }
-  portEXIT_CRITICAL(&spkMux);
+  xSemaphoreGive(spkMu);
 }
 
 static void speakerTask(void *) {
   int16_t stereo[256];
   for (;;) {
-    if (muted || !spkRing) {
+    if (muted || !spkRing || !spkMu) {
       vTaskDelay(pdMS_TO_TICKS(10));
       continue;
     }
     size_t got = 0;
-    portENTER_CRITICAL(&spkMux);
-    size_t avail = spkCountUnsafe();
-    size_t take = avail > 128 ? 128 : avail;
-    for (size_t i = 0; i < take; i++) {
-      int16_t s = spkRing[spkR];
-      spkR = (spkR + 1) % SPK_RING;
-      stereo[got++] = s;
-      stereo[got++] = s;
+    size_t take = 0;
+    if (xSemaphoreTake(spkMu, pdMS_TO_TICKS(20)) == pdTRUE) {
+      size_t avail = spkCountUnsafe();
+      take = avail > 128 ? 128 : avail;
+      for (size_t i = 0; i < take; i++) {
+        int16_t s = spkRing[spkR];
+        spkR = (spkR + 1) % SPK_RING;
+        stereo[got++] = s;
+        stereo[got++] = s;
+      }
+      xSemaphoreGive(spkMu);
     }
-    portEXIT_CRITICAL(&spkMux);
     if (!take) {
       vTaskDelay(pdMS_TO_TICKS(5));
       continue;
@@ -63,10 +71,16 @@ static void speakerTask(void *) {
 }
 
 void speakerBegin() {
-  spkRing = (int16_t *)heap_caps_malloc(SPK_RING * sizeof(int16_t),
-                                        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  spkMu = xSemaphoreCreateMutex();
+  // Prefer internal RAM so playback never depends on PSRAM cache timing.
+  spkRing = (int16_t *)heap_caps_malloc(SPK_RING * sizeof(int16_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  if (!spkRing) {
+    spkRing = (int16_t *)heap_caps_malloc(SPK_RING * sizeof(int16_t),
+                                          MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  }
   if (!spkRing) spkRing = (int16_t *)malloc(SPK_RING * sizeof(int16_t));
   if (spkRing) memset(spkRing, 0, SPK_RING * sizeof(int16_t));
+  else Serial.println("[SPK] ring alloc failed");
 
   i2s_config_t c = {};
   c.mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX);
