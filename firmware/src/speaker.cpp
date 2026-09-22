@@ -15,7 +15,9 @@
 // Wiring: MAX98357 SD -> 3V3 = RIGHT channel only.
 
 static const size_t SPK_RING = 8000;  // 0.5 s s16le mono
-static const int SPK_GAIN = 3;       // soft gain — hard clip sounds like crit-crit
+// Gain is applied once on the gateway (pqtalkie wav_to_pcm). Extra ×N here
+// after server boost turns speech into square-wave "crit crit" on MAX98357.
+static const int SPK_GAIN = 1;
 static int16_t *spkRing = nullptr;
 static volatile size_t spkW = 0;
 static volatile size_t spkR = 0;

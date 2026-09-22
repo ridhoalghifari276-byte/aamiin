@@ -176,6 +176,7 @@ class TalkieBridge:
         self._connect_thread: threading.Thread | None = None
 
     def set_token(self, token: str):
+        """Apply kiosk slug. Changing token forces leave + re-auth (new channel)."""
         token = normalize_kiosk_token(token)
         with self._lock:
             same = token == self.kiosk_token
@@ -183,10 +184,13 @@ class TalkieBridge:
             self.kiosk_token = token
             if same and (not token or alive):
                 return
-        if token:
-            self._ensure_connect_thread()
-        else:
+        if not token:
             self._disconnect()
+            return
+        # Drop old JWT/socket so _connect_loop re-auths (ch4 → ch11, etc.).
+        if alive and not same:
+            self._disconnect()
+        self._ensure_connect_thread()
 
     def _ensure_connect_thread(self):
         with self._lock:
