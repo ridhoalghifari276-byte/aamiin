@@ -1007,6 +1007,9 @@ def health():
         copy["radio_ch"] = r.get("channelId")
         copy["radio_label"] = r.get("label") or ""
         copy["radio_token"] = bool(r.get("has_token"))
+        copy["radio_rx_chunks"] = int(r.get("rx_chunks") or 0)
+        copy["radio_rx_bytes"] = int(r.get("rx_bytes") or 0)
+        copy["radio_rx_age_ms"] = r.get("rx_age_ms")
         states[d] = copy
     return {
         "ok": True,

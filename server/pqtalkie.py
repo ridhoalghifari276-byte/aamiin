@@ -104,6 +104,9 @@ class TalkieBridge:
         self._loc_sent = 0.0
         self.ok = False
         self.last_err = ""
+        self.rx_chunks = 0
+        self.rx_bytes = 0
+        self.rx_at = 0.0
         self._sio = None
         self._lock = threading.Lock()
         self._pending = bytearray()
@@ -209,6 +212,9 @@ class TalkieBridge:
                 "user": self.user_name,
                 "has_token": bool(self.kiosk_token),
                 "api": PQTALKIE_URL,
+                "rx_chunks": self.rx_chunks,
+                "rx_bytes": self.rx_bytes,
+                "rx_age_ms": int((time.time() - self.rx_at) * 1000) if self.rx_at else None,
                 "error": self.last_err,
             }
 
@@ -311,18 +317,43 @@ class TalkieBridge:
             with self._lock:
                 if self.tx or not self.ok:
                     return
+            # Web/HT emit: { channelId, chunk: base64 WAV|PCM, mime }
+            if isinstance(data, (list, tuple)) and data:
+                data = data[0]
             if not isinstance(data, dict):
                 return
-            chunk = data.get("chunk") or data.get("audio") or ""
-            if not chunk:
-                return
-            try:
-                raw = base64.b64decode(chunk)
-            except Exception:
+            chunk = data.get("chunk") or data.get("audio") or data.get("data") or ""
+            if isinstance(chunk, (bytes, bytearray)):
+                raw = bytes(chunk)
+            elif isinstance(chunk, str) and chunk:
+                try:
+                    raw = base64.b64decode(chunk)
+                except Exception:
+                    return
+            else:
                 return
             pcm = wav_to_pcm(raw)
-            if pcm:
-                push_radio_pcm(self.device, pcm)
+            if not pcm:
+                return
+            with self._lock:
+                self.rx_chunks += 1
+                self.rx_bytes += len(pcm)
+                self.rx_at = time.time()
+                n = self.rx_chunks
+            if n <= 3 or n % 50 == 0:
+                print(
+                    f"[ptt] {self.device} RX radio audio #{n} bytes={len(pcm)}",
+                    flush=True,
+                )
+            push_radio_pcm(self.device, pcm)
+
+        @sio.on("*")
+        def _any_event(event, data):
+            # One-shot visibility if the server uses a different event name.
+            if event in ("ptt:audio", "connect", "disconnect"):
+                return
+            if event.startswith("ptt:") or "audio" in str(event).lower():
+                print(f"[ptt] {self.device} event {event!r} type={type(data).__name__}", flush=True)
 
         @sio.event
         def disconnect():
