@@ -824,20 +824,21 @@ static void streamTxTask(void *) {
 
     uint32_t now = millis();
     if ((int32_t)(now - nextFrame) >= 0) {
-      // Prefer audio socket: skip JPEG when mic ring is backing up.
+      // Prefer audio when backlog is high, but keep ~1 FPS so dashboard is not black.
+      static uint32_t lastKeepaliveVideo = 0;
       size_t backlog = ringCount();
-      bool congested = backlog > (AUDIO_RING_SAMPLES / 4);
-      if (congested) {
+      bool congested = backlog > (AUDIO_RING_SAMPLES / 2);
+      if (congested && (now - lastKeepaliveVideo) < 1000) {
         drainCamFb();
-        nextFrame = now + framePeriod * 2;
+        nextFrame = now + framePeriod;
       } else {
         uint32_t t0 = now;
         bool ok = sendVideoFrame();
+        if (ok) lastKeepaliveVideo = now;
         now = millis();
-        // On send fail, back off harder so lwIP can drain audio.
-        nextFrame = t0 + (ok ? framePeriod : framePeriod * 3);
+        nextFrame = t0 + (ok ? framePeriod : framePeriod * 2);
         if ((int32_t)(now - nextFrame) >= 0) {
-          nextFrame = now + (ok ? 0 : framePeriod);
+          nextFrame = now;
         }
       }
     }
