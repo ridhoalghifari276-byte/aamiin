@@ -26,7 +26,8 @@ services:
       # Same-provider private IP — public 45.250.101.16:4000 times out from this VPS (hairpin).
       PQTALKIE_URL: http://192.168.245.99:4000
       # Per-device kiosk slug (not the HTTPS SPA URL on :3443). Channel comes from auth.
-      PQTALKIE_TOKENS: '{"bodycam-03":"GeBZjp9Jah1eE7mLNV1xqWPj"}'
+      # ESP bodycam kiosk slug (channel comes from PQTALKIE auth — ch 11).
+      PQTALKIE_TOKENS: '{"bodycam-03":"nW6M9EmsFqX2OLvyfoxaP7Yw"}'
       # Optional default if a unit has no entry in PQTALKIE_TOKENS:
       PQTALKIE_TOKEN: ""
       DATA_DIR: /data

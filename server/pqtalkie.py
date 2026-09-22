@@ -72,11 +72,72 @@ def _env_tokens() -> dict[str, str]:
 
 
 def wav_to_pcm(raw: bytes) -> bytes:
+    """Extract s16le mono @ SAMPLE_RATE from WAV/PCM.
+
+    Crit-crit on the amp is often stereo or 8 kHz PCM played as 16 kHz mono.
+    """
+    if not raw:
+        return b""
+    rate = SAMPLE_RATE
+    ch = 1
+    pcm = raw
     if len(raw) >= 44 and raw[:4] == b"RIFF":
-        i = raw.find(b"data")
-        if i >= 0 and i + 8 <= len(raw):
-            return raw[i + 8 :]
-    return raw
+        # fmt chunk: audio format, channels, sample rate, bits
+        try:
+            # Standard PCM WAV: channels @ 22, rate @ 24, bits @ 34
+            ch = struct.unpack_from("<H", raw, 22)[0] or 1
+            rate = struct.unpack_from("<I", raw, 24)[0] or SAMPLE_RATE
+            bits = struct.unpack_from("<H", raw, 34)[0] or 16
+            i = raw.find(b"data")
+            if i >= 0 and i + 8 <= len(raw):
+                pcm = raw[i + 8 :]
+            if bits != 16:
+                # Only s16le is supported on the bodycam path.
+                return b""
+        except Exception:
+            i = raw.find(b"data")
+            if i >= 0 and i + 8 <= len(raw):
+                pcm = raw[i + 8 :]
+    # Stereo → mono (left)
+    if ch >= 2 and len(pcm) >= 4:
+        samples = memoryview(pcm).cast("h")
+        mono = bytearray(len(samples) // ch * 2)
+        mv = memoryview(mono).cast("h")
+        for i in range(len(mv)):
+            mv[i] = samples[i * ch]
+        pcm = bytes(mono)
+    # Resample to 16 kHz if needed (common HT/web path is 8 kHz).
+    if rate > 0 and rate != SAMPLE_RATE and len(pcm) >= 4:
+        src = memoryview(pcm).cast("h")
+        n_src = len(src)
+        n_dst = max(1, int(round(n_src * SAMPLE_RATE / float(rate))))
+        out = bytearray(n_dst * 2)
+        dst = memoryview(out).cast("h")
+        if n_src == 1:
+            for i in range(n_dst):
+                dst[i] = src[0]
+        else:
+            for i in range(n_dst):
+                pos = i * (n_src - 1) / float(n_dst - 1)
+                i0 = int(pos)
+                i1 = i0 + 1 if i0 + 1 < n_src else i0
+                frac = pos - i0
+                dst[i] = int(src[i0] * (1.0 - frac) + src[i1] * frac)
+        pcm = bytes(out)
+    # Gentle boost without hard clip (hard clip → crit-crit on MAX98357).
+    if len(pcm) >= 2:
+        samples = memoryview(pcm).cast("h")
+        out = bytearray(len(pcm))
+        dst = memoryview(out).cast("h")
+        for i, s in enumerate(samples):
+            v = int(s) * 3
+            if v > 24000:
+                v = 24000
+            elif v < -24000:
+                v = -24000
+            dst[i] = v
+        pcm = bytes(out)
+    return pcm
 
 
 def pcm_wav(pcm: bytes, rate: int = SAMPLE_RATE) -> bytes:

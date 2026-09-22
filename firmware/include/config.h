@@ -90,9 +90,10 @@
 #define NIGHT_IR_PIN    -1
 
 // ============================================================
-// SPEAKER — MAX98357 / I2S DAC  (I2S_NUM_1, not the mic)
+// SPEAKER — MAX98357 (I2S_NUM_1)
 //   VIN -> 5V   GND -> GND
 //   DIN -> GPIO 38   BCLK -> GPIO 40   LRC -> GPIO 39
+//   GAIN -> float   SD -> 3V3 (= RIGHT channel only)
 // ============================================================
 #define SPK_I2S_DOUT    38
 #define SPK_I2S_BCLK    40
