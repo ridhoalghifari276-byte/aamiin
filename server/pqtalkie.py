@@ -84,20 +84,16 @@ def _pcm_peak(pcm: bytes) -> int:
 
 
 def _normalize_pcm(pcm: bytes, target: int = 10000) -> bytes:
-    """Scale to a speech-friendly peak. Hard clip → square-wave crit on MAX98357."""
+    """Only tame rare overs. Per-chunk peak→target AGC destroys speech (sounds like a broken speaker)."""
     if len(pcm) < 2:
         return pcm
     peak = _pcm_peak(pcm)
     if peak < 80:
-        return pcm  # near silence
-    if peak <= target:
-        # Quiet talk: mild boost only (never past target).
-        if peak < target // 3:
-            scale = min(3.0, target / float(peak))
-        else:
-            return pcm
-    else:
-        scale = target / float(peak)
+        return pcm
+    # Soft ceiling only — never boost every 20 ms frame to full scale.
+    if peak <= 28000:
+        return pcm
+    scale = 24000.0 / float(peak)
     samples = memoryview(pcm).cast("h")
     out = bytearray(len(pcm))
     dst = memoryview(out).cast("h")
@@ -111,18 +107,17 @@ def _normalize_pcm(pcm: bytes, target: int = 10000) -> bytes:
     return bytes(out)
 
 
-def wav_to_pcm(raw: bytes) -> bytes:
-    """Extract s16le mono @ SAMPLE_RATE from WAV/PCM.
-
-    Crit-crit on the amp is usually: wrong rate/channels, or hard-clipped gain.
-    """
+def wav_to_pcm(raw: bytes) -> tuple[bytes, dict]:
+    """Extract s16le mono @ SAMPLE_RATE from WAV/PCM. Returns (pcm, info)."""
+    info = {"kind": "raw", "rate": SAMPLE_RATE, "ch": 1, "bits": 16, "fmt": 1}
     if not raw:
-        return b""
+        return b"", info
     rate = SAMPLE_RATE
     ch = 1
     bits = 16
     pcm = raw
     if len(raw) >= 12 and raw[:4] == b"RIFF" and raw[8:12] == b"WAVE":
+        info["kind"] = "wav"
         pos = 12
         try:
             while pos + 8 <= len(raw):
@@ -135,9 +130,9 @@ def wav_to_pcm(raw: bytes) -> bytes:
                     ch = struct.unpack_from("<H", raw, body + 2)[0] or 1
                     rate = struct.unpack_from("<I", raw, body + 4)[0] or SAMPLE_RATE
                     bits = struct.unpack_from("<H", raw, body + 14)[0] or 16
-                    # 1 = PCM, 65534 = WAVE_FORMAT_EXTENSIBLE (still PCM payload)
+                    info.update({"fmt": fmt, "ch": ch, "rate": rate, "bits": bits})
                     if fmt not in (1, 65534):
-                        return b""
+                        return b"", info
                 elif tag == b"data":
                     pcm = raw[body:end]
                     break
@@ -147,7 +142,19 @@ def wav_to_pcm(raw: bytes) -> bytes:
             if i >= 0 and i + 8 <= len(raw):
                 pcm = raw[i + 8 :]
         if bits != 16:
-            return b""
+            return b"", info
+    else:
+        # Bare PCM from some HT clients is often 8 kHz mono.
+        # 20 ms @ 8 kHz = 320 samples = 640 bytes (common PTT frame).
+        if len(pcm) in (640, 320, 1600, 800) or (len(pcm) >= 640 and len(pcm) <= 720 and len(pcm) % 2 == 0):
+            # Prefer 8 kHz when frame size matches classic 20 ms @ 8 kHz (±headerless).
+            if len(pcm) <= 720:
+                rate = 8000
+                info["rate"] = rate
+                info["kind"] = "raw8k"
+    info["ch"] = ch
+    info["rate"] = rate
+    info["bits"] = bits
     # Stereo/multi → mono (average first two channels)
     if ch >= 2 and len(pcm) >= 4:
         samples = memoryview(pcm).cast("h")
@@ -156,13 +163,11 @@ def wav_to_pcm(raw: bytes) -> bytes:
         mv = memoryview(mono).cast("h")
         for i in range(n_frames):
             base = i * ch
-            if ch >= 2:
-                mv[i] = (int(samples[base]) + int(samples[base + 1])) // 2
-            else:
-                mv[i] = samples[base]
+            mv[i] = (int(samples[base]) + int(samples[base + 1])) // 2
         pcm = bytes(mono)
         ch = 1
-    # Resample to 16 kHz if needed (common HT/web path is 8 kHz).
+        info["ch"] = 1
+    # Resample to 16 kHz if needed.
     if rate > 0 and rate != SAMPLE_RATE and len(pcm) >= 4:
         src = memoryview(pcm).cast("h")
         n_src = len(src)
@@ -180,7 +185,11 @@ def wav_to_pcm(raw: bytes) -> bytes:
                 frac = pos - i0
                 dst[i] = int(src[i0] * (1.0 - frac) + src[i1] * frac)
         pcm = bytes(out)
-    return _normalize_pcm(pcm)
+        info["rate_out"] = SAMPLE_RATE
+    pcm = _normalize_pcm(pcm)
+    info["peak"] = _pcm_peak(pcm)
+    info["out"] = len(pcm)
+    return pcm, info
 
 
 def pcm_wav(pcm: bytes, rate: int = SAMPLE_RATE) -> bytes:
@@ -444,7 +453,7 @@ class TalkieBridge:
                     return
             else:
                 return
-            pcm = wav_to_pcm(raw)
+            pcm, meta = wav_to_pcm(raw)
             if not pcm:
                 return
             with self._lock:
@@ -452,11 +461,11 @@ class TalkieBridge:
                 self.rx_bytes += len(pcm)
                 self.rx_at = time.time()
                 n = self.rx_chunks
-            if n <= 5 or n % 50 == 0:
-                rif = "wav" if raw[:4] == b"RIFF" else "raw"
+            if n <= 8 or n % 50 == 0:
                 print(
                     f"[ptt] {self.device} RX radio audio #{n} "
-                    f"in={len(raw)} out={len(pcm)} peak={_pcm_peak(pcm)} {rif}",
+                    f"in={len(raw)} out={len(pcm)} peak={meta.get('peak', _pcm_peak(pcm))} "
+                    f"{meta.get('kind')} rate={meta.get('rate')} ch={meta.get('ch')} bits={meta.get('bits')}",
                     flush=True,
                 )
             push_radio_pcm(self.device, pcm)
