@@ -2212,7 +2212,10 @@
       const el = document.getElementById("ops-map");
       if (!el || typeof L === "undefined" || opsMap) return;
       opsMap = L.map(el, { zoomControl: true, attributionControl: false, worldCopyJump: true });
-      L.tileLayer("https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png", { maxZoom: 19 }).addTo(opsMap);
+      L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+        maxZoom: 19,
+        attribution: "&copy; OpenStreetMap",
+      }).addTo(opsMap);
       opsMap.setView([-2.5, 118], 5);
       opsLayer = L.layerGroup().addTo(opsMap);
       setTimeout(() => { if (opsMap) opsMap.invalidateSize(); }, 120);
