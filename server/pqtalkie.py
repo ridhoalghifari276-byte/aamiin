@@ -71,41 +71,97 @@ def _env_tokens() -> dict[str, str]:
     return out
 
 
+def _pcm_peak(pcm: bytes) -> int:
+    if len(pcm) < 2:
+        return 0
+    samples = memoryview(pcm).cast("h")
+    peak = 0
+    for s in samples:
+        a = -s if s < 0 else s
+        if a > peak:
+            peak = a
+    return int(peak)
+
+
+def _normalize_pcm(pcm: bytes, target: int = 10000) -> bytes:
+    """Scale to a speech-friendly peak. Hard clip → square-wave crit on MAX98357."""
+    if len(pcm) < 2:
+        return pcm
+    peak = _pcm_peak(pcm)
+    if peak < 80:
+        return pcm  # near silence
+    if peak <= target:
+        # Quiet talk: mild boost only (never past target).
+        if peak < target // 3:
+            scale = min(3.0, target / float(peak))
+        else:
+            return pcm
+    else:
+        scale = target / float(peak)
+    samples = memoryview(pcm).cast("h")
+    out = bytearray(len(pcm))
+    dst = memoryview(out).cast("h")
+    for i, s in enumerate(samples):
+        v = int(round(s * scale))
+        if v > 32767:
+            v = 32767
+        elif v < -32768:
+            v = -32768
+        dst[i] = v
+    return bytes(out)
+
+
 def wav_to_pcm(raw: bytes) -> bytes:
     """Extract s16le mono @ SAMPLE_RATE from WAV/PCM.
 
-    Crit-crit on the amp is often stereo or 8 kHz PCM played as 16 kHz mono.
+    Crit-crit on the amp is usually: wrong rate/channels, or hard-clipped gain.
     """
     if not raw:
         return b""
     rate = SAMPLE_RATE
     ch = 1
+    bits = 16
     pcm = raw
-    if len(raw) >= 44 and raw[:4] == b"RIFF":
-        # fmt chunk: audio format, channels, sample rate, bits
+    if len(raw) >= 12 and raw[:4] == b"RIFF" and raw[8:12] == b"WAVE":
+        pos = 12
         try:
-            # Standard PCM WAV: channels @ 22, rate @ 24, bits @ 34
-            ch = struct.unpack_from("<H", raw, 22)[0] or 1
-            rate = struct.unpack_from("<I", raw, 24)[0] or SAMPLE_RATE
-            bits = struct.unpack_from("<H", raw, 34)[0] or 16
-            i = raw.find(b"data")
-            if i >= 0 and i + 8 <= len(raw):
-                pcm = raw[i + 8 :]
-            if bits != 16:
-                # Only s16le is supported on the bodycam path.
-                return b""
+            while pos + 8 <= len(raw):
+                tag = raw[pos : pos + 4]
+                sz = struct.unpack_from("<I", raw, pos + 4)[0]
+                body = pos + 8
+                end = min(len(raw), body + max(0, sz))
+                if tag == b"fmt " and sz >= 16 and body + 16 <= len(raw):
+                    fmt = struct.unpack_from("<H", raw, body)[0]
+                    ch = struct.unpack_from("<H", raw, body + 2)[0] or 1
+                    rate = struct.unpack_from("<I", raw, body + 4)[0] or SAMPLE_RATE
+                    bits = struct.unpack_from("<H", raw, body + 14)[0] or 16
+                    # 1 = PCM, 65534 = WAVE_FORMAT_EXTENSIBLE (still PCM payload)
+                    if fmt not in (1, 65534):
+                        return b""
+                elif tag == b"data":
+                    pcm = raw[body:end]
+                    break
+                pos = body + sz + (sz & 1)
         except Exception:
             i = raw.find(b"data")
             if i >= 0 and i + 8 <= len(raw):
                 pcm = raw[i + 8 :]
-    # Stereo → mono (left)
+        if bits != 16:
+            return b""
+    # Stereo/multi → mono (average first two channels)
     if ch >= 2 and len(pcm) >= 4:
         samples = memoryview(pcm).cast("h")
-        mono = bytearray(len(samples) // ch * 2)
+        n_frames = len(samples) // ch
+        mono = bytearray(n_frames * 2)
         mv = memoryview(mono).cast("h")
-        for i in range(len(mv)):
-            mv[i] = samples[i * ch]
+        for i in range(n_frames):
+            base = i * ch
+            if ch >= 2:
+                mv[i] = (int(samples[base]) + int(samples[base + 1])) // 2
+            else:
+                mv[i] = samples[base]
         pcm = bytes(mono)
+        ch = 1
     # Resample to 16 kHz if needed (common HT/web path is 8 kHz).
     if rate > 0 and rate != SAMPLE_RATE and len(pcm) >= 4:
         src = memoryview(pcm).cast("h")
@@ -124,20 +180,7 @@ def wav_to_pcm(raw: bytes) -> bytes:
                 frac = pos - i0
                 dst[i] = int(src[i0] * (1.0 - frac) + src[i1] * frac)
         pcm = bytes(out)
-    # Gentle boost without hard clip (hard clip → crit-crit on MAX98357).
-    if len(pcm) >= 2:
-        samples = memoryview(pcm).cast("h")
-        out = bytearray(len(pcm))
-        dst = memoryview(out).cast("h")
-        for i, s in enumerate(samples):
-            v = int(s) * 3
-            if v > 24000:
-                v = 24000
-            elif v < -24000:
-                v = -24000
-            dst[i] = v
-        pcm = bytes(out)
-    return pcm
+    return _normalize_pcm(pcm)
 
 
 def pcm_wav(pcm: bytes, rate: int = SAMPLE_RATE) -> bytes:
@@ -409,9 +452,11 @@ class TalkieBridge:
                 self.rx_bytes += len(pcm)
                 self.rx_at = time.time()
                 n = self.rx_chunks
-            if n <= 3 or n % 50 == 0:
+            if n <= 5 or n % 50 == 0:
+                rif = "wav" if raw[:4] == b"RIFF" else "raw"
                 print(
-                    f"[ptt] {self.device} RX radio audio #{n} bytes={len(pcm)}",
+                    f"[ptt] {self.device} RX radio audio #{n} "
+                    f"in={len(raw)} out={len(pcm)} peak={_pcm_peak(pcm)} {rif}",
                     flush=True,
                 )
             push_radio_pcm(self.device, pcm)

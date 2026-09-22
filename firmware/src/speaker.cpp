@@ -19,7 +19,8 @@
 //   GND = LEFT only / shutdown (depending on board)
 
 static const size_t SPK_RING = 8000;  // 0.5 s s16le mono
-static const int SPK_GAIN = 8;       // audible; soft-limit avoids square-wave crit
+// Gateway already normalizes speech peak (~10k). Extra ×N here → square-wave crit.
+static const int SPK_GAIN = 1;
 static int16_t *spkRing = nullptr;
 static volatile size_t spkW = 0;
 static volatile size_t spkR = 0;
@@ -43,8 +44,8 @@ void speakerPush(const uint8_t *pcm, size_t bytes) {
   if (xSemaphoreTake(spkMu, pdMS_TO_TICKS(20)) != pdTRUE) return;
   for (size_t i = 0; i < n; i++) {
     int32_t v = (int32_t)src[i] * SPK_GAIN;
-    if (v > 22000) v = 22000;
-    if (v < -22000) v = -22000;
+    if (v > 32767) v = 32767;
+    if (v < -32768) v = -32768;
     int32_t a = v < 0 ? -v : v;
     if (a > peak) peak = a;
     size_t next = (spkW + 1) % SPK_RING;
