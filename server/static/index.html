@@ -1283,12 +1283,12 @@
             <div id="map-empty" class="map-empty">Menunggu GPS lock<br/>GPS searching · 0 sat</div>
           </div>
           <form id="ptt-token-form" class="ptt-token-form">
-            <label>Tautan radio PQTALKIE</label>
-            <input id="ptt-token-input" type="text" autocomplete="off" placeholder="https://45.250.101.16:3443/r/…" />
-            <button type="submit">Simpan tautan</button>
+            <label>Token kiosk PQTALKIE (per unit)</label>
+            <input id="ptt-token-input" type="text" autocomplete="off" placeholder="GeBZjp9Jah1eE7mLNV1xqWPj" />
+            <button type="submit">Simpan token</button>
             <span id="ptt-token-msg" class="hint"></span>
           </form>
-          <p class="hint">HT connected = hijau di kartu. GPIO 14 = PTT. GPIO 21 = SOS. Pin peta muncul setelah GPS lock (bukan searching).</p>
+          <p class="hint">API radio = http://45.250.101.16:4000 (bukan :3443/r/…). HT connected = hijau. GPIO 14 = PTT · GPIO 21 = SOS. Pin peta setelah GPS lock.</p>
         </div>
       </aside>
     </div>
@@ -1352,7 +1352,7 @@
             if (radio.label) bits.push(radio.label);
             if (radio.user) bits.push(radio.user);
             if (radio.channelId != null) bits.push("ch " + radio.channelId);
-            pttTokenMsg.textContent = (bits.join(" · ") || "tautan tersimpan") + " — GPIO 14 PTT";
+            pttTokenMsg.textContent = (bits.join(" · ") || "token tersimpan") + " — GPIO 14 PTT";
           }
         } catch (err) {
           pttTokenMsg.textContent = String(err.message || err);

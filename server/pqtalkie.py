@@ -1,9 +1,13 @@
 """Bridge bodycam PTT (GPIO hold-to-talk) into PQTALKIE radio.
 
-PQTALKIE kiosk flow (from https://45.250.101.16:3443):
-  POST /api/auth/kiosk  {token: <kiosk token from the web>}
-  socket.io auth {token: jwt}
+Native IoT client — same protocol as the web App, not the HTTPS SPA on :3443.
+
+  API_BASE = http://45.250.101.16:4000   (REST + Socket.IO, cleartext)
+  POST /auth/kiosk  {token: <kiosk slug>}  → JWT, user, channelId
+  Socket.IO ws://host:4000  auth {token: jwt}
   emit ptt:join / ptt:request / ptt:audio (WAV 16 kHz) / ptt:release
+
+Do not point this bridge at https://…:3443/r/… — that is the browser SPA.
 """
 from __future__ import annotations
 
@@ -14,16 +18,22 @@ import struct
 import threading
 import time
 from collections import deque
+from urllib.parse import urlparse
 
 import httpx
 
-PQTALKIE_URL = (os.getenv("PQTALKIE_URL") or "https://45.250.101.16:3443").rstrip("/")
-PQTALKIE_INSECURE = os.getenv("PQTALKIE_INSECURE", "1") not in ("0", "false", "False")
+PQTALKIE_URL = (os.getenv("PQTALKIE_URL") or "http://45.250.101.16:4000").rstrip("/")
+_scheme = (urlparse(PQTALKIE_URL).scheme or "http").lower()
+# Cleartext :4000 needs no TLS. HTTPS (e.g. nginx :3443) may use self-signed.
+PQTALKIE_INSECURE = os.getenv(
+    "PQTALKIE_INSECURE",
+    "1" if _scheme == "https" else "0",
+) not in ("0", "false", "False")
 SAMPLE_RATE = 16000
 
 
 def normalize_kiosk_token(raw: str) -> str:
-    """Accept a raw kiosk slug or the full tautan /r/... from the radio web."""
+    """Accept a raw kiosk slug or a paste of the web tautan …/r/<slug>."""
     raw = (raw or "").strip().strip("\"'")
     if not raw:
         return ""
@@ -206,7 +216,7 @@ class TalkieBridge:
         if token:
             headers["Authorization"] = f"Bearer {token}"
         url = PQTALKIE_URL + path
-        # Kiosk auth on :3443 often takes 3–5s; 3.0 caused false "timed out".
+        # Native API on :4000 is usually fast; keep headroom for cold start.
         with httpx.Client(verify=not PQTALKIE_INSECURE, timeout=12.0) as c:
             r = c.post(url, headers=headers, json=body)
             r.raise_for_status()
@@ -242,7 +252,8 @@ class TalkieBridge:
     def _connect_once(self):
         data = None
         last = None
-        for path in ("/api/auth/kiosk", "/auth/kiosk"):
+        # Prefer raw API path (:4000). /api/auth/kiosk is the nginx SPA proxy on :3443.
+        for path in ("/auth/kiosk", "/api/auth/kiosk"):
             try:
                 data = self._post(path, {"token": self.kiosk_token})
                 break
@@ -274,7 +285,7 @@ class TalkieBridge:
             return
         self._disconnect()
         sio = socketio.Client(
-            ssl_verify=not PQTALKIE_INSECURE,
+            ssl_verify=False if _scheme == "http" else (not PQTALKIE_INSECURE),
             reconnection=False,
         )
         jwt = self.jwt
