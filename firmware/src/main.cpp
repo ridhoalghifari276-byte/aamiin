@@ -748,13 +748,14 @@ static void houseKeepTask(void *) {
     // Sockets down: bounce WS back to the public VPS. Never scan the LAN.
     if (wsConnected || audioWsConnected) {
       linkOkAt = millis();
-    } else if (millis() - linkOkAt > 60000) {
+    } else if (millis() - linkOkAt > 20000) {
       Serial.printf("[NET] still no VPS from %s — WS retry %s:%d\n",
                     WiFi.localIP().toString().c_str(), SERVER_HOST, SERVER_PORT);
       serverHost = SERVER_HOST;
       stopWebSocket();
       stopAudioWebSocket();
-      WiFi.setSleep(true);
+      // Keep modem awake — sleep made MiFi reconnects worse.
+      WiFi.setSleep(false);
       linkOkAt = millis();
     }
 
@@ -816,13 +817,18 @@ static void streamTxTask(void *) {
 
     uint32_t now = millis();
     if ((int32_t)(now - nextFrame) >= 0) {
-      uint32_t t0 = now;
-      sendVideoFrame();
-      now = millis();
-      nextFrame = t0 + framePeriod;
-      if ((int32_t)(now - nextFrame) >= 0) {
-        // WAN slower than the target FPS: send the next (latest) frame now.
-        nextFrame = now;
+      // MiFi uplink sempit: kalau ring audio hampir penuh, skip frame supaya WS tidak drop.
+      if (ringCount() > (AUDIO_RING_SAMPLES * 3) / 4) {
+        drainCamFb();
+        nextFrame = now + framePeriod;
+      } else {
+        uint32_t t0 = now;
+        sendVideoFrame();
+        now = millis();
+        nextFrame = t0 + framePeriod;
+        if ((int32_t)(now - nextFrame) >= 0) {
+          nextFrame = now;
+        }
       }
     }
 

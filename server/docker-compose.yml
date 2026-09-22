@@ -34,7 +34,10 @@ services:
       # ESP32-S3-CAM dipasang horizontal → putar frame agar tegak (0/90/180/270)
       CAMERA_ROTATE: "270"
     ports:
+      # Dashboard browser
       - "7890:8080"
+      # ESP bodycam (allowlist QMeet; jangan 7891)
+      - "4301:8080"
     volumes:
       - ./data:/data
     healthcheck:
