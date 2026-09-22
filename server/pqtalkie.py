@@ -712,6 +712,18 @@ class TalkieBridge:
             mime = str(data.get("mime") or data.get("type") or "")
             pcm, meta = wav_to_pcm(raw, mime)
             if not pcm:
+                with self._lock:
+                    self.rx_fail = getattr(self, "rx_fail", 0) + 1
+                    nfail = self.rx_fail
+                if nfail <= 8 or nfail % 50 == 0:
+                    print(
+                        f"[ptt] {self.device} RX radio DROP #{nfail} "
+                        f"in={len(raw)} kind={meta.get('kind')} "
+                        f"rate={meta.get('rate')} frames={meta.get('frames')} "
+                        f"hex={meta.get('hex', '')} mime={mime!r} "
+                        f"err={meta.get('err')!r}",
+                        flush=True,
+                    )
                 return
             with self._lock:
                 self.rx_chunks += 1
