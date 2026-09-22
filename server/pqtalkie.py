@@ -231,85 +231,116 @@ def _opus_decoder(rate: int, channels: int):
         return dec
 
 
-def _parse_pqop(raw: bytes) -> dict | None:
-    """PQTALKIE Opus frame: PQOP | ver | ch | rate_u32le | u16 | u16 | opus..."""
+def _parse_pqop_frames(raw: bytes) -> dict | None:
+    """PQTALKIE Opus blob: PQOP|ver|ch|rate_u32le|frame_ms_u16 then [len_u16][opus]..."""
     if len(raw) < 14 or raw[:4] != b"PQOP":
         return None
     ch = int(raw[5]) or 1
     rate = struct.unpack_from("<I", raw, 6)[0] or 48000
-    misc = struct.unpack_from("<H", raw, 10)[0]
-    length = struct.unpack_from("<H", raw, 12)[0]
+    frame_ms = struct.unpack_from("<H", raw, 10)[0] or 20
+    frames: list[bytes] = []
+    pos = 12
+    while pos + 2 <= len(raw):
+        n = struct.unpack_from("<H", raw, pos)[0]
+        pos += 2
+        if n <= 0 or pos + n > len(raw):
+            break
+        frames.append(raw[pos : pos + n])
+        pos += n
     return {
         "ver": int(raw[4]),
         "ch": ch,
         "rate": rate,
-        "misc": misc,
-        "length": length,
-        "payload": raw[14:],
+        "frame_ms": frame_ms,
+        "frames": frames,
+        "consumed": pos,
+        "raw_len": len(raw),
     }
 
 
+def _decode_opus_packets(
+    packets: list[bytes], *, out_rate: int, channels: int, frame_ms: int
+) -> bytes:
+    """Decode a list of Opus packets with a fresh decoder → s16le PCM."""
+    if not packets:
+        return b""
+    import opuslib
+
+    ch = 1 if channels < 2 else 2
+    dec = opuslib.Decoder(int(out_rate), ch)
+    # Opus allows up to 120 ms; use header frame_ms with headroom.
+    ms = max(10, min(120, int(frame_ms or 20)))
+    frame_size = int(out_rate) * ms // 1000
+    if frame_size < 120:
+        frame_size = int(out_rate) * 120 // 1000
+    parts: list[bytes] = []
+    for pkt in packets:
+        if not pkt:
+            continue
+        parts.append(dec.decode(bytes(pkt), frame_size))
+    pcm = b"".join(parts)
+    if ch >= 2:
+        pcm = _downmix_stereo(pcm)
+    return pcm
+
+
 def opus_to_pcm(raw: bytes) -> tuple[bytes, dict]:
-    """Decode audio/opus (optional PQOP header) to mono s16le @ SAMPLE_RATE."""
+    """Decode audio/opus (optional PQOP multi-frame header) to mono s16le @ SAMPLE_RATE."""
     info: dict = {"kind": "opus", "bits": 16, "fmt": "opus"}
     if not raw:
         return b"", info
+
     rate = 48000
     ch = 1
-    candidates: list[bytes] = []
+    frame_ms = 20
+    packets: list[bytes] = []
+
     if raw.startswith(b"PQOP"):
-        hdr = _parse_pqop(raw)
+        hdr = _parse_pqop_frames(raw)
         if not hdr:
             info["err"] = "bad PQOP"
             return b"", info
         rate = int(hdr["rate"]) or 48000
         ch = int(hdr["ch"]) or 1
-        payload = hdr["payload"]
+        frame_ms = int(hdr["frame_ms"]) or 20
+        packets = list(hdr["frames"] or [])
         info.update(
             {
                 "kind": "pqop/opus",
                 "rate": rate,
                 "ch": ch,
-                "pqop_len": hdr["length"],
+                "frame_ms": frame_ms,
+                "frames": len(packets),
                 "hex": raw[:16].hex(),
             }
         )
-        plen = int(hdr["length"] or 0)
-        if 10 <= plen <= len(payload):
-            candidates.append(payload[:plen])
-        candidates.append(payload)
+        # Fallback: treat bytes after 12-byte header as one Opus packet.
+        if not packets and len(raw) > 12:
+            packets = [raw[12:]]
+            info["note"] = "pqop-blob"
     else:
         info["hex"] = raw[:16].hex()
         info["rate"] = rate
         info["ch"] = ch
-        candidates.append(raw)
+        packets = [raw]
 
     last_err: object = None
     pcm = b""
-    for cand in candidates:
-        if not cand:
-            continue
+    # Prefer decode straight to bodycam rate (libopus resamples).
+    for out_rate in (SAMPLE_RATE, rate):
         try:
-            dec = _opus_decoder(SAMPLE_RATE, 1)
-            frame_size = SAMPLE_RATE * 120 // 1000
-            pcm = dec.decode(bytes(cand), frame_size)
+            pcm = _decode_opus_packets(
+                packets, out_rate=out_rate, channels=ch, frame_ms=frame_ms
+            )
+            if out_rate != SAMPLE_RATE:
+                pcm = _resample_to_16k(pcm, out_rate)
+                info["note"] = (info.get("note") or "") + f"+rs{out_rate}"
             last_err = None
             break
-        except Exception as e1:
-            last_err = e1
-            try:
-                dec = _opus_decoder(rate, 1 if ch < 2 else 2)
-                frame_size = rate * 120 // 1000
-                pcm = dec.decode(bytes(cand), frame_size)
-                if ch >= 2:
-                    pcm = _downmix_stereo(pcm)
-                pcm = _resample_to_16k(pcm, rate)
-                info["note"] = f"fallback48:{e1}"
-                last_err = None
-                break
-            except Exception as e2:
-                last_err = f"{e1} / {e2}"
-                pcm = b""
+        except Exception as e:
+            last_err = e
+            pcm = b""
+
     if not pcm:
         info["err"] = f"opus decode failed: {last_err}"
         return b"", info
@@ -692,7 +723,9 @@ class TalkieBridge:
                     f"[ptt] {self.device} RX radio audio #{n} "
                     f"in={len(raw)} out={len(pcm)} peak={meta.get('peak')} "
                     f"clip={meta.get('clip')} kind={meta.get('kind')} "
-                    f"rate={meta.get('rate')} hex={meta.get('hex', '')} mime={mime!r}",
+                    f"rate={meta.get('rate')} frames={meta.get('frames')} "
+                    f"hex={meta.get('hex', '')} mime={mime!r}"
+                    + (f" err={meta.get('err')}" if meta.get("err") else ""),
                     flush=True,
                 )
             push_radio_pcm(self.device, pcm)
