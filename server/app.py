@@ -1648,28 +1648,25 @@ async def ws_audio(websocket: WebSocket):
             except WebSocketDisconnect:
                 return
             except Exception as e:
+                # Keep mic uplink alive; downlink glitches must not kill /ws/audio.
                 print(f"[ws-audio] speaker {device}: {e}", flush=True)
                 await asyncio.sleep(0.25)
 
     recv_task = asyncio.create_task(recv_mic())
     spk_task = asyncio.create_task(speaker_down())
     try:
-        done, pending = await asyncio.wait(
-            {recv_task, spk_task}, return_when=asyncio.FIRST_COMPLETED
-        )
-        for t in pending:
-            t.cancel()
-        for t in done:
-            exc = t.exception() if not t.cancelled() else None
-            if exc:
-                raise exc
+        # Only end the socket when the mic uplink dies — not when speaker task flaps.
+        await recv_task
     except WebSocketDisconnect:
         pass
     except Exception as e:
         print(f"[ws-audio] {device} error: {e}", flush=True)
     finally:
-        recv_task.cancel()
         spk_task.cancel()
+        try:
+            await spk_task
+        except Exception:
+            pass
         print(f"[ws-audio] disconnected {device}", flush=True)
 
 

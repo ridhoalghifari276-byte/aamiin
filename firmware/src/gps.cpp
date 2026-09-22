@@ -136,6 +136,18 @@ static void parseRmc(char *line) {
   applyFix(lat, lon, -9999.0f, spd, crs, -1, true);
 }
 
+// $GPGSV,numMsg,msgNum,satsInView,... — update sats even before a fix.
+static void parseGsv(char *line) {
+  char *star = strchr(line, '*');
+  if (star) *star = 0;
+  char *f[8];
+  int n = splitCsv(line, f, 8);
+  if (n < 4 || !f[3][0]) return;
+  int nsat = atoi(f[3]);
+  if (nsat < 0) return;
+  noteNmea(nsat);
+}
+
 static void handleLine(char *line) {
   if (line[0] != '$') return;
   if (strchr(line, '*') && !nmeaChecksumOk(line)) return;
@@ -144,6 +156,8 @@ static void handleLine(char *line) {
     parseGga(line);
   } else if (talkerIs(line, "RMC")) {
     parseRmc(line);
+  } else if (talkerIs(line, "GSV")) {
+    parseGsv(line);
   }
 }
 

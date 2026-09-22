@@ -277,7 +277,8 @@ static void wsEvent(WStype_t type, uint8_t *payload, size_t length) {
     case WStype_CONNECTED:
       wsConnected = true;
       WiFi.setSleep(false);
-      streamWs.enableHeartbeat(15000, 3000, 2);
+      // Longer heartbeat — congested uplink was tripping 15s ping.
+      streamWs.enableHeartbeat(30000, 8000, 3);
       Serial.printf("[WS] connected: %s\n", payload ? (char *)payload : "");
       break;
     case WStype_DISCONNECTED:
@@ -308,7 +309,7 @@ static void audioWsEvent(WStype_t type, uint8_t *payload, size_t length) {
   switch (type) {
     case WStype_CONNECTED:
       audioWsConnected = true;
-      audioWs.enableHeartbeat(15000, 3000, 2);
+      audioWs.enableHeartbeat(30000, 8000, 3);
       ringClear();  // start live, not with whatever piled up while offline
       Serial.println("[WS-AUDIO] connected");
       break;
@@ -343,7 +344,8 @@ static void startAudioWebSocket() {
   if (audioWsStarted) return;
   String path = String("/ws/audio?device=") + deviceId + "&token=" + SERVER_TOKEN;
   audioWs.onEvent(audioWsEvent);
-  audioWs.setReconnectInterval(10000);
+  // Faster reconnect on flaky MiFi/VTA uplinks.
+  audioWs.setReconnectInterval(2500);
   audioWs.begin(serverHost.c_str(), SERVER_PORT, path.c_str(), "");
   audioWsStarted = true;
   Serial.printf("[WS-AUDIO] connecting %s:%d%s\n", serverHost.c_str(), SERVER_PORT, path.c_str());
@@ -374,7 +376,7 @@ static void startWebSocket() {
                 "&token=" + SERVER_TOKEN;
 
   streamWs.onEvent(wsEvent);
-  streamWs.setReconnectInterval(10000);
+  streamWs.setReconnectInterval(2500);
   // Empty subprotocol: FastAPI rejects Sec-WebSocket-Protocol: arduino.
   streamWs.begin(serverHost.c_str(), SERVER_PORT, path.c_str(), "");
   wsStarted = true;
@@ -396,13 +398,18 @@ static bool sendAudioWs() {
   if (!audioWsConnected || !audioRing) return false;
   bool any = false;
   int sent = 0;
-  // Two 125 ms packets = one firmware.zip 250 ms batch, without a single
-  // 8000-byte send that would stall lwIP.
-  while (ringCount() >= (size_t)AUDIO_TX_SAMPLES && sent < 2) {
+  // Drain harder when ring is backing up (MiFi uplink lag).
+  size_t backlog = ringCount();
+  int maxBurst = backlog > (size_t)(AUDIO_TX_SAMPLES * 4) ? 4 : 2;
+  while (ringCount() >= (size_t)AUDIO_TX_SAMPLES && sent < maxBurst) {
     size_t n = ringPop(txBuf, AUDIO_TX_SAMPLES);
     if (!n) break;
     if (!audioWs.sendBIN((uint8_t *)txBuf, n * sizeof(int16_t))) {
       ++txAudioDrops;
+      // Drop a chunk of stale audio so the ring cannot stay pegged full.
+      if (ringCount() > (size_t)(AUDIO_RING_SAMPLES / 2)) {
+        ringPop(txBuf, AUDIO_TX_SAMPLES);
+      }
       break;
     }
     ++txAudioPackets;
@@ -817,17 +824,20 @@ static void streamTxTask(void *) {
 
     uint32_t now = millis();
     if ((int32_t)(now - nextFrame) >= 0) {
-      // MiFi uplink sempit: kalau ring audio hampir penuh, skip frame supaya WS tidak drop.
-      if (ringCount() > (AUDIO_RING_SAMPLES * 3) / 4) {
+      // Prefer audio socket: skip JPEG when mic ring is backing up.
+      size_t backlog = ringCount();
+      bool congested = backlog > (AUDIO_RING_SAMPLES / 4);
+      if (congested) {
         drainCamFb();
-        nextFrame = now + framePeriod;
+        nextFrame = now + framePeriod * 2;
       } else {
         uint32_t t0 = now;
-        sendVideoFrame();
+        bool ok = sendVideoFrame();
         now = millis();
-        nextFrame = t0 + framePeriod;
+        // On send fail, back off harder so lwIP can drain audio.
+        nextFrame = t0 + (ok ? framePeriod : framePeriod * 3);
         if ((int32_t)(now - nextFrame) >= 0) {
-          nextFrame = now;
+          nextFrame = now + (ok ? 0 : framePeriod);
         }
       }
     }
@@ -858,6 +868,10 @@ void setup() {
   nightIr(false);
 
   provisionNetwork();
+  WiFi.setSleep(false);
+#if defined(WIFI_POWER_19_5dBm)
+  WiFi.setTxPower(WIFI_POWER_19_5dBm);
+#endif
   bindPublicServer();
 
   if (!initCam()) rgb(255, 0, 255);

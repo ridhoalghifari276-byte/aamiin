@@ -51,13 +51,12 @@
 #define CAM_HMIRROR     0
 
 // ============================================================
-// VIDEO — outdoor bodycam. Small JPEGs so FPS stays steady while running
-// over public Wi-Fi. q=12 overflowed the camera (FB-OVF / NO SIGNAL).
+// VIDEO — MiFi/VTA uplink is narrow; keep JPEG small so WS stays up.
 // ============================================================
 #define STREAM_WIDTH    640
 #define STREAM_HEIGHT   480
-#define JPEG_QUALITY    28
-#define STREAM_FPS      15
+#define JPEG_QUALITY    38
+#define STREAM_FPS      8
 
 // ============================================================
 // INMP441
