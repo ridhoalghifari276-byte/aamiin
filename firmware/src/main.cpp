@@ -277,8 +277,7 @@ static void wsEvent(WStype_t type, uint8_t *payload, size_t length) {
     case WStype_CONNECTED:
       wsConnected = true;
       WiFi.setSleep(false);
-      // Longer heartbeat — congested uplink was tripping 15s ping.
-      streamWs.enableHeartbeat(30000, 8000, 3);
+      streamWs.enableHeartbeat(15000, 3000, 2);
       Serial.printf("[WS] connected: %s\n", payload ? (char *)payload : "");
       break;
     case WStype_DISCONNECTED:
@@ -309,7 +308,7 @@ static void audioWsEvent(WStype_t type, uint8_t *payload, size_t length) {
   switch (type) {
     case WStype_CONNECTED:
       audioWsConnected = true;
-      audioWs.enableHeartbeat(30000, 8000, 3);
+      audioWs.enableHeartbeat(15000, 3000, 2);
       ringClear();  // start live, not with whatever piled up while offline
       Serial.println("[WS-AUDIO] connected");
       break;
@@ -344,8 +343,7 @@ static void startAudioWebSocket() {
   if (audioWsStarted) return;
   String path = String("/ws/audio?device=") + deviceId + "&token=" + SERVER_TOKEN;
   audioWs.onEvent(audioWsEvent);
-  // Faster reconnect on flaky MiFi/VTA uplinks.
-  audioWs.setReconnectInterval(2500);
+  audioWs.setReconnectInterval(10000);
   audioWs.begin(serverHost.c_str(), SERVER_PORT, path.c_str(), "");
   audioWsStarted = true;
   Serial.printf("[WS-AUDIO] connecting %s:%d%s\n", serverHost.c_str(), SERVER_PORT, path.c_str());
@@ -376,7 +374,7 @@ static void startWebSocket() {
                 "&token=" + SERVER_TOKEN;
 
   streamWs.onEvent(wsEvent);
-  streamWs.setReconnectInterval(2500);
+  streamWs.setReconnectInterval(10000);
   // Empty subprotocol: FastAPI rejects Sec-WebSocket-Protocol: arduino.
   streamWs.begin(serverHost.c_str(), SERVER_PORT, path.c_str(), "");
   wsStarted = true;
@@ -398,18 +396,13 @@ static bool sendAudioWs() {
   if (!audioWsConnected || !audioRing) return false;
   bool any = false;
   int sent = 0;
-  // Drain harder when ring is backing up (MiFi uplink lag).
-  size_t backlog = ringCount();
-  int maxBurst = backlog > (size_t)(AUDIO_TX_SAMPLES * 4) ? 4 : 2;
-  while (ringCount() >= (size_t)AUDIO_TX_SAMPLES && sent < maxBurst) {
+  // Two 125 ms packets = one firmware.zip 250 ms batch, without a single
+  // 8000-byte send that would stall lwIP.
+  while (ringCount() >= (size_t)AUDIO_TX_SAMPLES && sent < 2) {
     size_t n = ringPop(txBuf, AUDIO_TX_SAMPLES);
     if (!n) break;
     if (!audioWs.sendBIN((uint8_t *)txBuf, n * sizeof(int16_t))) {
       ++txAudioDrops;
-      // Drop a chunk of stale audio so the ring cannot stay pegged full.
-      if (ringCount() > (size_t)(AUDIO_RING_SAMPLES / 2)) {
-        ringPop(txBuf, AUDIO_TX_SAMPLES);
-      }
       break;
     }
     ++txAudioPackets;
@@ -706,12 +699,6 @@ static bool btnPressed(BtnDebounce &b) {
 
 // ============================================================
 // AUDIO TX — owns the audio WebSocket. HTTP is only a last resort.
-//
-// Mic dual role (one INMP441):
-//   1) Livestream / rec  → PCM ke gateway → terdengar di dashboard
-//   2) PTT (GPIO 14)     → PCM yang sama di-feed ke PQTALKIE (HT TX)
-// Speaker ESP hanya memutar RX radio (rekan / SOS), bukan monitor live.
-// ============================================================
 static void audioTxTask(void *) {
   for (;;) {
     if (WiFi.status() != WL_CONNECTED) {
@@ -755,14 +742,13 @@ static void houseKeepTask(void *) {
     // Sockets down: bounce WS back to the public VPS. Never scan the LAN.
     if (wsConnected || audioWsConnected) {
       linkOkAt = millis();
-    } else if (millis() - linkOkAt > 20000) {
+    } else if (millis() - linkOkAt > 60000) {
       Serial.printf("[NET] still no VPS from %s — WS retry %s:%d\n",
                     WiFi.localIP().toString().c_str(), SERVER_HOST, SERVER_PORT);
       serverHost = SERVER_HOST;
       stopWebSocket();
       stopAudioWebSocket();
-      // Keep modem awake — sleep made MiFi reconnects worse.
-      WiFi.setSleep(false);
+      WiFi.setSleep(true);
       linkOkAt = millis();
     }
 
@@ -824,22 +810,13 @@ static void streamTxTask(void *) {
 
     uint32_t now = millis();
     if ((int32_t)(now - nextFrame) >= 0) {
-      // Prefer audio when backlog is high, but keep ~1 FPS so dashboard is not black.
-      static uint32_t lastKeepaliveVideo = 0;
-      size_t backlog = ringCount();
-      bool congested = backlog > (AUDIO_RING_SAMPLES / 2);
-      if (congested && (now - lastKeepaliveVideo) < 1000) {
-        drainCamFb();
-        nextFrame = now + framePeriod;
-      } else {
-        uint32_t t0 = now;
-        bool ok = sendVideoFrame();
-        if (ok) lastKeepaliveVideo = now;
-        now = millis();
-        nextFrame = t0 + (ok ? framePeriod : framePeriod * 2);
-        if ((int32_t)(now - nextFrame) >= 0) {
-          nextFrame = now;
-        }
+      uint32_t t0 = now;
+      sendVideoFrame();
+      now = millis();
+      nextFrame = t0 + framePeriod;
+      if ((int32_t)(now - nextFrame) >= 0) {
+        // WAN slower than the target FPS: send the next (latest) frame now.
+        nextFrame = now;
       }
     }
 
@@ -869,10 +846,6 @@ void setup() {
   nightIr(false);
 
   provisionNetwork();
-  WiFi.setSleep(false);
-#if defined(WIFI_POWER_19_5dBm)
-  WiFi.setTxPower(WIFI_POWER_19_5dBm);
-#endif
   bindPublicServer();
 
   if (!initCam()) rgb(255, 0, 255);
@@ -978,8 +951,7 @@ void loop() {
                   (int)videoEnabled, visualOn(), (int)streamEnabled);
   }
 
-  // GPIO 14: hold-to-talk → mic role switches to HT (PQTALKIE).
-  // While held: speaker muted so we do not play our own TX / echo.
+  // GPIO 14: hold-to-talk (PQTALKIE). Replaces night vision.
   bool pttRaw = digitalRead(BTN_PTT) == LOW;
   if (!pttArmed) {
     if (!pttRaw) pttArmed = true;

@@ -1070,14 +1070,11 @@
     }
     .media-modal.open { display: flex; }
     #live-speaker {
-      /* Must stay a real media element — 0×0/opacity:0 often mutes Chrome/Windows. */
-      position: fixed;
-      left: 8px;
-      bottom: 8px;
-      width: 36px;
-      height: 36px;
-      opacity: 0.15;
-      z-index: 80;
+      position: absolute;
+      width: 0;
+      height: 0;
+      opacity: 0;
+      pointer-events: none;
     }
     .media-modal-box {
       width: min(920px, 100%);
@@ -1209,7 +1206,7 @@
           <button type="button" class="nav-btn" data-view="faces">Wajah tercapture</button>
           <button type="button" class="nav-btn" data-view="registry">Wajah terdaftar</button>
         </nav>
-        <p class="hint">Mic otomatis live saat livestream (ke dashboard). GPIO 14 PTT = mic ke radio HT. Speaker bodycam hanya suara masuk dari HT. GPIO 1 tahan 7 dtk = reset Wi-Fi. GPIO 21 = SOS.</p>
+        <p class="hint">GPIO 1 rekam audio (tahan 7 detik = reset Wi-Fi). GPIO 3 rekam video + suara. GPIO 14 = PTT. GPIO 21 = SOS.</p>
       </aside>
 
       <section class="stage">
@@ -1291,7 +1288,7 @@
             <button type="submit">Simpan token</button>
             <span id="ptt-token-msg" class="hint"></span>
           </form>
-          <p class="hint">Mic: livestream → dashboard · PTT (GPIO 14) → PQTALKIE. Speaker: hanya RX HT (rekan/SOS). HT connected = hijau.</p>
+          <p class="hint">API radio = http://192.168.245.99:4000 (LAN VPS). HT connected = hijau. GPIO 14 = PTT · GPIO 21 = SOS · GPIO 1 tahan 7 dtk = reset Wi-Fi.</p>
         </div>
       </aside>
     </div>
@@ -1319,13 +1316,13 @@
     </div>
   </div>
 
-  <audio id="live-speaker" autoplay playsinline controls></audio>
+  <audio id="live-speaker" autoplay playsinline></audio>
 
   <script>
     const SAMPLE_RATE = 16000;
     // Bump when the worklet changes: the page is served no-store but the
     // module is not, and a stale jitter buffer is hard to diagnose.
-    const PCM_WORKLET_URL = "/static/pcm-player-worklet.js?v=12";
+    const PCM_WORKLET_URL = "/static/pcm-player-worklet.js?v=10";
     const BARS = 48;
 
     const deviceListEl = document.getElementById("device-list");
@@ -1780,16 +1777,13 @@
 
     function enqueuePcm(int16) {
       if (!audioCtx || !int16.length) return;
-      // Copy — posting a view into a WS ArrayBuffer can detach / go silent.
-      const samples = new Int16Array(int16.length);
-      samples.set(int16);
       if (pcmNode) {
-        pcmNode.port.postMessage({ type: "push", samples }, [samples.buffer]);
+        pcmNode.port.postMessage({ type: "push", samples: int16 });
         return;
       }
-      const f32 = new Float32Array(samples.length);
-      for (let i = 0; i < samples.length; i++) {
-        let v = samples[i] / 32768 * 2.5;
+      const f32 = new Float32Array(int16.length);
+      for (let i = 0; i < int16.length; i++) {
+        let v = int16[i] / 32768 * 1.5;
         if (v > 1) v = 1;
         if (v < -1) v = -1;
         f32[i] = v;
@@ -1876,14 +1870,9 @@
       analyser = audioCtx.createAnalyser();
       analyser.fftSize = 256;
       analyser.smoothingTimeConstant = 0.78;
-      // Dual sink: AudioContext.destination + <audio> element. Some Windows
-      // setups show a live spectrum but mute destination-only graphs.
-      const mediaDest = audioCtx.createMediaStreamDestination();
       if (liveSpeakerEl) {
-        liveSpeakerEl.srcObject = mediaDest.stream;
-        liveSpeakerEl.muted = false;
-        liveSpeakerEl.volume = 1;
-        liveSpeakerEl.play().catch(() => {});
+        liveSpeakerEl.pause();
+        liveSpeakerEl.srcObject = null;
       }
       try {
         await audioCtx.audioWorklet.addModule(PCM_WORKLET_URL);
@@ -1896,12 +1885,11 @@
             targetMs: 280,
             maxTargetMs: 560,
             maxMs: 800,
-            makeup: 2.8,
+            makeup: 1.0,
           },
         });
         pcmNode.connect(analyser);
         analyser.connect(audioCtx.destination);
-        analyser.connect(mediaDest);
         spectrumData = new Uint8Array(analyser.frequencyBinCount);
         spectrumLoop();
         startAudioSocket(device);
@@ -1911,10 +1899,9 @@
         pcmNode = null;
       }
       gainNode = audioCtx.createGain();
-      gainNode.gain.value = 2.5;
+      gainNode.gain.value = 1.5;
       gainNode.connect(analyser);
       analyser.connect(audioCtx.destination);
-      analyser.connect(mediaDest);
       spectrumData = new Uint8Array(analyser.frequencyBinCount);
       spectrumLoop();
       startAudioSocket(device);
@@ -3071,7 +3058,6 @@
       if (audioCtx && audioCtx.state === "suspended") audioCtx.resume();
       if (liveSpeakerEl && liveSpeakerEl.srcObject) liveSpeakerEl.play().catch(() => {});
       if (!speakerOn) setSpeaker(true);
-      else if (speakerOn && !audioWs) startAudioSocket(currentDevice);
     });
     document.addEventListener("visibilitychange", () => {
       if (document.hidden) {

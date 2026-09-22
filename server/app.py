@@ -1603,11 +1603,8 @@ async def ws_device(websocket: WebSocket):
 async def ws_audio(websocket: WebSocket):
     """ESP32 mic uplink + HT radio downlink on one socket (no JPEG HOL).
 
-    Mic roles (same PCM stream from the bodycam):
-      • always while livestream/rec → dashboard listeners (/ws/liveaudio)
-      • while PTT held → also bridged to PQTALKIE (feed_device_pcm)
-
-    Downlink 0x03 + s16le → bodycam speaker (HT peers / SOS only).
+    Uplink: raw s16le PCM (unchanged mic path).
+    Downlink: 0x03 + s16le → bodycam speaker.
     """
     await websocket.accept()
     device = websocket.query_params.get("device") or ""
@@ -1648,25 +1645,28 @@ async def ws_audio(websocket: WebSocket):
             except WebSocketDisconnect:
                 return
             except Exception as e:
-                # Keep mic uplink alive; downlink glitches must not kill /ws/audio.
                 print(f"[ws-audio] speaker {device}: {e}", flush=True)
                 await asyncio.sleep(0.25)
 
     recv_task = asyncio.create_task(recv_mic())
     spk_task = asyncio.create_task(speaker_down())
     try:
-        # Only end the socket when the mic uplink dies — not when speaker task flaps.
-        await recv_task
+        done, pending = await asyncio.wait(
+            {recv_task, spk_task}, return_when=asyncio.FIRST_COMPLETED
+        )
+        for t in pending:
+            t.cancel()
+        for t in done:
+            exc = t.exception() if not t.cancelled() else None
+            if exc:
+                raise exc
     except WebSocketDisconnect:
         pass
     except Exception as e:
         print(f"[ws-audio] {device} error: {e}", flush=True)
     finally:
+        recv_task.cancel()
         spk_task.cancel()
-        try:
-            await spk_task
-        except Exception:
-            pass
         print(f"[ws-audio] disconnected {device}", flush=True)
 
 

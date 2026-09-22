@@ -21,8 +21,7 @@
 // HTTP API (session/state)
 // Public VPS. Firmware always uses this host — no LAN /24 scan.
 #define SERVER_HOST     "45.250.101.17"
-// ESP ingest via 4301 (allowlist QMeet). Dashboard tetap :7890. Bukan 7891.
-#define SERVER_PORT     4301
+#define SERVER_PORT     7890
 #define SERVER_WS_PATH  "/ws/device"
 
 #define DEVICE_ID       "bodycam-01"
@@ -51,17 +50,16 @@
 #define CAM_HMIRROR     0
 
 // ============================================================
-// VIDEO — MiFi/VTA uplink is narrow; keep JPEG small so WS stays up.
+// VIDEO — outdoor bodycam. Small JPEGs so FPS stays steady while running
+// over public Wi-Fi. q=12 overflowed the camera (FB-OVF / NO SIGNAL).
 // ============================================================
 #define STREAM_WIDTH    640
 #define STREAM_HEIGHT   480
-#define JPEG_QUALITY    38
-#define STREAM_FPS      8
+#define JPEG_QUALITY    28
+#define STREAM_FPS      15
 
 // ============================================================
 // INMP441
-//   GND -> GND   VDD -> 3V3
-//   SD  -> GPIO 47   SCK -> GPIO 41   WS -> GPIO 42   L/R -> GND
 // ============================================================
 #define MIC_I2S_BCLK    41
 #define MIC_I2S_WS      42
@@ -80,26 +78,21 @@
 #define MIC_SHIFT       14
 
 // ============================================================
-// BUTTON (to GND, INPUT_PULLUP)
-//   SW1 GPIO 1  = audio record / hold 7s Wi-Fi reset
-//   SW2 GPIO 3  = video+audio record
-//   SW3 GPIO 14 = PTT
-//   SW4 GPIO 21 = SOS / hold at boot = portal
+// BUTTON
 // ============================================================
-#define BTN_AUDIO       1
-#define BTN_VIDEO       3
-#define BTN_PTT         14
-#define BTN_SOS         21
+#define BTN_AUDIO       1   // short: audio record. hold 7s: reset Wi-Fi / portal
+#define BTN_VIDEO       3   // toggle video+audio record
+#define BTN_PTT         14  // hold-to-talk → PQTALKIE (was night vision)
+#define BTN_SOS         21  // short: SOS on PQTALKIE. hold at boot: open portal
 #define BTN_POWER       BTN_SOS
 
 // IR unused: GPIO 40 is speaker BCLK.
 #define NIGHT_IR_PIN    -1
 
 // ============================================================
-// SPEAKER — MAX98357 (I2S_NUM_1)
+// SPEAKER — MAX98357 / I2S DAC  (I2S_NUM_1, not the mic)
 //   VIN -> 5V   GND -> GND
 //   DIN -> GPIO 38   BCLK -> GPIO 40   LRC -> GPIO 39
-//   GAIN -> float (tidak perlu)   SD -> 3V3  (= RIGHT channel only)
 // ============================================================
 #define SPK_I2S_DOUT    38
 #define SPK_I2S_BCLK    40
@@ -107,8 +100,9 @@
 
 // ============================================================
 // GPS — UART1 receive-only (NMEA 9600)
-//   VCC -> 3.3V   GND -> GND
-//   TX  -> GPIO 2 (ESP RX). GPS RX tidak disambung.
+//   GPS VCC -> 3.3V
+//   GPS GND -> GND
+//   GPS TX  -> GPIO 2 (ESP RX). GPS RX is not wired.
 // ============================================================
 #define GPS_RX          2
 #define GPS_TX          -1

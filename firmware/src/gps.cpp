@@ -23,11 +23,8 @@ static float altM = 0;
 static float spdKmh = 0;
 static float crsDeg = 0;
 static int sats = 0;
-static int fixQuality = 0;
 static uint32_t fixAt = 0;
 static uint32_t nmeaAt = 0;
-static uint32_t nmeaCount = 0;
-static uint32_t lastGpsLogAt = 0;
 
 static char lineBuf[128];
 static size_t lineLen = 0;
@@ -76,7 +73,6 @@ static int splitCsv(char *s, char *fields[], int maxFields) {
 static void noteNmea(int nsat) {
   portENTER_CRITICAL(&gpsMux);
   nmeaAt = millis();
-  nmeaCount++;
   if (nsat >= 0) sats = nsat;
   portEXIT_CRITICAL(&gpsMux);
 }
@@ -107,9 +103,6 @@ static void parseGga(char *line) {
   // $GPGGA,time,lat,N,lon,E,fix,sats,hdop,alt,M,...
   int quality = atoi(f[6]);
   int nsat = f[7][0] ? atoi(f[7]) : -1;
-  portENTER_CRITICAL(&gpsMux);
-  fixQuality = quality;
-  portEXIT_CRITICAL(&gpsMux);
   noteNmea(nsat);
   if (quality <= 0) return;
   if (!f[2][0] || !f[4][0]) return;
@@ -136,18 +129,6 @@ static void parseRmc(char *line) {
   applyFix(lat, lon, -9999.0f, spd, crs, -1, true);
 }
 
-// $GPGSV,numMsg,msgNum,satsInView,... — update sats even before a fix.
-static void parseGsv(char *line) {
-  char *star = strchr(line, '*');
-  if (star) *star = 0;
-  char *f[8];
-  int n = splitCsv(line, f, 8);
-  if (n < 4 || !f[3][0]) return;
-  int nsat = atoi(f[3]);
-  if (nsat < 0) return;
-  noteNmea(nsat);
-}
-
 static void handleLine(char *line) {
   if (line[0] != '$') return;
   if (strchr(line, '*') && !nmeaChecksumOk(line)) return;
@@ -156,8 +137,6 @@ static void handleLine(char *line) {
     parseGga(line);
   } else if (talkerIs(line, "RMC")) {
     parseRmc(line);
-  } else if (talkerIs(line, "GSV")) {
-    parseGsv(line);
   }
 }
 
@@ -193,21 +172,7 @@ static void gpsPoll() {
   if (haveFix && (millis() - fixAt) > 15000) {
     haveFix = false;
   }
-  bool ok = haveFix;
-  bool rx = nmeaAt && (millis() - nmeaAt) < 5000;
-  int nsat = sats;
-  int q = fixQuality;
-  uint32_t ncnt = nmeaCount;
-  uint32_t age = nmeaAt ? (millis() - nmeaAt) : 0;
   portEXIT_CRITICAL(&gpsMux);
-
-  // Periodic status so serial shows why map is empty (no sky / cold start / wiring).
-  if ((millis() - lastGpsLogAt) >= 5000) {
-    lastGpsLogAt = millis();
-    Serial.printf("[GPS] fix=%d rx=%d sats=%d q=%d nmea=%lu age=%lums\n",
-                  (int)ok, (int)rx, nsat, q,
-                  (unsigned long)ncnt, (unsigned long)age);
-  }
 }
 
 bool gpsHasFix() {
