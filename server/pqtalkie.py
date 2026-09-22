@@ -206,7 +206,8 @@ class TalkieBridge:
         if token:
             headers["Authorization"] = f"Bearer {token}"
         url = PQTALKIE_URL + path
-        with httpx.Client(verify=not PQTALKIE_INSECURE, timeout=3.0) as c:
+        # Kiosk auth on :3443 often takes 3–5s; 3.0 caused false "timed out".
+        with httpx.Client(verify=not PQTALKIE_INSECURE, timeout=12.0) as c:
             r = c.post(url, headers=headers, json=body)
             r.raise_for_status()
             if not r.content:
@@ -323,7 +324,7 @@ class TalkieBridge:
             auth={"token": jwt},
             transports=["websocket"],
             socketio_path="socket.io",
-            wait_timeout=5,
+            wait_timeout=15,
         )
 
     def _disconnect(self):
