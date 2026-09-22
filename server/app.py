@@ -1603,8 +1603,11 @@ async def ws_device(websocket: WebSocket):
 async def ws_audio(websocket: WebSocket):
     """ESP32 mic uplink + HT radio downlink on one socket (no JPEG HOL).
 
-    Uplink: raw s16le PCM (unchanged mic path).
-    Downlink: 0x03 + s16le → bodycam speaker.
+    Mic roles (same PCM stream from the bodycam):
+      • always while livestream/rec → dashboard listeners (/ws/liveaudio)
+      • while PTT held → also bridged to PQTALKIE (feed_device_pcm)
+
+    Downlink 0x03 + s16le → bodycam speaker (HT peers / SOS only).
     """
     await websocket.accept()
     device = websocket.query_params.get("device") or ""

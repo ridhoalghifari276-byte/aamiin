@@ -699,6 +699,12 @@ static bool btnPressed(BtnDebounce &b) {
 
 // ============================================================
 // AUDIO TX — owns the audio WebSocket. HTTP is only a last resort.
+//
+// Mic dual role (one INMP441):
+//   1) Livestream / rec  → PCM ke gateway → terdengar di dashboard
+//   2) PTT (GPIO 14)     → PCM yang sama di-feed ke PQTALKIE (HT TX)
+// Speaker ESP hanya memutar RX radio (rekan / SOS), bukan monitor live.
+// ============================================================
 static void audioTxTask(void *) {
   for (;;) {
     if (WiFi.status() != WL_CONNECTED) {
@@ -951,7 +957,8 @@ void loop() {
                   (int)videoEnabled, visualOn(), (int)streamEnabled);
   }
 
-  // GPIO 14: hold-to-talk (PQTALKIE). Replaces night vision.
+  // GPIO 14: hold-to-talk → mic role switches to HT (PQTALKIE).
+  // While held: speaker muted so we do not play our own TX / echo.
   bool pttRaw = digitalRead(BTN_PTT) == LOW;
   if (!pttArmed) {
     if (!pttRaw) pttArmed = true;

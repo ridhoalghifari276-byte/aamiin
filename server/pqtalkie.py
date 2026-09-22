@@ -187,6 +187,7 @@ class TalkieBridge:
             return bool(self.ok and self.jwt)
 
     def feed_pcm(self, pcm: bytes):
+        """Bodycam mic → HT only while PTT is held. Live dashboard uses append_pcm separately."""
         if not pcm:
             return
         with self._lock:
