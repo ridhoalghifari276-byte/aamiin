@@ -1070,11 +1070,14 @@
     }
     .media-modal.open { display: flex; }
     #live-speaker {
-      position: absolute;
-      width: 0;
-      height: 0;
-      opacity: 0;
-      pointer-events: none;
+      /* Must stay a real media element — 0×0/opacity:0 often mutes Chrome/Windows. */
+      position: fixed;
+      left: 8px;
+      bottom: 8px;
+      width: 36px;
+      height: 36px;
+      opacity: 0.15;
+      z-index: 80;
     }
     .media-modal-box {
       width: min(920px, 100%);
@@ -1316,7 +1319,7 @@
     </div>
   </div>
 
-  <audio id="live-speaker" autoplay playsinline></audio>
+  <audio id="live-speaker" autoplay playsinline controls></audio>
 
   <script>
     const SAMPLE_RATE = 16000;

@@ -4,6 +4,7 @@
 #include <esp_heap_caps.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
+#include <math.h>
 #include <string.h>
 
 // Playback only. Mic stays on I2S_NUM_0 and is not touched here.
@@ -13,7 +14,7 @@
 // when HT downlink starts pushing PCM. Use a FreeRTOS mutex instead.
 
 static const size_t SPK_RING = 8000;  // 0.5 s s16le mono
-static const int SPK_GAIN = 16;      // radio chunks are often quiet vs mic
+static const int SPK_GAIN = 24;      // HT downlink is often quiet
 static int16_t *spkRing = nullptr;
 static volatile size_t spkW = 0;
 static volatile size_t spkR = 0;
@@ -53,22 +54,20 @@ void speakerPush(const uint8_t *pcm, size_t bytes) {
 }
 
 static void speakerTask(void *) {
-  int16_t stereo[256];
+  // Mono left-slot frames — matches MAX98357 / many I2S amps on ESP32-S3.
+  int16_t mono[128];
   for (;;) {
     if (muted || !spkRing || !spkMu) {
       vTaskDelay(pdMS_TO_TICKS(10));
       continue;
     }
-    size_t got = 0;
     size_t take = 0;
     if (xSemaphoreTake(spkMu, pdMS_TO_TICKS(20)) == pdTRUE) {
       size_t avail = spkCountUnsafe();
       take = avail > 128 ? 128 : avail;
       for (size_t i = 0; i < take; i++) {
-        int16_t s = spkRing[spkR];
+        mono[i] = spkRing[spkR];
         spkR = (spkR + 1) % SPK_RING;
-        stereo[got++] = s;
-        stereo[got++] = s;
       }
       xSemaphoreGive(spkMu);
     }
@@ -77,7 +76,19 @@ static void speakerTask(void *) {
       continue;
     }
     size_t written = 0;
-    i2s_write(I2S_NUM_1, stereo, got * sizeof(int16_t), &written, pdMS_TO_TICKS(50));
+    i2s_write(I2S_NUM_1, mono, take * sizeof(int16_t), &written, pdMS_TO_TICKS(50));
+  }
+}
+
+static void speakerBeep(int hz, int ms) {
+  if (!spkRing) return;
+  const int rate = MIC_SAMPLE_RATE;
+  const int n = (rate * ms) / 1000;
+  for (int i = 0; i < n; i++) {
+    float t = (float)i / (float)rate;
+    int16_t s = (int16_t)(sinf(2.0f * 3.1415926f * hz * t) * 12000.0f);
+    uint8_t b[2] = { (uint8_t)(s & 0xff), (uint8_t)((s >> 8) & 0xff) };
+    speakerPush(b, 2);
   }
 }
 
@@ -97,10 +108,11 @@ void speakerBegin() {
   c.mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX);
   c.sample_rate = MIC_SAMPLE_RATE;
   c.bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT;
-  c.channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT;
+  // ONLY_LEFT is what most ESP32-CAM + MAX98357 bodycam builds use.
+  c.channel_format = I2S_CHANNEL_FMT_ONLY_LEFT;
   c.communication_format = I2S_COMM_FORMAT_STAND_I2S;
   c.intr_alloc_flags = ESP_INTR_FLAG_LEVEL1;
-  c.dma_desc_num = 6;
+  c.dma_desc_num = 8;
   c.dma_frame_num = 256;
   c.use_apll = false;
   c.tx_desc_auto_clear = true;
@@ -119,6 +131,10 @@ void speakerBegin() {
   i2s_set_pin(I2S_NUM_1, &p);
   i2s_zero_dma_buffer(I2S_NUM_1);
   xTaskCreatePinnedToCore(speakerTask, "spk", 4096, nullptr, 3, nullptr, 0);
-  Serial.printf("[SPK] I2S1 DIN=%d BCLK=%d LRC=%d gain=%dx\n",
+  Serial.printf("[SPK] I2S1 DOUT=%d BCLK=%d LRC=%d gain=%dx LEFT\n",
                 SPK_I2S_DOUT, SPK_I2S_BCLK, SPK_I2S_LRC, SPK_GAIN);
+  // Hardware check: two short beeps after boot (no HT needed).
+  speakerBeep(880, 120);
+  vTaskDelay(pdMS_TO_TICKS(80));
+  speakerBeep(1320, 120);
 }
