@@ -1002,6 +1002,11 @@ def health():
         copy = dict(st)
         r = radios.get(d) or {}
         copy["radio"] = bool(r.get("ready"))
+        copy["radio_tx"] = bool(r.get("tx"))
+        copy["radio_err"] = r.get("error") or ""
+        copy["radio_ch"] = r.get("channelId")
+        copy["radio_label"] = r.get("label") or ""
+        copy["radio_token"] = bool(r.get("has_token"))
         states[d] = copy
     return {
         "ok": True,
@@ -1049,6 +1054,11 @@ async def post_device_state(
     except Exception:
         pass
     with lock:
+        prev = device_state.get(x_device_id) or {}
+        lat = body.get("lat")
+        lon = body.get("lon")
+        last_lat = lat if lat is not None else prev.get("last_lat")
+        last_lon = lon if lon is not None else prev.get("last_lon")
         device_state[x_device_id] = {
             "stream": bool(body.get("stream")),
             "audio": bool(body.get("audio")),
@@ -1062,8 +1072,10 @@ async def post_device_state(
             "gps": bool(body.get("gps")),
             "gps_on": bool(body.get("gps_on", True)),
             "gps_rx": bool(body.get("gps_rx")),
-            "lat": body.get("lat"),
-            "lon": body.get("lon"),
+            "lat": lat,
+            "lon": lon,
+            "last_lat": last_lat,
+            "last_lon": last_lon,
             "alt": body.get("alt"),
             "spd": body.get("spd"),
             "crs": body.get("crs"),
@@ -1095,6 +1107,7 @@ async def post_device_state(
 def get_device_state(device: str = "bodycam-01"):
     with lock:
         st = device_state.get(device)
+    radio = pqtalkie.status(device) or {}
     if not st:
         return {
             "stream": False,
@@ -1105,11 +1118,29 @@ def get_device_state(device: str = "bodycam-01"):
             "ptt": False,
             "sos": False,
             "gps": False,
+            "gps_rx": False,
             "lat": None,
             "lon": None,
+            "radio": bool(radio.get("ready")),
+            "radio_tx": bool(radio.get("tx")),
+            "radio_err": radio.get("error") or "",
+            "radio_ch": radio.get("channelId"),
+            "radio_label": radio.get("label") or "",
+            "radio_token": bool(radio.get("has_token")),
             "device": device,
+            "ptt_radio": radio,
         }
-    return {**st, "device": device, "ptt_radio": pqtalkie.status(device)}
+    return {
+        **st,
+        "device": device,
+        "radio": bool(radio.get("ready")),
+        "radio_tx": bool(radio.get("tx")),
+        "radio_err": radio.get("error") or "",
+        "radio_ch": radio.get("channelId"),
+        "radio_label": radio.get("label") or "",
+        "radio_token": bool(radio.get("has_token")),
+        "ptt_radio": radio,
+    }
 
 
 @app.post("/api/v1/ptt-token")

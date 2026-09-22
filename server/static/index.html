@@ -7,6 +7,8 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@500;700&family=Rajdhani:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
   <style>
     :root {
       --bg0: #05080d;
@@ -228,7 +230,64 @@
       color: var(--muted);
       font-size: 0.7rem;
       margin-top: 0.2rem;
+      line-height: 1.35;
     }
+    .device-loc {
+      display: block;
+      color: var(--cyan);
+      font-size: 0.68rem;
+      margin-top: 0.15rem;
+      letter-spacing: 0.04em;
+    }
+    .ht-line {
+      display: block;
+      font-size: 0.68rem;
+      margin-top: 0.12rem;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+    .ht-line.on { color: var(--green); }
+    .ht-line.wait { color: var(--amber); }
+    .ht-line.off { color: var(--muted); }
+    .ht-line.tx { color: var(--amber); }
+    .map-wrap {
+      margin: 0.7rem 0 0.35rem;
+      border: 1px solid var(--line);
+      background: rgba(0, 0, 0, 0.35);
+      min-height: 180px;
+      height: 200px;
+      position: relative;
+    }
+    .map-wrap h3 {
+      position: relative;
+      z-index: 1;
+      padding: 6px 8px 0;
+      font-family: "Orbitron", sans-serif;
+      font-size: 0.58rem;
+      letter-spacing: 0.16em;
+      color: var(--cyan);
+      text-transform: uppercase;
+    }
+    #ops-map {
+      width: 100%;
+      height: calc(100% - 22px);
+      background: #071018;
+    }
+    .map-empty {
+      position: absolute;
+      inset: 0;
+      z-index: 400;
+      display: grid;
+      place-items: center;
+      text-align: center;
+      color: var(--muted);
+      font-size: 0.72rem;
+      padding: 1rem;
+      background: rgba(5, 10, 16, 0.55);
+      pointer-events: none;
+    }
+    .map-empty.hidden { display: none; }
+    .leaflet-container { background: #071018; font-family: inherit; }
     @media (max-width: 1100px) {
       .main { grid-template-columns: 200px 1fr; }
       .rail-right { display: none; }
@@ -260,7 +319,15 @@
       text-transform: uppercase;
     }
 
-    .device-list { display: flex; flex-direction: column; gap: 0.5rem; }
+    .device-list {
+      display: flex;
+      flex-direction: column;
+      gap: 0.5rem;
+      flex: 1;
+      min-height: 0;
+      overflow: auto;
+    }
+    .map-wrap, .ptt-token-form { flex-shrink: 0; }
     .ptt-token-form {
       display: flex;
       flex-direction: column;
@@ -1210,13 +1277,18 @@
             <div class="unit-focus-id" id="device-focus-id">—</div>
           </div>
           <div id="device-list" class="device-list"></div>
+          <div class="map-wrap">
+            <h3>Track</h3>
+            <div id="ops-map"></div>
+            <div id="map-empty" class="map-empty">Menunggu GPS lock<br/>GPS searching · 0 sat</div>
+          </div>
           <form id="ptt-token-form" class="ptt-token-form">
             <label>Tautan radio PQTALKIE</label>
             <input id="ptt-token-input" type="text" autocomplete="off" placeholder="https://45.250.101.16:3443/r/…" />
             <button type="submit">Simpan tautan</button>
             <span id="ptt-token-msg" class="hint"></span>
           </form>
-          <p class="hint">GPIO 14 = PTT (tahan bicara). GPIO 21 = SOS (tekan singkat). Tahan GPIO 21 3 detik = reset Wi-Fi. Live video tetap jalan.</p>
+          <p class="hint">HT connected = hijau di kartu. GPIO 14 = PTT. GPIO 21 = SOS. Pin peta muncul setelah GPS lock (bukan searching).</p>
         </div>
       </aside>
     </div>
@@ -1333,6 +1405,12 @@
     let lastVisualLive = null;
     let lastFrameAge = 99;
     let deviceInfoMap = {};
+    let lastGps = {};
+    try { lastGps = JSON.parse(localStorage.getItem("bc_last_gps") || "{}") || {}; } catch (e) { lastGps = {}; }
+    let opsMap = null;
+    let opsLayer = null;
+    let opsMarkers = {};
+    let lastMapFocus = "";
     let pendingJpeg = null;
     let jpegBusy = false;
     let liveFps = 0;
@@ -1939,14 +2017,24 @@
 
     async function syncFromDeviceState(st) {
       if (!st) return;
+      if (st.ptt_radio) {
+        st.radio = !!st.ptt_radio.ready;
+        st.radio_tx = !!st.ptt_radio.tx;
+        st.radio_err = st.ptt_radio.error || "";
+        st.radio_ch = st.ptt_radio.channelId;
+        st.radio_label = st.ptt_radio.label || "";
+        st.radio_token = !!st.ptt_radio.has_token;
+      }
       if ("stream" in st) deviceStreamOn = !!st.stream;
       if ("visual" in st) deviceVisualOn = !!st.visual;
       if ("nightvision" in st) deviceNightOn = !!st.nightvision;
-      deviceInfoMap[st.device || currentDevice] = Object.assign(
+      const did = st.device || currentDevice;
+      deviceInfoMap[did] = Object.assign(
         {},
-        deviceInfoMap[st.device || currentDevice] || {},
+        deviceInfoMap[did] || {},
         st
       );
+      rememberGps(did, deviceInfoMap[did]);
       if ("video" in st || "audio" in st) {
         const mode = st.video ? "video" : st.audio ? "audio" : null;
         deviceRecMode = mode;
@@ -2055,6 +2143,128 @@
       return strip;
     }
 
+    function fmtCoord(lat, lon) {
+      const nlat = Number(lat);
+      const nlon = Number(lon);
+      if (!Number.isFinite(nlat) || !Number.isFinite(nlon)) return "";
+      const ns = nlat >= 0 ? "N" : "S";
+      const ew = nlon >= 0 ? "E" : "W";
+      return Math.abs(nlat).toFixed(5) + "°" + ns + "  " + Math.abs(nlon).toFixed(5) + "°" + ew;
+    }
+
+    function validCoord(lat, lon) {
+      const nlat = Number(lat);
+      const nlon = Number(lon);
+      if (!Number.isFinite(nlat) || !Number.isFinite(nlon)) return null;
+      if (nlat === 0 && nlon === 0) return null;
+      if (Math.abs(nlat) > 90 || Math.abs(nlon) > 180) return null;
+      return { lat: nlat, lon: nlon };
+    }
+
+    function rememberGps(id, st) {
+      if (!id || !st) return;
+      const live = validCoord(st.lat, st.lon);
+      const last = validCoord(st.last_lat, st.last_lon);
+      const hit = live || last;
+      if (!hit) return;
+      const prev = lastGps[id];
+      const isLive = !!live && !!st.gps;
+      if (prev && prev.lat === hit.lat && prev.lon === hit.lon && prev.live === isLive) return;
+      lastGps[id] = {
+        lat: hit.lat,
+        lon: hit.lon,
+        sats: st.sats,
+        live: isLive,
+        at: Date.now(),
+      };
+      try { localStorage.setItem("bc_last_gps", JSON.stringify(lastGps)); } catch (e) {}
+    }
+
+    function htStatus(st, online) {
+      if (st.radio_tx || st.ptt) return { cls: "tx", text: "HT TX · PTT" };
+      if (st.radio) {
+        const extra = [];
+        if (st.radio_label) extra.push(st.radio_label);
+        else if (st.radio_ch != null && st.radio_ch !== "") extra.push("ch " + st.radio_ch);
+        return { cls: "on", text: extra.length ? "HT connected · " + extra.join(" · ") : "HT connected" };
+      }
+      if (st.radio_err) return { cls: "wait", text: "HT error" };
+      if (online && st.radio_token) return { cls: "wait", text: "HT standby · connecting" };
+      if (online) return { cls: "wait", text: "HT standby · connecting" };
+      return { cls: "off", text: "HT offline" };
+    }
+
+    function gpsPinIcon(live) {
+      return L.divIcon({
+        className: "bc-marker",
+        html:
+          '<div style="width:14px;height:14px;border-radius:50%;background:' +
+          (live ? "#00ff9c" : "#7aa0b8") +
+          ';border:2px solid #041018;box-shadow:0 0 10px ' +
+          (live ? "#00ff9c" : "#7aa0b8") +
+          '"></div>',
+        iconSize: [14, 14],
+        iconAnchor: [7, 7],
+      });
+    }
+
+    function initOpsMap() {
+      const el = document.getElementById("ops-map");
+      if (!el || typeof L === "undefined" || opsMap) return;
+      opsMap = L.map(el, { zoomControl: true, attributionControl: false, worldCopyJump: true });
+      L.tileLayer("https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png", { maxZoom: 19 }).addTo(opsMap);
+      opsMap.setView([-2.5, 118], 5);
+      opsLayer = L.layerGroup().addTo(opsMap);
+      setTimeout(() => { if (opsMap) opsMap.invalidateSize(); }, 120);
+    }
+
+    function updateOpsMap(pan) {
+      initOpsMap();
+      const empty = document.getElementById("map-empty");
+      Object.keys(deviceInfoMap).forEach((id) => rememberGps(id, deviceInfoMap[id]));
+      const ids = Object.keys(lastGps);
+      if (empty) {
+        const st = deviceInfoMap[currentDevice] || {};
+        empty.classList.toggle("hidden", ids.length > 0);
+        if (!ids.length) {
+          empty.innerHTML = st.gps_rx
+            ? "Menunggu GPS lock<br/>GPS searching · " + (st.sats != null ? st.sats : 0) + " sat"
+            : "Belum ada lokasi<br/>Bawa unit ke luar ruangan";
+        }
+      }
+      if (!opsMap || !opsLayer) return;
+      const seen = new Set();
+      ids.forEach((id) => {
+        const g = lastGps[id];
+        if (!g) return;
+        seen.add(id);
+        const live = !!(deviceInfoMap[id] && deviceInfoMap[id].gps && validCoord(deviceInfoMap[id].lat, deviceInfoMap[id].lon));
+        const html = "<b>" + id + "</b><br/>" + fmtCoord(g.lat, g.lon) + (live ? "<br/>LIVE GPS" : "<br/>last fix");
+        if (!opsMarkers[id]) {
+          opsMarkers[id] = L.marker([g.lat, g.lon], { icon: gpsPinIcon(live) })
+            .addTo(opsLayer)
+            .on("click", () => focusDevice(id));
+        } else {
+          opsMarkers[id].setLatLng([g.lat, g.lon]);
+          opsMarkers[id].setIcon(gpsPinIcon(live));
+        }
+        opsMarkers[id].bindPopup(html);
+      });
+      Object.keys(opsMarkers).forEach((id) => {
+        if (!seen.has(id)) {
+          opsLayer.removeLayer(opsMarkers[id]);
+          delete opsMarkers[id];
+        }
+      });
+      const focus = lastGps[currentDevice];
+      if (focus && (pan || lastMapFocus !== currentDevice)) {
+        const z = opsMap.getZoom();
+        opsMap.setView([focus.lat, focus.lon], z < 12 ? 14 : z);
+        lastMapFocus = currentDevice;
+      }
+      setTimeout(() => { if (opsMap) opsMap.invalidateSize(); }, 60);
+    }
+
     function listOverflowIds() {
       const stripSet = new Set(stripIds);
       const overflowOnline = onlineDevices.filter((id) => !stripSet.has(id)).sort();
@@ -2084,20 +2294,28 @@
       const bits = [];
       if (st.ip) bits.push(st.ip);
       if (st.rssi != null) bits.push(st.rssi + " dBm");
-      if (st.gps && st.lat != null && st.lon != null) {
-        bits.push(Number(st.lat).toFixed(5) + ", " + Number(st.lon).toFixed(5)
-          + (st.sats != null ? " · " + st.sats + " sat" : ""));
+      rememberGps(id, st);
+      const livePos = st.gps && validCoord(st.lat, st.lon);
+      const lastPos = lastGps[id];
+      if (livePos) {
+        bits.push("GPS lock" + (st.sats != null ? " · " + st.sats + " sat" : ""));
       } else if (st.gps_rx) {
         bits.push("GPS searching" + (st.sats != null ? " · " + st.sats + " sat" : ""));
       } else if (online) {
         bits.push("GPS on");
       }
-      if (st.radio) bits.push("RADIO");
-      else if (online) bits.push("RADIO ...");
+      const loc = livePos
+        ? fmtCoord(st.lat, st.lon)
+        : lastPos
+          ? fmtCoord(lastPos.lat, lastPos.lon) + " (last)"
+          : "";
+      const ht = htStatus(st, online);
       card.innerHTML =
         '<div class="id">' + id + "</div>" +
         '<div class="row"><span class="state">' + state + "</span></div>" +
-        (bits.length ? '<span class="device-meta">' + bits.join(" · ") + "</span>" : "");
+        (bits.length ? '<span class="device-meta">' + bits.join(" · ") + "</span>" : "") +
+        (loc ? '<span class="device-loc">' + loc + "</span>" : (online ? '<span class="device-loc">lokasi belum lock</span>' : "")) +
+        '<span class="ht-line ' + ht.cls + '">' + ht.text + "</span>";
       card.addEventListener("click", () => focusDevice(id));
       return card;
     }
@@ -2110,6 +2328,7 @@
       if (!strip.length && !overflow.length) {
         deviceListEl.innerHTML =
           '<div class="hint">Belum ada unit terdeteksi. Nyalakan bodycam agar muncul di sini &amp; preview strip.</div>';
+        updateOpsMap(false);
         return;
       }
 
@@ -2129,6 +2348,7 @@
       }
 
       overflow.forEach((id) => deviceListEl.appendChild(makeDeviceCard(id, { inStrip: false })));
+      updateOpsMap(false);
     }
 
     function closeMediaModal() {
@@ -2368,6 +2588,7 @@
       if (!id) return;
       if (id === currentDevice) {
         renderStrip();
+        updateOpsMap(true);
         return;
       }
       currentDevice = id;
@@ -2389,13 +2610,18 @@
       renderMainFeed();
       renderStrip();
       renderDeviceList();
+      updateOpsMap(true);
 
       setFaceEnabled(faceOn);
       refreshFaces();
       refreshRecordings();
       fetch("/api/v1/device/state?device=" + encodeURIComponent(id), { cache: "no-store" })
         .then((r) => r.json())
-        .then((st) => syncFromDeviceState(st))
+        .then(async (st) => {
+          await syncFromDeviceState(st);
+          renderDeviceList();
+          updateOpsMap(true);
+        })
         .catch(() => {});
     }
 
@@ -2428,12 +2654,16 @@
         stripIds = next;
         if (changed) lastStripKey = "";
         if (!feeds.has(currentDevice)) renderMainFeed();
-        renderStrip();
-        renderDeviceList();
 
         const stMap = data.device_state || {};
         deviceInfoMap = stMap;
-        Object.keys(stMap).forEach(rememberDevice);
+        Object.keys(stMap).forEach((id) => {
+          rememberDevice(id);
+          rememberGps(id, stMap[id]);
+        });
+        renderStrip();
+        renderDeviceList();
+        updateOpsMap(false);
         if (stMap[currentDevice]) await syncFromDeviceState(stMap[currentDevice]);
       } catch (_) {
         healthFail += 1;
@@ -2806,6 +3036,10 @@
     });
 
     // boot
+    initOpsMap();
+    window.addEventListener("resize", () => {
+      if (opsMap) setTimeout(() => opsMap.invalidateSize(), 80);
+    });
     renderWall();
     renderDeviceList();
     refreshDevices();
