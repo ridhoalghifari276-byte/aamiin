@@ -22,7 +22,7 @@ from urllib.parse import urlparse
 
 import httpx
 
-PQTALKIE_URL = (os.getenv("PQTALKIE_URL") or "http://45.250.101.16:4000").rstrip("/")
+PQTALKIE_URL = (os.getenv("PQTALKIE_URL") or "http://192.168.245.99:4000").rstrip("/")
 _scheme = (urlparse(PQTALKIE_URL).scheme or "http").lower()
 # Cleartext :4000 needs no TLS. HTTPS (e.g. nginx :3443) may use self-signed.
 PQTALKIE_INSECURE = os.getenv(

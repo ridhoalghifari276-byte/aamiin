@@ -23,7 +23,8 @@ services:
       # Other apps: live video/audio per bodycam. Not the device ingest token.
       BODYCAM_API_TOKEN: BC-LIVE-K8m2Qp4nR7xW
       BODYCAM_API_TOKENS: '{"bodycam-01":"BC-01-n4T8vL2qH9cF","bodycam-02":"BC-02-w6Y1dM5sJ3bA","bodycam-03":"BC-03-p7C0kR8uE2gZ"}'
-      PQTALKIE_URL: http://45.250.101.16:4000
+      # Same-provider private IP — public 45.250.101.16:4000 times out from this VPS (hairpin).
+      PQTALKIE_URL: http://192.168.245.99:4000
       # Per-device kiosk slug (not the HTTPS SPA URL on :3443). Channel comes from auth.
       PQTALKIE_TOKENS: '{"bodycam-03":"GeBZjp9Jah1eE7mLNV1xqWPj"}'
       # Optional default if a unit has no entry in PQTALKIE_TOKENS:
