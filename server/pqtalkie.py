@@ -144,14 +144,12 @@ def wav_to_pcm(raw: bytes) -> tuple[bytes, dict]:
         if bits != 16:
             return b"", info
     else:
-        # Bare PCM from some HT clients is often 8 kHz mono.
-        # 20 ms @ 8 kHz = 320 samples = 640 bytes (common PTT frame).
-        if len(pcm) in (640, 320, 1600, 800) or (len(pcm) >= 640 and len(pcm) <= 720 and len(pcm) % 2 == 0):
-            # Prefer 8 kHz when frame size matches classic 20 ms @ 8 kHz (±headerless).
-            if len(pcm) <= 720:
-                rate = 8000
-                info["rate"] = rate
-                info["kind"] = "raw8k"
+        # Headerless PCM from HT/web. ~640 bytes ≈ 20 ms mono @ 16 kHz.
+        # Do NOT guess 8 kHz from size — that alternated raw/raw8k in logs and
+        # destroyed speech (sounded like a broken speaker).
+        rate = SAMPLE_RATE
+        info["kind"] = "raw"
+        info["rate"] = rate
     info["ch"] = ch
     info["rate"] = rate
     info["bits"] = bits
@@ -186,7 +184,7 @@ def wav_to_pcm(raw: bytes) -> tuple[bytes, dict]:
                 dst[i] = int(src[i0] * (1.0 - frac) + src[i1] * frac)
         pcm = bytes(out)
         info["rate_out"] = SAMPLE_RATE
-    pcm = _normalize_pcm(pcm)
+    # No per-chunk AGC / soft-ceiling — keep natural levels (overs already int16-limited).
     info["peak"] = _pcm_peak(pcm)
     info["out"] = len(pcm)
     return pcm, info
@@ -465,7 +463,8 @@ class TalkieBridge:
                 print(
                     f"[ptt] {self.device} RX radio audio #{n} "
                     f"in={len(raw)} out={len(pcm)} peak={meta.get('peak', _pcm_peak(pcm))} "
-                    f"{meta.get('kind')} rate={meta.get('rate')} ch={meta.get('ch')} bits={meta.get('bits')}",
+                    f"{meta.get('kind')} rate={meta.get('rate')} ch={meta.get('ch')} "
+                    f"corr={meta.get('corr', '-')}",
                     flush=True,
                 )
             push_radio_pcm(self.device, pcm)
