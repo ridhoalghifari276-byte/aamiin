@@ -208,6 +208,7 @@ class TalkieBridge:
                 "label": self.label,
                 "user": self.user_name,
                 "has_token": bool(self.kiosk_token),
+                "api": PQTALKIE_URL,
                 "error": self.last_err,
             }
 
@@ -235,8 +236,8 @@ class TalkieBridge:
             except Exception as e:
                 with self._lock:
                     self.ok = False
-                    self.last_err = str(e)
-                print(f"[ptt] {self.device} kiosk failed: {e}", flush=True)
+                    self.last_err = f"{PQTALKIE_URL}: {e}"
+                print(f"[ptt] {self.device} kiosk failed via {PQTALKIE_URL}: {e}", flush=True)
             while True:
                 with self._lock:
                     if not self.kiosk_token:
@@ -260,11 +261,11 @@ class TalkieBridge:
             except Exception as e:
                 last = e
         if data is None:
-            raise last or RuntimeError("kiosk auth failed")
+            raise RuntimeError(f"kiosk auth failed at {PQTALKIE_URL}: {last}")
         jwt = (data.get("token") or "").strip()
         cid = data.get("channelId")
         if not jwt or cid is None:
-            raise RuntimeError("kiosk response missing token/channelId")
+            raise RuntimeError(f"kiosk response missing token/channelId from {PQTALKIE_URL}")
         user = data.get("user") or {}
         with self._lock:
             self.jwt = jwt
@@ -584,6 +585,7 @@ def status(device: str | None = None) -> dict:
                     "tx": False,
                     "sos": False,
                     "has_token": bool(_env.get(device) or DEFAULT_TOKEN),
+                    "api": PQTALKIE_URL,
                     "error": "",
                 }
             return b.snapshot()

@@ -2188,7 +2188,12 @@
         else if (st.radio_ch != null && st.radio_ch !== "") extra.push("ch " + st.radio_ch);
         return { cls: "on", text: extra.length ? "HT connected · " + extra.join(" · ") : "HT connected" };
       }
-      if (st.radio_err) return { cls: "wait", text: "HT error" };
+      if (st.radio_err) {
+        const short = String(st.radio_err).length > 48
+          ? String(st.radio_err).slice(0, 48) + "…"
+          : String(st.radio_err);
+        return { cls: "wait", text: "HT error · " + short };
+      }
       if (online && st.radio_token) return { cls: "wait", text: "HT standby · connecting" };
       if (online) return { cls: "wait", text: "HT standby · connecting" };
       return { cls: "off", text: "HT offline" };

@@ -1016,6 +1016,7 @@ def health():
         "recordings": len(recordings_index),
         "faces": faces_n,
         "camera_rotate": CAMERA_ROTATE,
+        "pqtalkie_url": pqtalkie.PQTALKIE_URL,
         "target_fps": TARGET_FPS,
         "live_fps": LIVE_FPS,
         "last_frame_age": {
