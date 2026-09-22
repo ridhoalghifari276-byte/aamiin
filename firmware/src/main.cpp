@@ -76,7 +76,8 @@ static void led(bool on) {
 
 static void rgb(uint8_t r, uint8_t g, uint8_t b) {
 #if USE_RGB_LED
-  pixel.setPixelColor(0, pixel.Color(r, g, b));
+  // GPIO 48 is next to the OV2640. Full-bright LED makes indoor AWB go magenta.
+  pixel.setPixelColor(0, pixel.Color(r / 20, g / 20, b / 20));
   pixel.show();
 #endif
 }
@@ -135,6 +136,7 @@ static void applyCamNight(bool on) {
     s->set_saturation(s, 0);
     s->set_whitebal(s, 1);
     s->set_awb_gain(s, 1);
+    s->set_wb_mode(s, 0);
     s->set_special_effect(s, 0);
     s->set_quality(s, JPEG_QUALITY);
     s->set_framesize(s, FRAMESIZE_VGA);
@@ -611,8 +613,11 @@ static bool initCam() {
     s->set_ae_level(s, -1);
     s->set_whitebal(s, 1);
     s->set_awb_gain(s, 1);
+    s->set_wb_mode(s, 0);
     s->set_dcw(s, 1);
     s->set_special_effect(s, 0);
+    s->set_lenc(s, 1);
+    s->set_raw_gma(s, 1);
   }
 
   Serial.printf("[CAM] VGA %dx%d JPEG q=%d @ %d FPS (outdoor / run-stable)\n",
@@ -877,16 +882,15 @@ void setup() {
 }
 
 void loop() {
-  static BtnDebounce bAudio = {BTN_AUDIO, false, false, 0};
   static BtnDebounce bVideo = {BTN_VIDEO, false, false, 0};
   static bool seeded = false;
-  static bool powerDown = false;
-  static uint32_t powerAt = 0;
+  static bool audioDown = false;
+  static uint32_t audioAt = 0;
+  static bool audioResetDone = false;
   static bool pttArmed = false;
   static bool pttRawLast = false;
   static uint32_t pttEdgeAt = 0;
   if (!seeded) {
-    btnSeed(bAudio);
     btnSeed(bVideo);
     pttRawLast = digitalRead(BTN_PTT) == LOW;
     pttArmed = !pttRawLast;  // pin held at boot is not PTT
@@ -894,20 +898,37 @@ void loop() {
     seeded = true;
   }
 
-  // GPIO 1: audio record only; live picture off, mic keeps recording.
-  if (btnPressed(bAudio)) {
-    audioEnabled = !audioEnabled;
-    if (audioEnabled) {
-      videoEnabled = false;
-      ringClear();
-      sessionCmd = 1;
-    } else {
-      sessionCmd = 3;
+  // GPIO 1: short press = audio record; hold 7s = reset Wi-Fi / captive portal.
+  bool audioRaw = digitalRead(BTN_AUDIO) == LOW;
+  if (audioRaw) {
+    if (!audioDown) {
+      audioDown = true;
+      audioAt = millis();
+      audioResetDone = false;
+    } else if (!audioResetDone && (millis() - audioAt) >= WIFI_RESET_HOLD_MS) {
+      Serial.println("[BTN] hold GPIO1 7s — reset WiFi / captive portal");
+      rgb(255, 80, 0);
+      portalClear();
+      delay(400);
+      ESP.restart();
     }
-    stateDirty = true;
-    stateLed();
-    Serial.printf("[BTN] audio=%d visual=%d stream=%d\n",
-                  (int)audioEnabled, visualOn(), (int)streamEnabled);
+  } else if (audioDown) {
+    uint32_t held = millis() - audioAt;
+    audioDown = false;
+    if (!audioResetDone && held >= 40 && held < WIFI_RESET_HOLD_MS) {
+      audioEnabled = !audioEnabled;
+      if (audioEnabled) {
+        videoEnabled = false;
+        ringClear();
+        sessionCmd = 1;
+      } else {
+        sessionCmd = 3;
+      }
+      stateDirty = true;
+      stateLed();
+      Serial.printf("[BTN] audio=%d visual=%d stream=%d\n",
+                    (int)audioEnabled, visualOn(), (int)streamEnabled);
+    }
   }
 
   // GPIO 3: video recording + microphone.
@@ -942,25 +963,19 @@ void loop() {
     Serial.printf("[BTN] ptt=%d\n", (int)pttHeld);
   }
 
-  // GPIO 21: short press = SOS on PQTALKIE. Hold 3s clears Wi-Fi / portal.
-  // Livestream stays on while the unit is powered — this button no longer
-  // toggles the picture.
-  bool pwr = digitalRead(BTN_SOS) == LOW;
-  if (pwr) {
-    if (!powerDown) {
-      powerDown = true;
-      powerAt = millis();
-    } else if (millis() - powerAt >= POWER_HOLD_MS) {
-      Serial.println("[BTN] hold GPIO21 — reset WiFi / captive portal");
-      rgb(255, 80, 0);
-      portalClear();
-      delay(400);
-      ESP.restart();
+  // GPIO 21: short press = SOS on PQTALKIE (no Wi-Fi reset here).
+  static bool sosDown = false;
+  static uint32_t sosAt = 0;
+  bool sosRaw = digitalRead(BTN_SOS) == LOW;
+  if (sosRaw) {
+    if (!sosDown) {
+      sosDown = true;
+      sosAt = millis();
     }
-  } else if (powerDown) {
-    uint32_t held = millis() - powerAt;
-    powerDown = false;
-    if (held >= 40 && held < POWER_HOLD_MS) {
+  } else if (sosDown) {
+    uint32_t held = millis() - sosAt;
+    sosDown = false;
+    if (held >= 40) {
       sosActive = !sosActive;
       stateDirty = true;
       stateLed();

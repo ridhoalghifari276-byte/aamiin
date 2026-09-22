@@ -7,8 +7,9 @@
 // Device ID + Wi-Fi are entered there and stored in NVS.
 // These two strings are compile-time fallbacks only; leave them
 // empty so the portal always runs until the unit is provisioned.
-// Hold GPIO 21 for 3 seconds during operation to reset and
-// re-open the portal.
+// Hold record-audio (GPIO 1) for 7 seconds during operation to
+// clear Wi-Fi and re-open the portal. Hold GPIO 21 at boot also
+// forces the portal.
 // ============================================================
 #define WIFI_SSID       ""
 #define WIFI_PASSWORD   ""
@@ -79,10 +80,10 @@
 // ============================================================
 // BUTTON
 // ============================================================
-#define BTN_AUDIO       1   // toggle audio record (live picture off)
+#define BTN_AUDIO       1   // short: audio record. hold 7s: reset Wi-Fi / portal
 #define BTN_VIDEO       3   // toggle video+audio record
 #define BTN_PTT         14  // hold-to-talk → PQTALKIE (was night vision)
-#define BTN_SOS         21  // short: SOS on PQTALKIE. hold 3s: reset Wi-Fi / portal
+#define BTN_SOS         21  // short: SOS on PQTALKIE. hold at boot: open portal
 #define BTN_POWER       BTN_SOS
 
 // IR unused: GPIO 40 is speaker BCLK.
@@ -113,4 +114,5 @@
 #define STATUS_LED      -1  // GPIO 2 is GPS RX; status is RGB on 48
 #define RGB_LED         48
 #define USE_RGB_LED     1
-#define POWER_HOLD_MS   3000
+#define POWER_HOLD_MS       3000   // boot: hold SOS to force portal
+#define WIFI_RESET_HOLD_MS  7000   // hold record-audio to clear Wi-Fi / portal
