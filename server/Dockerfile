@@ -1,6 +1,7 @@
 FROM python:3.12-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg libglib2.0-0 libgomp1 curl ca-certificates \
+    libopus0 libopus-dev \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY requirements.txt .

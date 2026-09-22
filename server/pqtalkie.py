@@ -214,11 +214,126 @@ def _decode_candidates(raw: bytes) -> list[tuple[str, bytes, int]]:
     return cands
 
 
-def wav_to_pcm(raw: bytes) -> tuple[bytes, dict]:
-    """Extract s16le mono @ SAMPLE_RATE from WAV/PCM. Returns (pcm, info)."""
+
+_opus_decoders: dict[tuple[int, int], object] = {}
+_opus_dec_lock = threading.Lock()
+
+
+def _opus_decoder(rate: int, channels: int):
+    """Cached libopus decoder (output rate/channels)."""
+    key = (int(rate), int(channels))
+    with _opus_dec_lock:
+        dec = _opus_decoders.get(key)
+        if dec is None:
+            import opuslib
+            dec = opuslib.Decoder(key[0], key[1])
+            _opus_decoders[key] = dec
+        return dec
+
+
+def _parse_pqop(raw: bytes) -> dict | None:
+    """PQTALKIE Opus frame: PQOP | ver | ch | rate_u32le | u16 | u16 | opus..."""
+    if len(raw) < 14 or raw[:4] != b"PQOP":
+        return None
+    ch = int(raw[5]) or 1
+    rate = struct.unpack_from("<I", raw, 6)[0] or 48000
+    misc = struct.unpack_from("<H", raw, 10)[0]
+    length = struct.unpack_from("<H", raw, 12)[0]
+    return {
+        "ver": int(raw[4]),
+        "ch": ch,
+        "rate": rate,
+        "misc": misc,
+        "length": length,
+        "payload": raw[14:],
+    }
+
+
+def opus_to_pcm(raw: bytes) -> tuple[bytes, dict]:
+    """Decode audio/opus (optional PQOP header) to mono s16le @ SAMPLE_RATE."""
+    info: dict = {"kind": "opus", "bits": 16, "fmt": "opus"}
+    if not raw:
+        return b"", info
+    rate = 48000
+    ch = 1
+    candidates: list[bytes] = []
+    if raw.startswith(b"PQOP"):
+        hdr = _parse_pqop(raw)
+        if not hdr:
+            info["err"] = "bad PQOP"
+            return b"", info
+        rate = int(hdr["rate"]) or 48000
+        ch = int(hdr["ch"]) or 1
+        payload = hdr["payload"]
+        info.update(
+            {
+                "kind": "pqop/opus",
+                "rate": rate,
+                "ch": ch,
+                "pqop_len": hdr["length"],
+                "hex": raw[:16].hex(),
+            }
+        )
+        plen = int(hdr["length"] or 0)
+        if 10 <= plen <= len(payload):
+            candidates.append(payload[:plen])
+        candidates.append(payload)
+    else:
+        info["hex"] = raw[:16].hex()
+        info["rate"] = rate
+        info["ch"] = ch
+        candidates.append(raw)
+
+    last_err: object = None
+    pcm = b""
+    for cand in candidates:
+        if not cand:
+            continue
+        try:
+            dec = _opus_decoder(SAMPLE_RATE, 1)
+            frame_size = SAMPLE_RATE * 120 // 1000
+            pcm = dec.decode(bytes(cand), frame_size)
+            last_err = None
+            break
+        except Exception as e1:
+            last_err = e1
+            try:
+                dec = _opus_decoder(rate, 1 if ch < 2 else 2)
+                frame_size = rate * 120 // 1000
+                pcm = dec.decode(bytes(cand), frame_size)
+                if ch >= 2:
+                    pcm = _downmix_stereo(pcm)
+                pcm = _resample_to_16k(pcm, rate)
+                info["note"] = f"fallback48:{e1}"
+                last_err = None
+                break
+            except Exception as e2:
+                last_err = f"{e1} / {e2}"
+                pcm = b""
+    if not pcm:
+        info["err"] = f"opus decode failed: {last_err}"
+        return b"", info
+    m = _pcm_metrics(pcm)
+    info.update(
+        {
+            "rate_out": SAMPLE_RATE,
+            "peak": m["peak"],
+            "clip": round(m["clip"], 3),
+            "zcr": round(m["zcr"], 3),
+            "out": len(pcm),
+        }
+    )
+    return pcm, info
+
+
+def wav_to_pcm(raw: bytes, mime: str = "") -> tuple[bytes, dict]:
+    """Extract s16le mono @ SAMPLE_RATE from WAV/PCM/Opus. Returns (pcm, info)."""
     info: dict = {"kind": "raw", "rate": SAMPLE_RATE, "ch": 1, "bits": 16, "fmt": 1}
     if not raw:
         return b"", info
+    mime_l = (mime or "").lower()
+    if "opus" in mime_l or raw.startswith(b"PQOP"):
+        return opus_to_pcm(raw)
 
     if len(raw) >= 12 and raw[:4] == b"RIFF" and raw[8:12] == b"WAVE":
         info["kind"] = "wav"
@@ -564,7 +679,7 @@ class TalkieBridge:
             else:
                 return
             mime = str(data.get("mime") or data.get("type") or "")
-            pcm, meta = wav_to_pcm(raw)
+            pcm, meta = wav_to_pcm(raw, mime)
             if not pcm:
                 return
             with self._lock:
