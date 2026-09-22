@@ -13,6 +13,7 @@ import os
 import struct
 import threading
 import time
+from collections import deque
 
 import httpx
 
@@ -58,6 +59,14 @@ def _env_tokens() -> dict[str, str]:
         if k and v:
             out[k] = v
     return out
+
+
+def wav_to_pcm(raw: bytes) -> bytes:
+    if len(raw) >= 44 and raw[:4] == b"RIFF":
+        i = raw.find(b"data")
+        if i >= 0 and i + 8 <= len(raw):
+            return raw[i + 8 :]
+    return raw
 
 
 def pcm_wav(pcm: bytes, rate: int = SAMPLE_RATE) -> bytes:
@@ -246,6 +255,24 @@ class TalkieBridge:
             print(f"[ptt] {self.device} joined channel {cid}", flush=True)
             if want_sos:
                 threading.Thread(target=self._sos_apply, name=f"sos-{self.device}", daemon=True).start()
+
+        @sio.on("ptt:audio")
+        def _rx_audio(data):
+            with self._lock:
+                if self.tx or not self.ok:
+                    return
+            if not isinstance(data, dict):
+                return
+            chunk = data.get("chunk") or data.get("audio") or ""
+            if not chunk:
+                return
+            try:
+                raw = base64.b64decode(chunk)
+            except Exception:
+                return
+            pcm = wav_to_pcm(raw)
+            if pcm:
+                push_radio_pcm(self.device, pcm)
 
         @sio.event
         def disconnect():
@@ -448,6 +475,29 @@ def feed_device_pcm(device: str, pcm: bytes):
     b = _bridges.get(device)
     if b:
         b.feed_pcm(pcm)
+
+
+_rx: dict[str, deque] = {}
+_rx_lock = threading.Lock()
+
+
+def push_radio_pcm(device: str, pcm: bytes):
+    if not pcm:
+        return
+    with _rx_lock:
+        q = _rx.get(device)
+        if q is None:
+            q = deque(maxlen=12)
+            _rx[device] = q
+        q.append(pcm)
+
+
+def pop_radio_pcm(device: str) -> bytes:
+    with _rx_lock:
+        q = _rx.get(device)
+        if not q:
+            return b""
+        return q.popleft()
 
 
 def status(device: str | None = None) -> dict:

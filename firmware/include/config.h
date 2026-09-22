@@ -85,19 +85,26 @@
 #define BTN_SOS         21  // short: SOS on PQTALKIE. hold 3s: reset Wi-Fi / portal
 #define BTN_POWER       BTN_SOS
 
-// Optional IR / white illuminator (safe if unconnected).
-#define NIGHT_IR_PIN    40
+// IR unused: GPIO 40 is speaker BCLK.
+#define NIGHT_IR_PIN    -1
 
 // ============================================================
-// GPS — UART1, NEO-6M / NEO-7M / NEO-M8N (NMEA 9600)
-// GPIO 38/39 are free on ESP32-S3-CAM N16R8 (not camera, I2S, USB, or PSRAM).
-//   GPS VCC -> 3.3V (5V only if the module is 5V-tolerant)
-//   GPS GND -> GND
-//   GPS TX  -> GPIO 38 (ESP RX)
-//   GPS RX  -> GPIO 39 (ESP TX, optional)
+// SPEAKER — MAX98357 / I2S DAC  (I2S_NUM_1, not the mic)
+//   VIN -> 5V   GND -> GND
+//   DIN -> GPIO 38   BCLK -> GPIO 40   LRC -> GPIO 39
 // ============================================================
-#define GPS_RX          38
-#define GPS_TX          39
+#define SPK_I2S_DOUT    38
+#define SPK_I2S_BCLK    40
+#define SPK_I2S_LRC     39
+
+// ============================================================
+// GPS — UART1 receive-only (NMEA 9600)
+//   GPS VCC -> 3.3V
+//   GPS GND -> GND
+//   GPS TX  -> GPIO 43 (ESP RX). GPS RX is not wired.
+// ============================================================
+#define GPS_RX          43
+#define GPS_TX          -1
 #define GPS_BAUD        9600
 
 // ============================================================

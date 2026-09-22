@@ -13,6 +13,7 @@
 #include "config.h"
 #include "portal.h"
 #include "gps.h"
+#include "speaker.h"
 
 // ============================================================
 // ESP32 BODYCAM
@@ -84,8 +85,12 @@ static bool visualOn() {
 }
 
 static void nightIr(bool on) {
+#if NIGHT_IR_PIN >= 0
   pinMode(NIGHT_IR_PIN, OUTPUT);
   digitalWrite(NIGHT_IR_PIN, on ? HIGH : LOW);
+#else
+  (void)on;
+#endif
 }
 
 static void applyCamNight(bool on) {
@@ -280,6 +285,12 @@ static void wsEvent(WStype_t type, uint8_t *payload, size_t length) {
     case WStype_TEXT:
       if (payload && length) {
         Serial.printf("[WS] server: %.*s\n", (int)length, (char *)payload);
+      }
+      break;
+    case WStype_BIN:
+      // 0x03 + s16le = radio downlink for the speaker. Mic TX path is unchanged.
+      if (payload && length > 1 && payload[0] == 0x03) {
+        speakerPush(payload + 1, length - 1);
       }
       break;
     default:
@@ -859,15 +870,15 @@ void setup() {
   pinMode(BTN_VIDEO, INPUT_PULLUP);
   pinMode(BTN_PTT, INPUT_PULLUP);
   pinMode(BTN_SOS, INPUT_PULLUP);
-  pinMode(NIGHT_IR_PIN, OUTPUT);
   nightIr(false);
-  gpsBegin();
 
   provisionNetwork();
 
   if (!initCam()) rgb(255, 0, 255);
   nightVision = false;
   applyCamNight(false);
+  gpsBegin();
+  speakerBegin();
 
   // Drain the sensor immediately so DMA cannot overflow while we wait on
   // the public gateway (discoverServer used to block with nobody grabbing).
@@ -963,6 +974,7 @@ void loop() {
   } else if ((millis() - pttEdgeAt) >= 40 && pttRaw != pttHeld) {
     pttHeld = pttRaw;
     if (pttHeld) ringClear();
+    speakerMute(pttHeld);
     stateDirty = true;
     stateLed();
     Serial.printf("[BTN] ptt=%d\n", (int)pttHeld);

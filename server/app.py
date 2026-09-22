@@ -1407,11 +1407,12 @@ async def ws_device(websocket: WebSocket):
         return
     touch_device(device)
     print(f"[ws-device] connected {device}", flush=True)
-    try:
+
+    async def ingest():
         while True:
             msg = await websocket.receive()
             if msg.get("type") == "websocket.disconnect":
-                break
+                return
             data = msg.get("bytes")
             if not data or len(data) < 2:
                 continue
@@ -1439,6 +1440,23 @@ async def ws_device(websocket: WebSocket):
                         except queue.Full:
                             pass
             touch_device(device)
+
+    async def speaker_down():
+        # Radio audio to the bodycam speaker only. Does not alter mic ingest.
+        while True:
+            pcm = pqtalkie.pop_radio_pcm(device)
+            if pcm:
+                await websocket.send_bytes(b"\x03" + pcm)
+            else:
+                await asyncio.sleep(0.01)
+
+    try:
+        done, pending = await asyncio.wait(
+            {asyncio.create_task(ingest()), asyncio.create_task(speaker_down())},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        for t in pending:
+            t.cancel()
     except WebSocketDisconnect:
         pass
     except Exception as e:

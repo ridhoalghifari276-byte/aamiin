@@ -133,8 +133,8 @@ void gpsBegin() {
   GpsUart.setRxBufferSize(512);
   GpsUart.begin(GPS_BAUD, SERIAL_8N1, GPS_RX, GPS_TX);
   lineLen = 0;
-  Serial.printf("[GPS] UART1 %d baud  RX=GPIO%d TX=GPIO%d (NEO-6M TX -> GPIO%d)\n",
-                GPS_BAUD, GPS_RX, GPS_TX, GPS_RX);
+  Serial.printf("[GPS] UART1 %d baud  RX=GPIO%d (GPS TX -> GPIO%d, no ESP TX)\n",
+                GPS_BAUD, GPS_RX, GPS_RX);
   xTaskCreatePinnedToCore(gpsTask, "gps", 4096, nullptr, 1, nullptr, 0);
 }
 
