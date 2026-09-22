@@ -18,7 +18,7 @@
 #define AP_CHANNEL      1
 
 // HTTP API (session/state)
-// Public VPS. Local /24 scan is only a fallback if this host is unreachable.
+// Public VPS. Firmware always uses this host — no LAN /24 scan.
 #define SERVER_HOST     "45.250.101.17"
 #define SERVER_PORT     7890
 #define SERVER_WS_PATH  "/ws/device"

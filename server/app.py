@@ -78,6 +78,29 @@ audio_since: dict[str, float] = {}
 # way to judge whether video is starving voice is to know what it actually uses.
 video_bytes: dict[str, int] = defaultdict(int)
 video_frames: dict[str, int] = defaultdict(int)
+_loop_beat = time.monotonic()
+
+
+def _event_loop_watchdog():
+    time.sleep(30)
+    while True:
+        time.sleep(5)
+        if time.monotonic() - _loop_beat > 25:
+            print("[watchdog] event loop stuck — exit so Docker restarts", flush=True)
+            os._exit(1)
+
+
+async def _arm_watchdog():
+    async def beat():
+        global _loop_beat
+        while True:
+            _loop_beat = time.monotonic()
+            await asyncio.sleep(1)
+
+    asyncio.create_task(beat())
+    threading.Thread(target=_event_loop_watchdog, name="watchdog", daemon=True).start()
+
+
 ingest_q: queue.Queue = queue.Queue(maxsize=24)
 lock = threading.RLock()
 face_engine: FaceEngine | None = None
@@ -89,6 +112,10 @@ LIVE_MAX_SIDE = 480  # 360p, keep native 4:3 / 3:4 — never crop
 FACE_INTERVAL_SEC = 0.50
 MAX_RECORDINGS_PER_DEVICE = 80
 last_face_submit: dict[str, float] = defaultdict(float)
+WS_IDLE_SEC = 45.0
+MJPEG_MAX = 6
+_mjpeg_live = 0
+_mjpeg_gate = threading.Lock()
 
 
 def ingest_loop():
@@ -98,6 +125,34 @@ def ingest_loop():
             process_frame_work(device, data, rec_path, do_face)
         except Exception as e:
             print(f"[frame] ingest error: {e}", flush=True)
+
+
+async def _ws_until_close(websocket: WebSocket):
+    try:
+        while True:
+            msg = await websocket.receive()
+            if msg.get("type") == "websocket.disconnect":
+                return
+    except Exception:
+        return
+
+
+async def _ws_send_until_close(websocket: WebSocket, sender):
+    send_task = asyncio.create_task(sender())
+    watch_task = asyncio.create_task(_ws_until_close(websocket))
+    try:
+        await asyncio.wait(
+            {send_task, watch_task},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+    finally:
+        send_task.cancel()
+        watch_task.cancel()
+        for t in (send_task, watch_task):
+            try:
+                await t
+            except Exception:
+                pass
 
 
 def _encode_jpg(img, quality: int) -> bytes | None:
@@ -911,6 +966,11 @@ def load_index():
     pqtalkie.warm_default()
 
 
+@app.on_event("startup")
+async def arm_watchdog():
+    await _arm_watchdog()
+
+
 @app.get("/health")
 def health():
     with lock:
@@ -937,6 +997,12 @@ def health():
             if video_frames[d]
         }
     faces_n = len(face_engine.captures) if face_engine else 0
+    radios = pqtalkie.status()
+    for d, st in list(states.items()):
+        copy = dict(st)
+        r = radios.get(d) or {}
+        copy["radio"] = bool(r.get("ready"))
+        states[d] = copy
     return {
         "ok": True,
         "devices": devices,
@@ -994,6 +1060,8 @@ async def post_device_state(
             "rssi": body.get("rssi"),
             "ip": body.get("ip"),
             "gps": bool(body.get("gps")),
+            "gps_on": bool(body.get("gps_on", True)),
+            "gps_rx": bool(body.get("gps_rx")),
             "lat": body.get("lat"),
             "lon": body.get("lon"),
             "alt": body.get("alt"),
@@ -1001,16 +1069,25 @@ async def post_device_state(
             "crs": body.get("crs"),
             "sats": body.get("sats"),
             "gps_age_ms": body.get("gps_age_ms"),
+            "radio": False,
             "ts": time.time(),
         }
         touch_device(x_device_id)
-    pqtalkie.set_device_tx(x_device_id, bool(body.get("ptt")))
-    pqtalkie.set_device_sos(x_device_id, bool(body.get("sos")))
-    if body.get("lat") is not None and body.get("lon") is not None:
-        pqtalkie.set_device_location(x_device_id, body.get("lat"), body.get("lon"))
-    tok = (body.get("ptt_token") or "").strip()
-    if tok:
-        pqtalkie.set_device_token(x_device_id, tok)
+    try:
+        pqtalkie.ensure_standby(x_device_id)
+        pqtalkie.set_device_tx(x_device_id, bool(body.get("ptt")))
+        pqtalkie.set_device_sos(x_device_id, bool(body.get("sos")))
+        if body.get("lat") is not None and body.get("lon") is not None:
+            pqtalkie.set_device_location(x_device_id, body.get("lat"), body.get("lon"))
+        tok = (body.get("ptt_token") or "").strip()
+        if tok:
+            pqtalkie.set_device_token(x_device_id, tok)
+        radio_ready = bool((pqtalkie.status(x_device_id) or {}).get("ready"))
+        with lock:
+            if x_device_id in device_state:
+                device_state[x_device_id]["radio"] = radio_ready
+    except Exception as e:
+        print(f"[ptt] state hook {x_device_id}: {e}", flush=True)
     return {"ok": True, "device": x_device_id, "state": device_state[x_device_id]}
 
 
@@ -1366,28 +1443,40 @@ def latest_jpg(device: str = "bodycam-01", annotate: int = 0):
 
 
 @app.get("/api/v1/mjpeg")
-async def mjpeg(device: str = "bodycam-01", annotate: int = 0):
+async def mjpeg(request: Request, device: str = "bodycam-01", annotate: int = 0):
+    global _mjpeg_live
+    with _mjpeg_gate:
+        if _mjpeg_live >= MJPEG_MAX:
+            return JSONResponse({"error": "too many viewers"}, status_code=503)
+        _mjpeg_live += 1
     period = 1.0 / LIVE_FPS
 
     async def gen():
+        global _mjpeg_live
         last = b""
         last_sent = 0.0
-        while True:
-            f = upright_latest(device)
-            now = time.monotonic()
-            if f and f != last and (now - last_sent) >= period:
-                last = f
-                last_sent = now
-                yield (
-                    b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: "
-                    + str(len(f)).encode()
-                    + b"\r\n\r\n"
-                    + f
-                    + b"\r\n"
-                )
-                await asyncio.sleep(0)
-            else:
-                await asyncio.sleep(0.02)
+        try:
+            while True:
+                if await request.is_disconnected():
+                    return
+                f = upright_latest(device)
+                now = time.monotonic()
+                if f and f != last and (now - last_sent) >= period:
+                    last = f
+                    last_sent = now
+                    yield (
+                        b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: "
+                        + str(len(f)).encode()
+                        + b"\r\n\r\n"
+                        + f
+                        + b"\r\n"
+                    )
+                    await asyncio.sleep(0)
+                else:
+                    await asyncio.sleep(0.05)
+        finally:
+            with _mjpeg_gate:
+                _mjpeg_live = max(0, _mjpeg_live - 1)
 
     return StreamingResponse(
         gen(),
@@ -1407,10 +1496,19 @@ async def ws_device(websocket: WebSocket):
         return
     touch_device(device)
     print(f"[ws-device] connected {device}", flush=True)
+    try:
+        pqtalkie.ensure_standby(device)
+    except Exception as e:
+        print(f"[ptt] ws standby {device}: {e}", flush=True)
 
     async def ingest():
         while True:
-            msg = await websocket.receive()
+            try:
+                msg = await websocket.receive()
+            except WebSocketDisconnect:
+                return
+            except Exception:
+                return
             if msg.get("type") == "websocket.disconnect":
                 return
             data = msg.get("bytes")
@@ -1418,50 +1516,62 @@ async def ws_device(websocket: WebSocket):
                 continue
             kind = data[0]
             payload = bytes(data[1:])
-            if kind == 0x02:
-                # PCM path is tiny and should never wait on the frame queue.
-                append_pcm(device, payload, None, None)
-            elif kind == 0x01:
-                # Publish immediately (no decode), then queue CPU work only if
-                # this frame actually needs it (recording or face check due).
-                now = store_live_frame(device, payload)
-                rec_path, do_face = claim_frame_work(device, now, None, "video")
-                if rec_path is not None or do_face:
-                    item = (device, payload, rec_path, do_face)
-                    try:
-                        ingest_q.put_nowait(item)
-                    except queue.Full:
-                        try:
-                            ingest_q.get_nowait()
-                        except queue.Empty:
-                            pass
+            try:
+                if kind == 0x02:
+                    append_pcm(device, payload, None, None)
+                elif kind == 0x01:
+                    now = store_live_frame(device, payload)
+                    rec_path, do_face = claim_frame_work(device, now, None, "video")
+                    if rec_path is not None or do_face:
+                        item = (device, payload, rec_path, do_face)
                         try:
                             ingest_q.put_nowait(item)
                         except queue.Full:
-                            pass
-            touch_device(device)
+                            try:
+                                ingest_q.get_nowait()
+                            except queue.Empty:
+                                pass
+                            try:
+                                ingest_q.put_nowait(item)
+                            except queue.Full:
+                                pass
+                touch_device(device)
+            except Exception as e:
+                print(f"[ws-device] ingest {device}: {e}", flush=True)
 
     async def speaker_down():
-        # Radio audio to the bodycam speaker only. Does not alter mic ingest.
+        # Radio audio to the bodycam speaker only. Never cancel the JPEG ingest.
+        await asyncio.sleep(2.0)
+        while pqtalkie.pop_radio_pcm(device):
+            pass
         while True:
-            pcm = pqtalkie.pop_radio_pcm(device)
-            if pcm:
-                await websocket.send_bytes(b"\x03" + pcm)
-            else:
-                await asyncio.sleep(0.01)
+            try:
+                pcm = pqtalkie.pop_radio_pcm(device)
+                if pcm:
+                    if len(pcm) > 4096:
+                        pcm = pcm[-4096:]
+                    await websocket.send_bytes(b"\x03" + pcm)
+                else:
+                    await asyncio.sleep(0.04)
+            except WebSocketDisconnect:
+                return
+            except Exception:
+                await asyncio.sleep(0.25)
 
+    ingest_task = asyncio.create_task(ingest())
+    speaker_task = asyncio.create_task(speaker_down())
     try:
-        done, pending = await asyncio.wait(
-            {asyncio.create_task(ingest()), asyncio.create_task(speaker_down())},
-            return_when=asyncio.FIRST_COMPLETED,
-        )
-        for t in pending:
-            t.cancel()
+        await ingest_task
     except WebSocketDisconnect:
         pass
     except Exception as e:
         print(f"[ws-device] {device} error: {e}", flush=True)
     finally:
+        speaker_task.cancel()
+        try:
+            await speaker_task
+        except Exception:
+            pass
         print(f"[ws-device] disconnected {device}", flush=True)
 
 
@@ -1513,7 +1623,9 @@ async def ws_live_audio(websocket: WebSocket, device: str = "bodycam-01", raw: i
     ring = audio_raw if raw else audio_live
     last_seq = 0
     primed = False
-    try:
+
+    async def sender():
+        nonlocal last_seq, primed
         while True:
             with lock:
                 buf = list(ring.get(device, ()))
@@ -1531,6 +1643,9 @@ async def ws_live_audio(websocket: WebSocket, device: str = "bodycam-01", raw: i
                         await websocket.send_bytes(chunk)
                         last_seq = seq
             await asyncio.sleep(0.004)
+
+    try:
+        await _ws_send_until_close(websocket, sender)
     except WebSocketDisconnect:
         return
     except Exception:
@@ -1549,7 +1664,9 @@ async def ws_live(websocket: WebSocket, device: str = "bodycam-01"):
     )
     last_jpeg_ts = -1.0
     last_overlay = ""
-    try:
+
+    async def sender():
+        nonlocal last_jpeg_ts, last_overlay
         while True:
             t0 = time.monotonic()
             with lock:
@@ -1568,6 +1685,9 @@ async def ws_live(websocket: WebSocket, device: str = "bodycam-01"):
 
             elapsed = time.monotonic() - t0
             await asyncio.sleep(max(0.0, 0.005 - elapsed))
+
+    try:
+        await _ws_send_until_close(websocket, sender)
     except WebSocketDisconnect:
         return
     except Exception:
@@ -1882,7 +2002,9 @@ async def ws_ext_live(websocket: WebSocket, device: str = "bodycam-01"):
     )
     last_jpeg_ts = -1.0
     last_overlay = ""
-    try:
+
+    async def sender():
+        nonlocal last_jpeg_ts, last_overlay
         while True:
             t0 = time.monotonic()
             with lock:
@@ -1899,6 +2021,9 @@ async def ws_ext_live(websocket: WebSocket, device: str = "bodycam-01"):
                         await websocket.send_text(blob)
             elapsed = time.monotonic() - t0
             await asyncio.sleep(max(0.0, 0.005 - elapsed))
+
+    try:
+        await _ws_send_until_close(websocket, sender)
     except WebSocketDisconnect:
         return
     except Exception:
@@ -1920,7 +2045,9 @@ async def ws_ext_audio(websocket: WebSocket, device: str = "bodycam-01", raw: in
     ring = audio_raw if raw else audio_live
     last_seq = 0
     primed = False
-    try:
+
+    async def sender():
+        nonlocal last_seq, primed
         while True:
             with lock:
                 buf = list(ring.get(unit, ()))
@@ -1935,6 +2062,9 @@ async def ws_ext_audio(websocket: WebSocket, device: str = "bodycam-01", raw: in
                         await websocket.send_bytes(chunk)
                         last_seq = seq
             await asyncio.sleep(0.004)
+
+    try:
+        await _ws_send_until_close(websocket, sender)
     except WebSocketDisconnect:
         return
     except Exception:

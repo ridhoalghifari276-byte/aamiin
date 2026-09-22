@@ -79,6 +79,8 @@ void portalClear() {
 bool portalConnectSta(const PortalConfig &cfg, uint32_t timeoutMs) {
   if (!cfg.ssid.length()) return false;
 
+  // Same STA init as aamiin-main.zip — do not WIFI_OFF / useStaticBuffers /
+  // esp_netif_set_default_netif (that logged netstack cb reg failed 12308).
   WiFi.mode(WIFI_STA);
   WiFi.setSleep(false);
   WiFi.setAutoReconnect(true);
@@ -210,8 +212,9 @@ static void sendForm(bool doScan) {
   body += F("<button type=\"submit\">Simpan &amp; Hubungkan</button></form>");
   body += F("<a class=\"btn\" href=\"/\">Scan ulang WiFi</a>");
   body += F("<p class=\"hint\">Hubungkan HP/laptop ke WiFi <b>BODYCAM-SETUP</b>. "
-            "Pilih Bodycam 1 / 2 / 3, lalu masukkan WiFi yang akan dipakai unit. "
-            "Setelah berhasil, perangkat reboot dan masuk ke jaringan tersebut.</p>");
+            "Pilih Bodycam 1 / 2 / 3, lalu Wi-Fi <b>2.4 GHz</b> (ESP32 tidak bisa 5 GHz). "
+            "Hotspot HP: nyalakan Maximize Compatibility / band 2.4 GHz, isi password. "
+            "Setelah simpan, perangkat reboot lalu menyambung sebagai STA.</p>");
 
   portalHttp.send(200, "text/html", pageShell(body));
 }
@@ -249,34 +252,20 @@ static void handleSave() {
   portalLive->deviceId = id;
   portalLive->pttToken = ptt;
 
-  Serial.printf("[PORTAL] trying '%s' as %s\n", ssid.c_str(), id.c_str());
-  WiFi.begin(ssid.c_str(), pass.c_str());
-  bool ok = false;
-  for (int i = 0; i < 64 && !ok; ++i) {
-    delay(250);
-    ok = WiFi.status() == WL_CONNECTED;
-    portalDns.processNextRequest();
-  }
-
-  if (!ok) {
-    portalFlash = "Gagal terhubung ke WiFi. Cek nama jaringan dan password, lalu coba lagi.";
-    Serial.println("[PORTAL] STA join failed");
-    WiFi.disconnect(false, false);
-    sendForm(false);
-    return;
-  }
-
+  // Do not join while softAP is up (AP+STA often fails on phone hotspots).
+  // Save, reboot, then portalConnectSta() joins as STA-only.
   portalSave(*portalLive);
   portalSaved = true;
-  Serial.printf("[PORTAL] saved device=%s ssid=%s ip=%s\n",
-                id.c_str(), ssid.c_str(), WiFi.localIP().toString().c_str());
+  Serial.printf("[PORTAL] saved device=%s ssid=%s — reboot to join STA\n",
+                id.c_str(), ssid.c_str());
 
   String done = F(
-    "<h1>Berhasil</h1><div class=\"tag\">Konfigurasi tersimpan</div>"
-    "<div class=\"flash ok\">Terhubung. Perangkat reboot dalam 2 detik.</div>"
-    "<p class=\"hint\">Kembalikan HP/laptop ke WiFi rumah/kantor, lalu buka dashboard bodycam.</p>");
+    "<h1>Tersimpan</h1><div class=\"tag\">Konfigurasi Wi-Fi</div>"
+    "<div class=\"flash ok\">Reboot, lalu menyambung ke jaringan yang dipilih.</div>"
+    "<p class=\"hint\">Kembalikan HP ke hotspot/Wi-Fi 2.4 GHz. Jika portal muncul lagi, "
+    "password salah atau jaringan itu 5 GHz.</p>");
   portalHttp.send(200, "text/html", pageShell(done));
-  delay(1800);
+  delay(1500);
   ESP.restart();
 }
 
@@ -284,12 +273,14 @@ static void handleNotFound() {
   sendCaptive();
 }
 
-void portalRun(PortalConfig &cfg) {
+void portalRun(PortalConfig &cfg, const String &flash) {
   portalLive = &cfg;
-  portalFlash = "";
+  portalFlash = flash;
   portalSaved = false;
 
+#if STATUS_LED >= 0
   pinMode(STATUS_LED, OUTPUT);
+#endif
 
   WiFi.persistent(false);
   WiFi.disconnect(true, true);
@@ -339,7 +330,9 @@ void portalRun(PortalConfig &cfg) {
     if (now - lastBlink > 400) {
       lastBlink = now;
       ledOn = !ledOn;
+#if STATUS_LED >= 0
       digitalWrite(STATUS_LED, ledOn ? HIGH : LOW);
+#endif
     }
     delay(2);
   }

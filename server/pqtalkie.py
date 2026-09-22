@@ -97,17 +97,29 @@ class TalkieBridge:
         self._sio = None
         self._lock = threading.Lock()
         self._pending = bytearray()
+        self._connect_thread: threading.Thread | None = None
 
     def set_token(self, token: str):
         token = normalize_kiosk_token(token)
         with self._lock:
-            if token == self.kiosk_token:
-                return
+            same = token == self.kiosk_token
+            alive = self._connect_thread is not None and self._connect_thread.is_alive()
             self.kiosk_token = token
+            if same and (not token or alive):
+                return
         if token:
-            threading.Thread(target=self._connect, name=f"ptt-{self.device}", daemon=True).start()
+            self._ensure_connect_thread()
         else:
             self._disconnect()
+
+    def _ensure_connect_thread(self):
+        with self._lock:
+            t = self._connect_thread
+            if t is not None and t.is_alive():
+                return
+            t = threading.Thread(target=self._connect_loop, name=f"ptt-{self.device}", daemon=True)
+            self._connect_thread = t
+        t.start()
 
     def set_tx(self, on: bool):
         on = bool(on)
@@ -194,42 +206,61 @@ class TalkieBridge:
         if token:
             headers["Authorization"] = f"Bearer {token}"
         url = PQTALKIE_URL + path
-        with httpx.Client(verify=not PQTALKIE_INSECURE, timeout=8.0) as c:
+        with httpx.Client(verify=not PQTALKIE_INSECURE, timeout=3.0) as c:
             r = c.post(url, headers=headers, json=body)
             r.raise_for_status()
             if not r.content:
                 return {}
             return r.json()
 
-    def _connect(self):
-        try:
-            data = None
-            last = None
-            for path in ("/api/auth/kiosk", "/auth/kiosk"):
-                try:
-                    data = self._post(path, {"token": self.kiosk_token})
-                    break
-                except Exception as e:
-                    last = e
-            if data is None:
-                raise last or RuntimeError("kiosk auth failed")
-            jwt = (data.get("token") or "").strip()
-            cid = data.get("channelId")
-            if not jwt or cid is None:
-                raise RuntimeError("kiosk response missing token/channelId")
-            user = data.get("user") or {}
+    def _connect_loop(self):
+        delay = 2.0
+        while True:
             with self._lock:
-                self.jwt = jwt
-                self.channel_id = int(cid)
-                self.label = str(data.get("label") or "")
-                self.user_name = str(user.get("name") or "")
-                self.last_err = ""
-            self._socket_connect()
-        except Exception as e:
-            with self._lock:
-                self.ok = False
-                self.last_err = str(e)
-            print(f"[ptt] {self.device} kiosk failed: {e}", flush=True)
+                if not self.kiosk_token:
+                    return
+            try:
+                self._connect_once()
+            except Exception as e:
+                with self._lock:
+                    self.ok = False
+                    self.last_err = str(e)
+                print(f"[ptt] {self.device} kiosk failed: {e}", flush=True)
+            while True:
+                with self._lock:
+                    if not self.kiosk_token:
+                        return
+                    if self.ok:
+                        delay = 2.0
+                    else:
+                        break
+                time.sleep(1.0)
+            time.sleep(delay)
+            delay = min(delay * 2.0, 30.0)
+
+    def _connect_once(self):
+        data = None
+        last = None
+        for path in ("/api/auth/kiosk", "/auth/kiosk"):
+            try:
+                data = self._post(path, {"token": self.kiosk_token})
+                break
+            except Exception as e:
+                last = e
+        if data is None:
+            raise last or RuntimeError("kiosk auth failed")
+        jwt = (data.get("token") or "").strip()
+        cid = data.get("channelId")
+        if not jwt or cid is None:
+            raise RuntimeError("kiosk response missing token/channelId")
+        user = data.get("user") or {}
+        with self._lock:
+            self.jwt = jwt
+            self.channel_id = int(cid)
+            self.label = str(data.get("label") or "")
+            self.user_name = str(user.get("name") or "")
+            self.last_err = ""
+        self._socket_connect()
 
     def _socket_connect(self):
         try:
@@ -241,7 +272,10 @@ class TalkieBridge:
             print("[ptt] pip install python-socketio websocket-client", flush=True)
             return
         self._disconnect()
-        sio = socketio.Client(ssl_verify=not PQTALKIE_INSECURE, reconnection=True)
+        sio = socketio.Client(
+            ssl_verify=not PQTALKIE_INSECURE,
+            reconnection=False,
+        )
         jwt = self.jwt
         cid = self.channel_id
 
@@ -252,7 +286,10 @@ class TalkieBridge:
                 self.ok = True
                 self.last_err = ""
                 want_sos = self.sos_want
+                want_tx = self.tx
             print(f"[ptt] {self.device} joined channel {cid}", flush=True)
+            if want_tx:
+                self._emit_request()
             if want_sos:
                 threading.Thread(target=self._sos_apply, name=f"sos-{self.device}", daemon=True).start()
 
@@ -286,7 +323,7 @@ class TalkieBridge:
             auth={"token": jwt},
             transports=["websocket"],
             socketio_path="socket.io",
-            wait_timeout=10,
+            wait_timeout=5,
         )
 
     def _disconnect(self):
@@ -446,11 +483,26 @@ def bridge_for(device: str) -> TalkieBridge:
 
 
 def warm_default():
-    """Join the configured kiosk so GPIO PTT is ready before the first press."""
+    """Radio joins in the background as soon as a bodycam comes online."""
     if not DEFAULT_TOKEN and not _env:
+        print("[ptt] no kiosk token — PTT idle", flush=True)
         return
-    for d in ("bodycam-01", "bodycam-02", "bodycam-03"):
-        bridge_for(d)
+    print("[ptt] radio standby when a bodycam is online", flush=True)
+
+
+def _existing(device: str) -> TalkieBridge | None:
+    with _mux:
+        return _bridges.get(device)
+
+
+def ensure_standby(device: str):
+    """Keep this unit's radio joined while the bodycam is alive. Non-blocking."""
+    if not device:
+        return
+    tok = _env.get(device) or DEFAULT_TOKEN
+    if not tok:
+        return
+    bridge_for(device)
 
 
 def set_device_token(device: str, token: str):
@@ -458,15 +510,24 @@ def set_device_token(device: str, token: str):
 
 
 def set_device_tx(device: str, on: bool):
-    bridge_for(device).set_tx(on)
+    ensure_standby(device)
+    b = _existing(device)
+    if b is None:
+        return
+    b.set_tx(on)
 
 
 def set_device_sos(device: str, on: bool):
-    bridge_for(device).set_sos(on)
+    if on:
+        ensure_standby(device)
+    b = _existing(device)
+    if b is None:
+        return
+    b.set_sos(on)
 
 
 def set_device_location(device: str, lat, lon):
-    b = _bridges.get(device)
+    b = _existing(device)
     if b:
         b.set_location(lat, lon)
 
@@ -503,5 +564,15 @@ def pop_radio_pcm(device: str) -> bytes:
 def status(device: str | None = None) -> dict:
     with _mux:
         if device:
-            return bridge_for(device).snapshot()
+            b = _bridges.get(device)
+            if not b:
+                return {
+                    "device": device,
+                    "ready": False,
+                    "tx": False,
+                    "sos": False,
+                    "has_token": bool(_env.get(device) or DEFAULT_TOKEN),
+                    "error": "",
+                }
+            return b.snapshot()
         return {d: b.snapshot() for d, b in _bridges.items()}

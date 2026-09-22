@@ -7,7 +7,6 @@
 #include <esp_heap_caps.h>
 #include <driver/i2s.h>
 #include <Adafruit_NeoPixel.h>
-#include <Preferences.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
 #include "config.h"
@@ -46,15 +45,15 @@ static volatile size_t ringWrite = 0;
 static volatile size_t ringRead = 0;
 static portMUX_TYPE ringMux = portMUX_INITIALIZER_UNLOCKED;
 
-// Server address is discovered at runtime: the laptop's DHCP lease changes.
+// Public VPS. Do not scan the STA /24 — that floods TCP and aborts /ws/device.
 static String serverHost = SERVER_HOST;
 static String deviceId = DEVICE_ID;
 static String pttToken;
-static Preferences prefs;
 
 static String baseUrl() {
   return String("http://") + serverHost + ":" + String(SERVER_PORT);
 }
+
 
 static String sessionId;
 static String sessionMode;
@@ -222,8 +221,8 @@ static bool postJson(const char *path, const String &body) {
 
   h.addHeader("Content-Type", "application/json");
   copySessionHeaders(h);
-  h.setConnectTimeout(500);
-  h.setTimeout(800);
+  h.setConnectTimeout(4000);
+  h.setTimeout(4000);
   int code = h.POST(body);
   h.end();
   return code >= 200 && code < 300;
@@ -275,6 +274,7 @@ static void wsEvent(WStype_t type, uint8_t *payload, size_t length) {
   switch (type) {
     case WStype_CONNECTED:
       wsConnected = true;
+      WiFi.setSleep(false);
       streamWs.enableHeartbeat(15000, 3000, 2);
       Serial.printf("[WS] connected: %s\n", payload ? (char *)payload : "");
       break;
@@ -314,6 +314,7 @@ static void audioWsEvent(WStype_t type, uint8_t *payload, size_t length) {
       break;
     case WStype_DISCONNECTED:
       audioWsConnected = false;
+      ringClear();
       Serial.println("[WS-AUDIO] disconnected");
       break;
     case WStype_ERROR:
@@ -336,7 +337,7 @@ static void startAudioWebSocket() {
   if (audioWsStarted) return;
   String path = String("/ws/audio?device=") + deviceId + "&token=" + SERVER_TOKEN;
   audioWs.onEvent(audioWsEvent);
-  audioWs.setReconnectInterval(2000);
+  audioWs.setReconnectInterval(10000);
   audioWs.begin(serverHost.c_str(), SERVER_PORT, path.c_str(), "");
   audioWsStarted = true;
   Serial.printf("[WS-AUDIO] connecting %s:%d%s\n", serverHost.c_str(), SERVER_PORT, path.c_str());
@@ -349,68 +350,12 @@ static void stopAudioWebSocket() {
   audioWsConnected = false;
 }
 
-// Does this address answer our gateway's /health? Used for discovery.
-static bool probeHost(const String &ip, uint32_t connectMs) {
-  WiFiClient c;
-  if (!c.connect(ip.c_str(), SERVER_PORT, connectMs)) return false;
-  c.print("GET /health HTTP/1.1\r\nHost: bodycam\r\nConnection: close\r\n\r\n");
-  String resp;
-  uint32_t t0 = millis();
-  while (millis() - t0 < 500) {
-    while (c.available()) resp += (char)c.read();
-    if (resp.indexOf("camera_rotate") >= 0) break;
-    if (!c.connected() && !c.available()) break;
-    delay(5);
-  }
-  c.stop();
-  return resp.indexOf("camera_rotate") >= 0;
-}
-
-// The laptop's DHCP lease changes, which used to kill the link until the
-// firmware was reflashed. Scan our own /24 for the gateway and remember it.
-static void rememberServerHost(const String &ip) {
-  if (!ip.length() || ip == serverHost) return;
-  serverHost = ip;
-  prefs.begin("bodycam", false);
-  prefs.putString("srv", ip);
-  prefs.end();
-}
-
-static bool discoverServer() {
-  if (WiFi.status() != WL_CONNECTED) return false;
-  if (serverHost.length() && probeHost(serverHost, 800)) {
-    Serial.printf("[NET] server ok at %s:%d\n", serverHost.c_str(), SERVER_PORT);
-    return true;
-  }
-  if (String(SERVER_HOST) != serverHost && probeHost(SERVER_HOST, 1200)) {
-    rememberServerHost(SERVER_HOST);
-    Serial.printf("[NET] server ok at %s:%d\n", SERVER_HOST, SERVER_PORT);
-    return true;
-  }
-  IPAddress me = WiFi.localIP();
-  Serial.printf("[NET] searching %d.%d.%d.0/24 for gateway...\n", me[0], me[1], me[2]);
-  String prefix = String(me[0]) + "." + String(me[1]) + "." + String(me[2]) + ".";
-  for (int i = 1; i <= 254; ++i) {
-    if (i == me[3]) continue;
-    String ip = prefix + String(i);
-    if (probeHost(ip, 120)) {
-      rememberServerHost(ip);
-      Serial.printf("[NET] gateway found at %s:%d\n", ip.c_str(), SERVER_PORT);
-      return true;
-    }
-  }
-  Serial.println("[NET] gateway not found");
-  return false;
-}
-
-static void loadServerHost() {
-  prefs.begin("bodycam", true);
-  String saved = prefs.getString("srv", "");
-  prefs.end();
-  if (saved.length()) {
-    serverHost = saved;
-    Serial.printf("[NET] saved gateway %s\n", saved.c_str());
-  }
+static void bindPublicServer() {
+  serverHost = SERVER_HOST;
+  Serial.printf("[NET] ip=%s -> %s:%d\n",
+                WiFi.localIP().toString().c_str(),
+                SERVER_HOST,
+                SERVER_PORT);
 }
 
 static void startWebSocket() {
@@ -423,7 +368,7 @@ static void startWebSocket() {
                 "&token=" + SERVER_TOKEN;
 
   streamWs.onEvent(wsEvent);
-  streamWs.setReconnectInterval(4000);
+  streamWs.setReconnectInterval(10000);
   // Empty subprotocol: FastAPI rejects Sec-WebSocket-Protocol: arduino.
   streamWs.begin(serverHost.c_str(), SERVER_PORT, path.c_str(), "");
   wsStarted = true;
@@ -547,13 +492,14 @@ static void audioCaptureTask(void *) {
   int32_t raw[RAW_N];
   int16_t pcm[RAW_N];
   for (;;) {
-    bool need = streamEnabled || audioEnabled || videoEnabled || pttHeld;
-    if (!need || !audioRing) {
+    bool live = audioWsConnected || audioEnabled || videoEnabled || pttHeld;
+    if (!audioRing) {
       vTaskDelay(pdMS_TO_TICKS(40));
       continue;
     }
     size_t bytes = 0;
     esp_err_t e = i2s_read(I2S_NUM_0, raw, sizeof(raw), &bytes, pdMS_TO_TICKS(100));
+    if (!live) continue;
     if (e != ESP_OK || bytes < sizeof(int32_t)) continue;
     size_t n = bytes / sizeof(int32_t);
     // Outdoor wind rumble sits below ~100 Hz. Cut it on-device so the
@@ -689,9 +635,18 @@ static void provisionNetwork() {
     Serial.println("[PORTAL] GPIO21 held at boot — opening setup");
   }
 
-  if (forcePortal || !haveCfg || !portalConnectSta(net, 20000)) {
+  String portalMsg;
+  bool joined = false;
+  if (!forcePortal && haveCfg) {
+    joined = portalConnectSta(net, 25000);
+    if (!joined) {
+      portalMsg = "Gagal gabung ke '" + net.ssid +
+                  "'. Pakai Wi-Fi 2.4 GHz dan cek password hotspot.";
+    }
+  }
+  if (forcePortal || !haveCfg || !joined) {
     rgb(0, 160, 200);
-    portalRun(net);  // saves then restarts
+    portalRun(net, portalMsg);
   }
   deviceId = net.deviceId;
   pttToken = net.pttToken;
@@ -742,7 +697,9 @@ static void audioTxTask(void *) {
       vTaskDelay(pdMS_TO_TICKS(200));
       continue;
     }
-    startAudioWebSocket();
+    // Open audio WS only after /ws/device is up so two handshakes do not
+    // fight for the few lwIP sockets on a filtered meeting LAN.
+    if (wsConnected) startAudioWebSocket();
     audioWs.loop();
 
     if (!(streamEnabled || audioEnabled || videoEnabled || pttHeld)) {
@@ -754,8 +711,9 @@ static void audioTxTask(void *) {
       vTaskDelay(pdMS_TO_TICKS(ringCount() >= (size_t)AUDIO_TX_SAMPLES ? 1 : 15));
       continue;
     }
-    // Zip drained the ring over HTTP when the socket was down.
-    sendAudioChunk();
+    // HTTP fallback only while recording a file. Live stays on WS so a
+    // down socket is not drowned by POST /api/v1/audio.
+    if (audioEnabled || videoEnabled) sendAudioChunk();
     vTaskDelay(pdMS_TO_TICKS(20));
   }
 }
@@ -772,15 +730,16 @@ static void houseKeepTask(void *) {
       continue;
     }
 
-    // Both sockets dead for a while usually means the laptop changed IP.
+    // Sockets down: bounce WS back to the public VPS. Never scan the LAN.
     if (wsConnected || audioWsConnected) {
       linkOkAt = millis();
-    } else if (millis() - linkOkAt > 12000) {
-      Serial.println("[NET] link down, re-discovering gateway");
-      if (discoverServer()) {
-        stopWebSocket();
-        stopAudioWebSocket();
-      }
+    } else if (millis() - linkOkAt > 60000) {
+      Serial.printf("[NET] still no VPS from %s — WS retry %s:%d\n",
+                    WiFi.localIP().toString().c_str(), SERVER_HOST, SERVER_PORT);
+      serverHost = SERVER_HOST;
+      stopWebSocket();
+      stopAudioWebSocket();
+      WiFi.setSleep(true);
       linkOkAt = millis();
     }
 
@@ -793,12 +752,13 @@ static void houseKeepTask(void *) {
     if (now - lastHb >= 5000) {
       lastHb = now;
       postDeviceState();
-      Serial.printf("[STAT] ws=%d aws=%d ptt=%d sos=%d gps=%d sats=%d audio=%lu drops=%lu video=%lu drops=%lu ring=%u RSSI=%d\n",
+      Serial.printf("[STAT] ws=%d aws=%d ptt=%d sos=%d gps=%d rx=%d sats=%d audio=%lu drops=%lu video=%lu drops=%lu ring=%u RSSI=%d\n",
                     wsConnected,
                     audioWsConnected,
                     (int)pttHeld,
                     (int)sosActive,
                     (int)gpsHasFix(),
+                    (int)gpsHasRx(),
                     gpsSatellites(),
                     (unsigned long)txAudioPackets,
                     (unsigned long)txAudioDrops,
@@ -831,10 +791,11 @@ static void streamTxTask(void *) {
     }
 
     startWebSocket();
+    WiFi.setSleep(false);
 
     if (!wsConnected) {
       drainCamFb();
-      vTaskDelay(pdMS_TO_TICKS(50));
+      vTaskDelay(pdMS_TO_TICKS(250));
       continue;
     }
 
@@ -876,6 +837,7 @@ void setup() {
   nightIr(false);
 
   provisionNetwork();
+  bindPublicServer();
 
   if (!initCam()) rgb(255, 0, 255);
   nightVision = false;
@@ -883,8 +845,7 @@ void setup() {
   gpsBegin();
   speakerBegin();
 
-  // Drain the sensor immediately so DMA cannot overflow while we wait on
-  // the public gateway (discoverServer used to block with nobody grabbing).
+  // Drain the sensor immediately so DMA cannot overflow during WS connect.
   txPacketCap = 96 * 1024;
   txPacket = (uint8_t *)heap_caps_malloc(txPacketCap, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
   if (!txPacket) {
@@ -899,8 +860,6 @@ void setup() {
   xTaskCreatePinnedToCore(streamTxTask, "streamtx", 12288, nullptr, 4, nullptr, 1);
 
   initMic();
-  loadServerHost();
-  discoverServer();
 
   nightVision = false;
   applyCamNight(false);

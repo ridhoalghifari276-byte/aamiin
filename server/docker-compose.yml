@@ -35,6 +35,12 @@ services:
       - "7890:8080"
     volumes:
       - ./data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "--max-time", "4", "http://127.0.0.1:8080/health"]
+      interval: 20s
+      timeout: 5s
+      retries: 3
+      start_period: 40s
 
 volumes:
   insightface:

@@ -24,6 +24,7 @@ static float spdKmh = 0;
 static float crsDeg = 0;
 static int sats = 0;
 static uint32_t fixAt = 0;
+static uint32_t nmeaAt = 0;
 
 static char lineBuf[128];
 static size_t lineLen = 0;
@@ -69,6 +70,13 @@ static int splitCsv(char *s, char *fields[], int maxFields) {
   return n;
 }
 
+static void noteNmea(int nsat) {
+  portENTER_CRITICAL(&gpsMux);
+  nmeaAt = millis();
+  if (nsat >= 0) sats = nsat;
+  portEXIT_CRITICAL(&gpsMux);
+}
+
 static void applyFix(double lat, double lon, float alt, float spd, float crs, int nsat, bool valid) {
   if (!valid) return;
   if (lat == 0.0 && lon == 0.0) return;
@@ -82,6 +90,7 @@ static void applyFix(double lat, double lon, float alt, float spd, float crs, in
   if (crs >= 0.0f) crsDeg = crs;
   if (nsat >= 0) sats = nsat;
   fixAt = millis();
+  nmeaAt = fixAt;
   portEXIT_CRITICAL(&gpsMux);
 }
 
@@ -93,11 +102,12 @@ static void parseGga(char *line) {
   if (n < 10) return;
   // $GPGGA,time,lat,N,lon,E,fix,sats,hdop,alt,M,...
   int quality = atoi(f[6]);
+  int nsat = f[7][0] ? atoi(f[7]) : -1;
+  noteNmea(nsat);
   if (quality <= 0) return;
   if (!f[2][0] || !f[4][0]) return;
   double lat = nmeaToDeg(f[2], f[3][0]);
   double lon = nmeaToDeg(f[4], f[5][0]);
-  int nsat = f[7][0] ? atoi(f[7]) : -1;
   float alt = f[9][0] ? (float)atof(f[9]) : -9999.0f;
   applyFix(lat, lon, alt, -1.0f, -1.0f, nsat, true);
 }
@@ -122,6 +132,7 @@ static void parseRmc(char *line) {
 static void handleLine(char *line) {
   if (line[0] != '$') return;
   if (strchr(line, '*') && !nmeaChecksumOk(line)) return;
+  noteNmea(-1);
   if (talkerIs(line, "GGA")) {
     parseGga(line);
   } else if (talkerIs(line, "RMC")) {
@@ -171,6 +182,13 @@ bool gpsHasFix() {
   return ok;
 }
 
+bool gpsHasRx() {
+  portENTER_CRITICAL(&gpsMux);
+  bool ok = nmeaAt && (millis() - nmeaAt) < 5000;
+  portEXIT_CRITICAL(&gpsMux);
+  return ok;
+}
+
 int gpsSatellites() {
   portENTER_CRITICAL(&gpsMux);
   int n = sats;
@@ -191,6 +209,8 @@ void gpsAppendJson(String &body) {
   float alt, spd, crs;
   int nsat;
   uint32_t age;
+  bool rx;
+  uint32_t nmeaMs;
   portENTER_CRITICAL(&gpsMux);
   ok = haveFix;
   lat = latDeg;
@@ -200,10 +220,17 @@ void gpsAppendJson(String &body) {
   crs = crsDeg;
   nsat = sats;
   age = haveFix ? (millis() - fixAt) : 0;
+  nmeaMs = nmeaAt;
   portEXIT_CRITICAL(&gpsMux);
+  rx = nmeaMs && (millis() - nmeaMs) < 5000;
 
   body += ",\"gps\":";
   body += ok ? "true" : "false";
+  body += ",\"gps_on\":true";
+  body += ",\"gps_rx\":";
+  body += rx ? "true" : "false";
+  body += ",\"sats\":";
+  body += String(nsat);
   if (!ok) {
     body += ",\"lat\":null,\"lon\":null";
     return;

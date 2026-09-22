@@ -13,4 +13,4 @@ ENV FACE_RECOG_MODEL=/app/models/face_recognition_sface_2021dec.onnx
 RUN curl -fsSL -o /app/models/face_recognition_sface_2021dec.onnx \
     "https://github.com/opencv/opencv_zoo/raw/main/models/face_recognition_sface/face_recognition_sface_2021dec.onnx" \
     || echo "SFace download skipped"
-CMD ["uvicorn","app:app","--host","0.0.0.0","--port","8080"]
+CMD ["uvicorn","app:app","--host","0.0.0.0","--port","8080","--timeout-keep-alive","15","--timeout-graceful-shutdown","10","--ws-ping-interval","0"]

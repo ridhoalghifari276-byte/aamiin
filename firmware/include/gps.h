@@ -4,6 +4,7 @@
 
 void gpsBegin();
 bool gpsHasFix();
+bool gpsHasRx();
 int gpsSatellites();
 uint32_t gpsAgeMs();
 
