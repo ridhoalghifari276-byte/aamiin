@@ -83,42 +83,150 @@ def _pcm_peak(pcm: bytes) -> int:
     return int(peak)
 
 
-def _normalize_pcm(pcm: bytes, target: int = 10000) -> bytes:
-    """Only tame rare overs. Per-chunk peak→target AGC destroys speech (sounds like a broken speaker)."""
-    if len(pcm) < 2:
+def _pcm_metrics(pcm: bytes) -> dict:
+    if len(pcm) < 4:
+        return {"peak": 0, "clip": 1.0, "zcr": 0.0, "rms": 0.0}
+    samples = memoryview(pcm).cast("h")
+    n = len(samples)
+    peak = 0
+    clip_n = 0
+    zc = 0
+    acc = 0.0
+    prev = 0
+    for i, s in enumerate(samples):
+        a = -s if s < 0 else s
+        if a > peak:
+            peak = a
+        if a > 28000:
+            clip_n += 1
+        acc += float(s) * float(s)
+        if i and ((prev >= 0) != (s >= 0)):
+            zc += 1
+        prev = s
+    return {
+        "peak": int(peak),
+        "clip": clip_n / float(n),
+        "zcr": zc / float(n),
+        "rms": (acc / float(n)) ** 0.5,
+    }
+
+
+def _score_pcm(m: dict) -> float:
+    """Lower is better. Full-scale clipped noise scores worst."""
+    score = m["clip"] * 20.0
+    if m["peak"] >= 30000:
+        score += 5.0
+    # Speech-ish zero-crossing; pure square/noise is extreme.
+    z = m["zcr"]
+    if z < 0.01 or z > 0.45:
+        score += 3.0
+    # Prefer some energy but not pegged.
+    if m["rms"] < 200:
+        score += 2.0
+    if m["rms"] > 20000:
+        score += 2.0
+    return score
+
+
+def _resample_to_16k(pcm: bytes, rate: int) -> bytes:
+    if rate <= 0 or rate == SAMPLE_RATE or len(pcm) < 4:
         return pcm
-    peak = _pcm_peak(pcm)
-    if peak < 80:
+    src = memoryview(pcm).cast("h")
+    n_src = len(src)
+    n_dst = max(1, int(round(n_src * SAMPLE_RATE / float(rate))))
+    out = bytearray(n_dst * 2)
+    dst = memoryview(out).cast("h")
+    if n_src == 1:
+        for i in range(n_dst):
+            dst[i] = src[0]
+        return bytes(out)
+    for i in range(n_dst):
+        pos = i * (n_src - 1) / float(n_dst - 1)
+        i0 = int(pos)
+        i1 = i0 + 1 if i0 + 1 < n_src else i0
+        frac = pos - i0
+        dst[i] = int(src[i0] * (1.0 - frac) + src[i1] * frac)
+    return bytes(out)
+
+
+def _downmix_stereo(pcm: bytes) -> bytes:
+    if len(pcm) < 4:
         return pcm
-    # Soft ceiling only — never boost every 20 ms frame to full scale.
-    if peak <= 28000:
+    if len(pcm) % 4:
+        pcm = pcm[: len(pcm) - (len(pcm) % 4)]
+    samples = memoryview(pcm).cast("h")
+    n_frames = len(samples) // 2
+    out = bytearray(n_frames * 2)
+    dst = memoryview(out).cast("h")
+    for i in range(n_frames):
+        dst[i] = (int(samples[i * 2]) + int(samples[i * 2 + 1])) // 2
+    return bytes(out)
+
+
+def _u8_to_s16(raw: bytes) -> bytes:
+    out = bytearray(len(raw) * 2)
+    dst = memoryview(out).cast("h")
+    for i, b in enumerate(raw):
+        dst[i] = (int(b) - 128) << 8
+    return bytes(out)
+
+
+def _byteswap_s16(raw: bytes) -> bytes:
+    if len(raw) < 2:
+        return raw
+    if len(raw) % 2:
+        raw = raw[:-1]
+    out = bytearray(len(raw))
+    for i in range(0, len(raw), 2):
+        out[i] = raw[i + 1]
+        out[i + 1] = raw[i]
+    return bytes(out)
+
+
+def _attenuate(pcm: bytes, div: int) -> bytes:
+    if div <= 1 or len(pcm) < 2:
         return pcm
-    scale = 24000.0 / float(peak)
     samples = memoryview(pcm).cast("h")
     out = bytearray(len(pcm))
     dst = memoryview(out).cast("h")
     for i, s in enumerate(samples):
-        v = int(round(s * scale))
-        if v > 32767:
-            v = 32767
-        elif v < -32768:
-            v = -32768
-        dst[i] = v
+        dst[i] = int(s) // div
     return bytes(out)
+
+
+def _decode_candidates(raw: bytes) -> list[tuple[str, bytes, int]]:
+    """Return list of (kind, pcm_mono_16k, assumed_src_rate)."""
+    cands: list[tuple[str, bytes, int]] = []
+    even = raw if (len(raw) % 2 == 0) else raw[:-1]
+    if len(even) >= 4:
+        cands.append(("s16le_16k", even, SAMPLE_RATE))
+        cands.append(("s16be_16k", _byteswap_s16(even), SAMPLE_RATE))
+        cands.append(("s16le_8k", _resample_to_16k(even, 8000), 8000))
+        cands.append(("s16be_8k", _resample_to_16k(_byteswap_s16(even), 8000), 8000))
+        stereo = _downmix_stereo(even)
+        if len(stereo) >= 4:
+            cands.append(("stereo_16k", stereo, SAMPLE_RATE))
+            cands.append(("stereo_8k", _resample_to_16k(stereo, 8000), 8000))
+    if len(raw) >= 8:
+        u8 = _u8_to_s16(raw)
+        cands.append(("u8_16k", u8, SAMPLE_RATE))
+        cands.append(("u8_8k", _resample_to_16k(u8, 8000), 8000))
+    return cands
 
 
 def wav_to_pcm(raw: bytes) -> tuple[bytes, dict]:
     """Extract s16le mono @ SAMPLE_RATE from WAV/PCM. Returns (pcm, info)."""
-    info = {"kind": "raw", "rate": SAMPLE_RATE, "ch": 1, "bits": 16, "fmt": 1}
+    info: dict = {"kind": "raw", "rate": SAMPLE_RATE, "ch": 1, "bits": 16, "fmt": 1}
     if not raw:
         return b"", info
-    rate = SAMPLE_RATE
-    ch = 1
-    bits = 16
-    pcm = raw
+
     if len(raw) >= 12 and raw[:4] == b"RIFF" and raw[8:12] == b"WAVE":
         info["kind"] = "wav"
         pos = 12
+        rate = SAMPLE_RATE
+        ch = 1
+        bits = 16
+        pcm = raw
         try:
             while pos + 8 <= len(raw):
                 tag = raw[pos : pos + 4]
@@ -143,51 +251,55 @@ def wav_to_pcm(raw: bytes) -> tuple[bytes, dict]:
                 pcm = raw[i + 8 :]
         if bits != 16:
             return b"", info
-    else:
-        # Headerless PCM from HT/web. ~640 bytes ≈ 20 ms mono @ 16 kHz.
-        # Do NOT guess 8 kHz from size — that alternated raw/raw8k in logs and
-        # destroyed speech (sounded like a broken speaker).
-        rate = SAMPLE_RATE
-        info["kind"] = "raw"
-        info["rate"] = rate
-    info["ch"] = ch
-    info["rate"] = rate
-    info["bits"] = bits
-    # Stereo/multi → mono (average first two channels)
-    if ch >= 2 and len(pcm) >= 4:
-        samples = memoryview(pcm).cast("h")
-        n_frames = len(samples) // ch
-        mono = bytearray(n_frames * 2)
-        mv = memoryview(mono).cast("h")
-        for i in range(n_frames):
-            base = i * ch
-            mv[i] = (int(samples[base]) + int(samples[base + 1])) // 2
-        pcm = bytes(mono)
-        ch = 1
-        info["ch"] = 1
-    # Resample to 16 kHz if needed.
-    if rate > 0 and rate != SAMPLE_RATE and len(pcm) >= 4:
-        src = memoryview(pcm).cast("h")
-        n_src = len(src)
-        n_dst = max(1, int(round(n_src * SAMPLE_RATE / float(rate))))
-        out = bytearray(n_dst * 2)
-        dst = memoryview(out).cast("h")
-        if n_src == 1:
-            for i in range(n_dst):
-                dst[i] = src[0]
-        else:
-            for i in range(n_dst):
-                pos = i * (n_src - 1) / float(n_dst - 1)
-                i0 = int(pos)
-                i1 = i0 + 1 if i0 + 1 < n_src else i0
-                frac = pos - i0
-                dst[i] = int(src[i0] * (1.0 - frac) + src[i1] * frac)
-        pcm = bytes(out)
-        info["rate_out"] = SAMPLE_RATE
-    # No per-chunk AGC / soft-ceiling — keep natural levels (overs already int16-limited).
-    info["peak"] = _pcm_peak(pcm)
-    info["out"] = len(pcm)
-    return pcm, info
+        if ch >= 2 and len(pcm) >= 4:
+            pcm = _downmix_stereo(pcm)
+            info["ch"] = 1
+        pcm = _resample_to_16k(pcm, rate)
+        m = _pcm_metrics(pcm)
+        info.update({"rate_out": SAMPLE_RATE, "peak": m["peak"], "clip": round(m["clip"], 3), "out": len(pcm)})
+        return pcm, info
+
+    # Headerless: pick the decode that looks least like full-scale noise.
+    best_pcm = b""
+    best_score = 1e9
+    best_kind = "s16le_16k"
+    best_rate = SAMPLE_RATE
+    best_m: dict = {}
+    for kind, pcm, rate in _decode_candidates(raw):
+        m = _pcm_metrics(pcm)
+        score = _score_pcm(m)
+        if score < best_score:
+            best_score = score
+            best_pcm = pcm
+            best_kind = kind
+            best_rate = rate
+            best_m = m
+    # If still pegged, gently bring into speech range (last resort — source is hot/wrong).
+    if best_m.get("clip", 1) > 0.35 or best_m.get("peak", 0) >= 30000:
+        for div in (2, 4, 8):
+            softened = _attenuate(best_pcm, div)
+            m = _pcm_metrics(softened)
+            score = _score_pcm(m) + div * 0.1
+            if score < best_score:
+                best_score = score
+                best_pcm = softened
+                best_kind = f"{best_kind}/att{div}"
+                best_m = m
+    info.update(
+        {
+            "kind": best_kind,
+            "rate": best_rate,
+            "ch": 1,
+            "bits": 16,
+            "rate_out": SAMPLE_RATE,
+            "peak": best_m.get("peak", 0),
+            "clip": round(best_m.get("clip", 0.0), 3),
+            "zcr": round(best_m.get("zcr", 0.0), 3),
+            "out": len(best_pcm),
+            "hex": raw[:16].hex(),
+        }
+    )
+    return best_pcm, info
 
 
 def pcm_wav(pcm: bytes, rate: int = SAMPLE_RATE) -> bytes:
@@ -451,6 +563,7 @@ class TalkieBridge:
                     return
             else:
                 return
+            mime = str(data.get("mime") or data.get("type") or "")
             pcm, meta = wav_to_pcm(raw)
             if not pcm:
                 return
@@ -462,9 +575,9 @@ class TalkieBridge:
             if n <= 8 or n % 50 == 0:
                 print(
                     f"[ptt] {self.device} RX radio audio #{n} "
-                    f"in={len(raw)} out={len(pcm)} peak={meta.get('peak', _pcm_peak(pcm))} "
-                    f"{meta.get('kind')} rate={meta.get('rate')} ch={meta.get('ch')} "
-                    f"corr={meta.get('corr', '-')}",
+                    f"in={len(raw)} out={len(pcm)} peak={meta.get('peak')} "
+                    f"clip={meta.get('clip')} kind={meta.get('kind')} "
+                    f"rate={meta.get('rate')} hex={meta.get('hex', '')} mime={mime!r}",
                     flush=True,
                 )
             push_radio_pcm(self.device, pcm)
