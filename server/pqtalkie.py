@@ -107,6 +107,8 @@ class TalkieBridge:
         self.rx_chunks = 0
         self.rx_bytes = 0
         self.rx_at = 0.0
+        self.tx_chunks = 0
+        self.sos_err = ""
         self._sio = None
         self._lock = threading.Lock()
         self._pending = bytearray()
@@ -215,6 +217,8 @@ class TalkieBridge:
                 "rx_chunks": self.rx_chunks,
                 "rx_bytes": self.rx_bytes,
                 "rx_age_ms": int((time.time() - self.rx_at) * 1000) if self.rx_at else None,
+                "tx_chunks": self.tx_chunks,
+                "sos_err": self.sos_err,
                 "error": self.last_err,
             }
 
@@ -347,14 +351,6 @@ class TalkieBridge:
                 )
             push_radio_pcm(self.device, pcm)
 
-        @sio.on("*")
-        def _any_event(event, data):
-            # One-shot visibility if the server uses a different event name.
-            if event in ("ptt:audio", "connect", "disconnect"):
-                return
-            if event.startswith("ptt:") or "audio" in str(event).lower():
-                print(f"[ptt] {self.device} event {event!r} type={type(data).__name__}", flush=True)
-
         @sio.event
         def disconnect():
             with self._lock:
@@ -394,6 +390,8 @@ class TalkieBridge:
             return
         try:
             sio.emit("ptt:request", {"channelId": cid})
+            with self._lock:
+                self.last_err = ""
             print(f"[ptt] {self.device} TX start", flush=True)
         except Exception as e:
             with self._lock:
@@ -420,8 +418,14 @@ class TalkieBridge:
         chunk = base64.b64encode(wav).decode("ascii")
         try:
             sio.emit("ptt:audio", {"channelId": cid, "chunk": chunk, "mime": "audio/wav"})
-        except Exception:
-            pass
+            with self._lock:
+                self.tx_chunks += 1
+                n = self.tx_chunks
+            if n <= 3 or n % 50 == 0:
+                print(f"[ptt] {self.device} TX radio audio #{n} bytes={len(pcm)}", flush=True)
+        except Exception as e:
+            with self._lock:
+                self.last_err = str(e)
 
     def _sos_apply(self):
         if not self._wait_ready():
@@ -486,8 +490,9 @@ class TalkieBridge:
                     self.last_err = ""
                 print(f"[sos] {self.device} OFF", flush=True)
         except Exception as e:
+            # SOS API failure must not look like the radio link died.
             with self._lock:
-                self.last_err = str(e)
+                self.sos_err = str(e)
             print(f"[sos] {self.device} failed: {e}", flush=True)
 
     def _sos_location(self, alert_id, lat: float, lon: float):

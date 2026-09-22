@@ -1010,6 +1010,8 @@ def health():
         copy["radio_rx_chunks"] = int(r.get("rx_chunks") or 0)
         copy["radio_rx_bytes"] = int(r.get("rx_bytes") or 0)
         copy["radio_rx_age_ms"] = r.get("rx_age_ms")
+        copy["radio_tx_chunks"] = int(r.get("tx_chunks") or 0)
+        copy["sos_err"] = r.get("sos_err") or ""
         states[d] = copy
     return {
         "ok": True,
