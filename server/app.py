@@ -1631,15 +1631,19 @@ async def ws_audio(websocket: WebSocket):
             try:
                 pcm = pqtalkie.pop_radio_pcm(device)
                 if pcm:
-                    if len(pcm) > 4096:
-                        pcm = pcm[-4096:]
-                    await websocket.send_bytes(b"\x03" + pcm)
-                    sent += 1
-                    if sent <= 3 or sent % 50 == 0:
-                        print(
-                            f"[ptt] {device} speaker out #{sent} bytes={len(pcm)}",
-                            flush=True,
-                        )
+                    # Opus chunks can be >>4 KB; send in pieces — never drop the head.
+                    off = 0
+                    while off < len(pcm):
+                        piece = pcm[off : off + 4096]
+                        off += len(piece)
+                        await websocket.send_bytes(b"\x03" + piece)
+                        sent += 1
+                        if sent <= 8 or sent % 50 == 0:
+                            print(
+                                f"[ptt] {device} speaker out #{sent} bytes={len(piece)} "
+                                f"qleft={len(pcm) - off}",
+                                flush=True,
+                            )
                 else:
                     await asyncio.sleep(0.02)
             except WebSocketDisconnect:

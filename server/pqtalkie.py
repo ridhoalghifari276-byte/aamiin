@@ -12,6 +12,7 @@ Do not point this bridge at https://…:3443/r/… — that is the browser SPA.
 from __future__ import annotations
 
 import base64
+import ctypes.util
 import json
 import os
 import struct
@@ -21,6 +22,45 @@ from collections import deque
 from urllib.parse import urlparse
 
 import httpx
+
+# opuslib uses ctypes.util.find_library("opus"), which often returns None on
+# Debian slim even when libopus0 is installed. Point it at the real .so first.
+_OPUS_SO_CANDIDATES = (
+    "libopus.so.0",
+    "libopus.so",
+    "/usr/lib/x86_64-linux-gnu/libopus.so.0",
+    "/usr/lib/aarch64-linux-gnu/libopus.so.0",
+    "/lib/x86_64-linux-gnu/libopus.so.0",
+    "/lib/aarch64-linux-gnu/libopus.so.0",
+)
+_orig_find_library = ctypes.util.find_library
+
+
+def _find_library_opus(name: str):
+    found = _orig_find_library(name)
+    if found:
+        return found
+    if name in ("opus", "libopus"):
+        for path in _OPUS_SO_CANDIDATES:
+            if os.path.exists(path):
+                return path
+        return "libopus.so.0"
+    return None
+
+
+ctypes.util.find_library = _find_library_opus  # type: ignore[assignment]
+
+_OPUS_OK = False
+_OPUS_ERR = ""
+try:
+    import opuslib  # noqa: F401
+
+    _OPUS_OK = True
+except Exception as e:  # pragma: no cover
+    _OPUS_ERR = str(e)
+    print(f"[ptt] opuslib UNAVAILABLE: {e}", flush=True)
+else:
+    print("[ptt] opuslib OK (PQOP/audio/opus decode enabled)", flush=True)
 
 PQTALKIE_URL = (os.getenv("PQTALKIE_URL") or "http://192.168.245.99:4000").rstrip("/")
 _scheme = (urlparse(PQTALKIE_URL).scheme or "http").lower()
@@ -260,28 +300,34 @@ def _parse_pqop_frames(raw: bytes) -> dict | None:
 
 def _decode_opus_packets(
     packets: list[bytes], *, out_rate: int, channels: int, frame_ms: int
-) -> bytes:
-    """Decode a list of Opus packets with a fresh decoder → s16le PCM."""
+) -> tuple[bytes, int, object]:
+    """Decode Opus packets → (pcm, ok_frames, last_err)."""
     if not packets:
-        return b""
+        return b"", 0, "no packets"
+    if not _OPUS_OK:
+        return b"", 0, f"opuslib unavailable: {_OPUS_ERR}"
     import opuslib
 
     ch = 1 if channels < 2 else 2
     dec = opuslib.Decoder(int(out_rate), ch)
-    # Opus allows up to 120 ms; use header frame_ms with headroom.
-    ms = max(10, min(120, int(frame_ms or 20)))
-    frame_size = int(out_rate) * ms // 1000
-    if frame_size < 120:
-        frame_size = int(out_rate) * 120 // 1000
+    # Always allow up to 120 ms — TOC may disagree with PQOP frame_ms.
+    frame_size = int(out_rate) * 120 // 1000
     parts: list[bytes] = []
+    ok = 0
+    last_err: object = None
     for pkt in packets:
         if not pkt:
             continue
-        parts.append(dec.decode(bytes(pkt), frame_size))
+        try:
+            parts.append(dec.decode(bytes(pkt), frame_size))
+            ok += 1
+        except Exception as e:
+            last_err = e
+            continue
     pcm = b"".join(parts)
-    if ch >= 2:
+    if ch >= 2 and pcm:
         pcm = _downmix_stereo(pcm)
-    return pcm
+    return pcm, ok, last_err
 
 
 def opus_to_pcm(raw: bytes) -> tuple[bytes, dict]:
@@ -289,11 +335,15 @@ def opus_to_pcm(raw: bytes) -> tuple[bytes, dict]:
     info: dict = {"kind": "opus", "bits": 16, "fmt": "opus"}
     if not raw:
         return b"", info
+    if not _OPUS_OK:
+        info["err"] = f"opuslib unavailable: {_OPUS_ERR}"
+        info["hex"] = raw[:16].hex()
+        return b"", info
 
     rate = 48000
     ch = 1
     frame_ms = 20
-    packets: list[bytes] = []
+    packet_sets: list[tuple[str, list[bytes]]] = []
 
     if raw.startswith(b"PQOP"):
         hdr = _parse_pqop_frames(raw)
@@ -303,43 +353,53 @@ def opus_to_pcm(raw: bytes) -> tuple[bytes, dict]:
         rate = int(hdr["rate"]) or 48000
         ch = int(hdr["ch"]) or 1
         frame_ms = int(hdr["frame_ms"]) or 20
-        packets = list(hdr["frames"] or [])
+        frames = list(hdr["frames"] or [])
         info.update(
             {
                 "kind": "pqop/opus",
                 "rate": rate,
                 "ch": ch,
                 "frame_ms": frame_ms,
-                "frames": len(packets),
+                "frames": len(frames),
                 "hex": raw[:16].hex(),
             }
         )
-        # Fallback: treat bytes after 12-byte header as one Opus packet.
-        if not packets and len(raw) > 12:
-            packets = [raw[12:]]
-            info["note"] = "pqop-blob"
+        if frames:
+            packet_sets.append(("lenpref", frames))
+        # Fallbacks if length-prefix framing is wrong for this build.
+        if len(raw) > 12:
+            packet_sets.append(("blob12", [raw[12:]]))
+        if len(raw) > 14:
+            packet_sets.append(("blob14", [raw[14:]]))
     else:
         info["hex"] = raw[:16].hex()
         info["rate"] = rate
         info["ch"] = ch
-        packets = [raw]
+        packet_sets.append(("raw", [raw]))
 
     last_err: object = None
     pcm = b""
-    # Prefer decode straight to bodycam rate (libopus resamples).
-    for out_rate in (SAMPLE_RATE, rate):
-        try:
-            pcm = _decode_opus_packets(
-                packets, out_rate=out_rate, channels=ch, frame_ms=frame_ms
-            )
-            if out_rate != SAMPLE_RATE:
-                pcm = _resample_to_16k(pcm, out_rate)
-                info["note"] = (info.get("note") or "") + f"+rs{out_rate}"
-            last_err = None
+    for label, packets in packet_sets:
+        for out_rate in (SAMPLE_RATE, rate):
+            try:
+                pcm, ok, err = _decode_opus_packets(
+                    packets, out_rate=out_rate, channels=ch, frame_ms=frame_ms
+                )
+                last_err = err
+                if not pcm or ok <= 0:
+                    pcm = b""
+                    continue
+                if out_rate != SAMPLE_RATE:
+                    pcm = _resample_to_16k(pcm, out_rate)
+                info["note"] = f"{label}@{out_rate}x{ok}"
+                info["frames_ok"] = ok
+                last_err = None
+                break
+            except Exception as e:
+                last_err = e
+                pcm = b""
+        if pcm:
             break
-        except Exception as e:
-            last_err = e
-            pcm = b""
 
     if not pcm:
         info["err"] = f"opus decode failed: {last_err}"
@@ -737,6 +797,7 @@ class TalkieBridge:
                     f"clip={meta.get('clip')} kind={meta.get('kind')} "
                     f"rate={meta.get('rate')} frames={meta.get('frames')} "
                     f"hex={meta.get('hex', '')} mime={mime!r}"
+                    + (f" note={meta.get('note')}" if meta.get("note") else "")
                     + (f" err={meta.get('err')}" if meta.get("err") else ""),
                     flush=True,
                 )
