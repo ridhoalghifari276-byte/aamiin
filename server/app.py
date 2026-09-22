@@ -1577,23 +1577,10 @@ async def ws_device(websocket: WebSocket):
                 print(f"[ws-device] ingest {device}: {e}", flush=True)
 
     async def speaker_down():
-        # Radio audio to the bodycam speaker only. Never cancel the JPEG ingest.
-        await asyncio.sleep(2.0)
-        while pqtalkie.pop_radio_pcm(device):
-            pass
+        # Radio downlink used to share /ws/device with JPEG; the cam rarely
+        # processed inbound BIN while TX was busy. Speaker audio is idle here.
         while True:
-            try:
-                pcm = pqtalkie.pop_radio_pcm(device)
-                if pcm:
-                    if len(pcm) > 4096:
-                        pcm = pcm[-4096:]
-                    await websocket.send_bytes(b"\x03" + pcm)
-                else:
-                    await asyncio.sleep(0.04)
-            except WebSocketDisconnect:
-                return
-            except Exception:
-                await asyncio.sleep(0.25)
+            await asyncio.sleep(1.0)
 
     ingest_task = asyncio.create_task(ingest())
     speaker_task = asyncio.create_task(speaker_down())
@@ -1614,10 +1601,10 @@ async def ws_device(websocket: WebSocket):
 
 @app.websocket("/ws/audio")
 async def ws_audio(websocket: WebSocket):
-    """Dedicated ESP32 PCM socket. Raw s16le payloads, no type byte.
+    """ESP32 mic uplink + HT radio downlink on one socket (no JPEG HOL).
 
-    Separate from /ws/device so a 20 KB JPEG can never delay a 20 ms voice
-    packet behind it (head-of-line blocking was the audible lag).
+    Uplink: raw s16le PCM (unchanged mic path).
+    Downlink: 0x03 + s16le → bodycam speaker.
     """
     await websocket.accept()
     device = websocket.query_params.get("device") or ""
@@ -1626,20 +1613,60 @@ async def ws_audio(websocket: WebSocket):
         await websocket.close(code=4401)
         return
     print(f"[ws-audio] connected {device}", flush=True)
-    try:
+    sent = 0
+
+    async def recv_mic():
         while True:
             msg = await websocket.receive()
             if msg.get("type") == "websocket.disconnect":
-                break
+                return
             data = msg.get("bytes")
             if not data:
                 continue
             append_pcm(device, bytes(data), None, None)
+
+    async def speaker_down():
+        nonlocal sent
+        while True:
+            try:
+                pcm = pqtalkie.pop_radio_pcm(device)
+                if pcm:
+                    if len(pcm) > 4096:
+                        pcm = pcm[-4096:]
+                    await websocket.send_bytes(b"\x03" + pcm)
+                    sent += 1
+                    if sent <= 3 or sent % 50 == 0:
+                        print(
+                            f"[ptt] {device} speaker out #{sent} bytes={len(pcm)}",
+                            flush=True,
+                        )
+                else:
+                    await asyncio.sleep(0.02)
+            except WebSocketDisconnect:
+                return
+            except Exception as e:
+                print(f"[ws-audio] speaker {device}: {e}", flush=True)
+                await asyncio.sleep(0.25)
+
+    recv_task = asyncio.create_task(recv_mic())
+    spk_task = asyncio.create_task(speaker_down())
+    try:
+        done, pending = await asyncio.wait(
+            {recv_task, spk_task}, return_when=asyncio.FIRST_COMPLETED
+        )
+        for t in pending:
+            t.cancel()
+        for t in done:
+            exc = t.exception() if not t.cancelled() else None
+            if exc:
+                raise exc
     except WebSocketDisconnect:
         pass
     except Exception as e:
         print(f"[ws-audio] {device} error: {e}", flush=True)
     finally:
+        recv_task.cancel()
+        spk_task.cancel()
         print(f"[ws-audio] disconnected {device}", flush=True)
 
 

@@ -305,8 +305,6 @@ static void wsEvent(WStype_t type, uint8_t *payload, size_t length) {
 }
 
 static void audioWsEvent(WStype_t type, uint8_t *payload, size_t length) {
-  (void)payload;
-  (void)length;
   switch (type) {
     case WStype_CONNECTED:
       audioWsConnected = true;
@@ -321,6 +319,12 @@ static void audioWsEvent(WStype_t type, uint8_t *payload, size_t length) {
       break;
     case WStype_ERROR:
       audioWsConnected = false;
+      break;
+    case WStype_BIN:
+      // HT radio downlink on the audio socket (JPEG no longer blocks it).
+      if (payload && length > 1 && payload[0] == 0x03) {
+        speakerPush(payload + 1, length - 1);
+      }
       break;
     default:
       break;

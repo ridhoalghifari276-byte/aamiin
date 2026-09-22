@@ -13,11 +13,13 @@
 // when HT downlink starts pushing PCM. Use a FreeRTOS mutex instead.
 
 static const size_t SPK_RING = 8000;  // 0.5 s s16le mono
+static const int SPK_GAIN = 8;       // radio chunks are often quiet vs mic
 static int16_t *spkRing = nullptr;
 static volatile size_t spkW = 0;
 static volatile size_t spkR = 0;
 static volatile bool muted = false;
 static SemaphoreHandle_t spkMu = nullptr;
+static uint32_t spkPushCount = 0;
 
 static size_t spkCountUnsafe() {
   return (spkW + SPK_RING - spkR) % SPK_RING;
@@ -33,12 +35,21 @@ void speakerPush(const uint8_t *pcm, size_t bytes) {
   size_t n = bytes / 2;
   if (xSemaphoreTake(spkMu, pdMS_TO_TICKS(20)) != pdTRUE) return;
   for (size_t i = 0; i < n; i++) {
+    int32_t v = (int32_t)src[i] * SPK_GAIN;
+    if (v > 32767) v = 32767;
+    if (v < -32768) v = -32768;
     size_t next = (spkW + 1) % SPK_RING;
     if (next == spkR) spkR = (spkR + 1) % SPK_RING;
-    spkRing[spkW] = src[i];
+    spkRing[spkW] = (int16_t)v;
     spkW = next;
   }
+  spkPushCount++;
+  uint32_t npush = spkPushCount;
   xSemaphoreGive(spkMu);
+  if (npush <= 3 || (npush % 50) == 0) {
+    Serial.printf("[SPK] push #%lu bytes=%u muted=%d\n",
+                  (unsigned long)npush, (unsigned)bytes, (int)muted);
+  }
 }
 
 static void speakerTask(void *) {
@@ -108,5 +119,6 @@ void speakerBegin() {
   i2s_set_pin(I2S_NUM_1, &p);
   i2s_zero_dma_buffer(I2S_NUM_1);
   xTaskCreatePinnedToCore(speakerTask, "spk", 4096, nullptr, 3, nullptr, 0);
-  Serial.printf("[SPK] I2S1 DIN=%d BCLK=%d LRC=%d\n", SPK_I2S_DOUT, SPK_I2S_BCLK, SPK_I2S_LRC);
+  Serial.printf("[SPK] I2S1 DIN=%d BCLK=%d LRC=%d gain=%dx\n",
+                SPK_I2S_DOUT, SPK_I2S_BCLK, SPK_I2S_LRC, SPK_GAIN);
 }

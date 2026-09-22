@@ -597,7 +597,7 @@ def push_radio_pcm(device: str, pcm: bytes):
     with _rx_lock:
         q = _rx.get(device)
         if q is None:
-            q = deque(maxlen=12)
+            q = deque(maxlen=48)
             _rx[device] = q
         q.append(pcm)
 
