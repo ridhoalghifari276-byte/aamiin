@@ -101,7 +101,9 @@ async def _arm_watchdog():
     threading.Thread(target=_event_loop_watchdog, name="watchdog", daemon=True).start()
 
 
-ingest_q: queue.Queue = queue.Queue(maxsize=24)
+ingest_q: queue.Queue = queue.Queue(maxsize=48)
+audio_q: queue.Queue = queue.Queue(maxsize=96)
+INGEST_WORKERS = 3
 lock = threading.RLock()
 face_engine: FaceEngine | None = None
 device_state: dict[str, dict] = {}
@@ -109,7 +111,7 @@ ONLINE_TTL = 8.0
 TARGET_FPS = 20
 LIVE_FPS = 20
 LIVE_MAX_SIDE = 480  # 360p, keep native 4:3 / 3:4 — never crop
-FACE_INTERVAL_SEC = 0.50
+FACE_INTERVAL_SEC = 0.75
 MAX_RECORDINGS_PER_DEVICE = 80
 last_face_submit: dict[str, float] = defaultdict(float)
 WS_IDLE_SEC = 45.0
@@ -125,6 +127,43 @@ def ingest_loop():
             process_frame_work(device, data, rec_path, do_face)
         except Exception as e:
             print(f"[frame] ingest error: {e}", flush=True)
+
+
+def audio_loop():
+    """PCM voice-chain off the asyncio loop — multi-cam must not stall WS accept."""
+    while True:
+        device, data, sid, mode = audio_q.get()
+        try:
+            append_pcm(device, data, sid, mode)
+        except Exception as e:
+            print(f"[audio] ingest error: {e}", flush=True)
+
+
+def enqueue_pcm(
+    device: str,
+    data: bytes,
+    session_id: str | None = None,
+    session_mode: str | None = None,
+):
+    item = (device, data, session_id, session_mode)
+    try:
+        audio_q.put_nowait(item)
+    except queue.Full:
+        try:
+            audio_q.get_nowait()
+        except queue.Empty:
+            pass
+        try:
+            audio_q.put_nowait(item)
+        except queue.Full:
+            pass
+
+
+def _safe_standby(device: str):
+    try:
+        pqtalkie.ensure_standby(device)
+    except Exception as e:
+        print(f"[ptt] standby {device}: {e}", flush=True)
 
 
 async def _ws_until_close(websocket: WebSocket):
@@ -708,14 +747,21 @@ class VoiceChain:
         return np.clip(out, -self.CEILING, self.CEILING).astype("<i2").tobytes()
 
     def _hpf(self, x: np.ndarray) -> np.ndarray:
+        # First-order DC blocker. Keep state across packets.
+        x = np.asarray(x, dtype=np.float32)
         y = np.empty_like(x)
-        px, py = self.hp_x, self.hp_y
-        r = self.HP_R
-        for i, v in enumerate(x):
-            ny = float(v) - px + r * py
+        px = float(self.hp_x)
+        py = float(self.hp_y)
+        r = float(self.HP_R)
+        # Local bindings — still O(n) but much cheaper than attribute hits per sample.
+        for i in range(x.size):
+            v = float(x[i])
+            ny = v - px + r * py
             y[i] = ny
-            px, py = float(v), ny
-        self.hp_x, self.hp_y = px, py
+            px = v
+            py = ny
+        self.hp_x = px
+        self.hp_y = py
         return y
 
     def _gate(self, y: np.ndarray) -> np.ndarray:
@@ -900,18 +946,25 @@ def store_live_frame(device: str, data: bytes) -> float:
 def claim_frame_work(device: str, now: float, session_id: str | None, session_mode: str | None):
     """Decide whether this frame needs CPU (recording to disk / face detect)."""
     rec_path = None
+    need_mkdir = None
     with lock:
         sess = ensure_record_session(device, session_id, session_mode or "video")
         if sess and sess.mode == "video" and sess.frame_count < sess.max_frames:
             if not sess.frames_dir:
                 frames_dir = BASE / device / "recordings" / f"{sess.session_id.replace('/', '_')}_frames"
-                frames_dir.mkdir(parents=True, exist_ok=True)
                 sess.frames_dir = frames_dir
+                need_mkdir = frames_dir
             rec_path = sess.frames_dir / f"{sess.frame_count:06d}.jpg"
             sess.frame_count += 1
         do_face = face_engine is not None and (now - last_face_submit[device]) >= FACE_INTERVAL_SEC
         if do_face:
             last_face_submit[device] = now
+    if need_mkdir is not None:
+        try:
+            need_mkdir.mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            print(f"[frame] mkdir {need_mkdir}: {e}", flush=True)
+            rec_path = None
     return rec_path, do_face
 
 
@@ -956,8 +1009,10 @@ def load_index():
     except Exception as e:
         print(f"[recordings] recover: {e}", flush=True)
     face_engine = FaceEngine(BASE)
-    threading.Thread(target=ingest_loop, name="frame-ingest", daemon=True).start()
-    print("[face] engine ready", flush=True)
+    for i in range(INGEST_WORKERS):
+        threading.Thread(target=ingest_loop, name=f"frame-ingest-{i}", daemon=True).start()
+    threading.Thread(target=audio_loop, name="audio-ingest", daemon=True).start()
+    print(f"[face] engine ready · frame workers={INGEST_WORKERS} · audio worker=1", flush=True)
     if API_TOKEN or DEVICE_API_TOKENS:
         print("[api] external live API enabled at /api/v1/ext", flush=True)
     else:
@@ -1205,7 +1260,7 @@ async def audio(
 ):
     auth(x_device_id, x_token)
     data = await req.body()
-    append_pcm(x_device_id, data, x_session_id, x_session_mode)
+    enqueue_pcm(x_device_id, data, x_session_id, x_session_mode)
     return {"ok": True, "bytes": len(data)}
 
 
@@ -1533,10 +1588,11 @@ async def ws_device(websocket: WebSocket):
         return
     touch_device(device)
     print(f"[ws-device] connected {device}", flush=True)
-    try:
-        pqtalkie.ensure_standby(device)
-    except Exception as e:
-        print(f"[ptt] ws standby {device}: {e}", flush=True)
+    threading.Thread(
+        target=lambda d=device: _safe_standby(d),
+        name=f"ptt-standby-{device}",
+        daemon=True,
+    ).start()
 
     async def ingest():
         while True:
@@ -1555,7 +1611,7 @@ async def ws_device(websocket: WebSocket):
             payload = bytes(data[1:])
             try:
                 if kind == 0x02:
-                    append_pcm(device, payload, None, None)
+                    enqueue_pcm(device, payload, None, None)
                 elif kind == 0x01:
                     now = store_live_frame(device, payload)
                     rec_path, do_face = claim_frame_work(device, now, None, "video")
@@ -1623,7 +1679,7 @@ async def ws_audio(websocket: WebSocket):
             data = msg.get("bytes")
             if not data:
                 continue
-            append_pcm(device, bytes(data), None, None)
+            enqueue_pcm(device, bytes(data), None, None)
 
     async def speaker_down():
         nonlocal sent
@@ -1644,6 +1700,8 @@ async def ws_audio(websocket: WebSocket):
                                 f"qleft={len(pcm) - off}",
                                 flush=True,
                             )
+                        # Yield so other device sockets can accept/read.
+                        await asyncio.sleep(0)
                 else:
                     await asyncio.sleep(0.02)
             except WebSocketDisconnect:
@@ -1710,7 +1768,7 @@ async def ws_live_audio(websocket: WebSocket, device: str = "bodycam-01", raw: i
                     if seq > last_seq:
                         await websocket.send_bytes(chunk)
                         last_seq = seq
-            await asyncio.sleep(0.004)
+            await asyncio.sleep(0.012)
 
     try:
         await _ws_send_until_close(websocket, sender)
@@ -1752,7 +1810,7 @@ async def ws_live(websocket: WebSocket, device: str = "bodycam-01"):
                         await websocket.send_text(blob)
 
             elapsed = time.monotonic() - t0
-            await asyncio.sleep(max(0.0, 0.005 - elapsed))
+            await asyncio.sleep(max(0.001, (1.0 / LIVE_FPS) - elapsed))
 
     try:
         await _ws_send_until_close(websocket, sender)
@@ -1901,7 +1959,7 @@ async def pcm_stream(device: str = "bodycam-01", raw: int = 0):
             if not sent:
                 await asyncio.sleep(0.015)
             else:
-                await asyncio.sleep(0)
+                await asyncio.sleep(0.001)
 
     return StreamingResponse(
         gen(),
@@ -2088,7 +2146,7 @@ async def ws_ext_live(websocket: WebSocket, device: str = "bodycam-01"):
                         last_overlay = blob
                         await websocket.send_text(blob)
             elapsed = time.monotonic() - t0
-            await asyncio.sleep(max(0.0, 0.005 - elapsed))
+            await asyncio.sleep(max(0.001, (1.0 / LIVE_FPS) - elapsed))
 
     try:
         await _ws_send_until_close(websocket, sender)
@@ -2129,7 +2187,7 @@ async def ws_ext_audio(websocket: WebSocket, device: str = "bodycam-01", raw: in
                     if seq > last_seq:
                         await websocket.send_bytes(chunk)
                         last_seq = seq
-            await asyncio.sleep(0.004)
+            await asyncio.sleep(0.012)
 
     try:
         await _ws_send_until_close(websocket, sender)

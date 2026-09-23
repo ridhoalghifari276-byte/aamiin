@@ -978,9 +978,12 @@ def bridge_for(device: str) -> TalkieBridge:
             b = TalkieBridge(device)
             _bridges[device] = b
             tok = _env.get(device) or DEFAULT_TOKEN
-            if tok:
-                b.set_token(tok)
-        return b
+        else:
+            tok = None
+    # set_token outside _mux — may start IO threads; must not block other devices.
+    if tok:
+        b.set_token(tok)
+    return b
 
 
 def warm_default():
