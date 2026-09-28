@@ -66,6 +66,8 @@ class FaceEngine:
     def __init__(self, data_dir: Path):
         self.data_dir = data_dir
         self.enabled = defaultdict(lambda: True)
+        self._watch: dict[str, float] = {}
+        self.watch_sec = 8.0
         self.live_bboxes: dict[str, list] = defaultdict(list)
         self.live_scores: dict[str, list] = defaultdict(list)
         self.live_names: dict[str, list] = defaultdict(list)
@@ -268,8 +270,31 @@ class FaceEngine:
             self.live_scores[device] = []
             self.live_names[device] = []
 
+    def note_watch(self, device: str, on: bool):
+        """Fullscreen viewer heartbeat. Detection runs only while this is fresh."""
+        device = (device or "").strip()
+        if not device:
+            return
+        with self._lock:
+            if on:
+                self._watch[device] = time.time()
+                self.enabled[device] = True
+            else:
+                self._watch.pop(device, None)
+                self.enabled[device] = False
+                self.live_bboxes[device] = []
+                self.live_scores[device] = []
+                self.live_names[device] = []
+
+    def watching(self, device: str) -> bool:
+        with self._lock:
+            ts = self._watch.get(device) or 0.0
+            if (time.time() - ts) > self.watch_sec:
+                return False
+            return bool(self.enabled.get(device, False))
+
     def submit(self, device: str, jpeg: bytes):
-        if not self.enabled.get(device, True):
+        if not self.watching(device):
             return
         try:
             self._q.put_nowait((device, jpeg, time.time()))
@@ -313,7 +338,7 @@ class FaceEngine:
     def live_overlay(self, device: str) -> dict:
         with self._lock:
             return {
-                "enabled": self.enabled.get(device, True),
+                "enabled": self.watching(device),
                 "bboxes": list(self.live_bboxes.get(device, [])),
                 "scores": list(self.live_scores.get(device, [])),
                 "names": list(self.live_names.get(device, [])),
@@ -345,7 +370,7 @@ class FaceEngine:
     def status(self, device: str) -> dict:
         with self._lock:
             return {
-                "enabled": self.enabled.get(device, True),
+                "enabled": self.watching(device),
                 "bboxes": list(self.live_bboxes.get(device, [])),
                 "scores": list(self.live_scores.get(device, [])),
                 "names": list(self.live_names.get(device, [])),

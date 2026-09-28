@@ -948,8 +948,8 @@ def store_live_frame(device: str, data: bytes) -> float:
 
 
 def _face_due(device: str, now: float) -> bool:
-    """Stretch face checks as more units come online so dozens do not pin the CPU."""
-    if face_engine is None:
+    """Only the camera a dashboard has open fullscreen."""
+    if face_engine is None or not face_engine.watching(device):
         return False
     n = max(1, len(online_ids()))
     interval = max(FACE_INTERVAL_SEC, 0.15 * n)
@@ -1937,6 +1937,18 @@ def faces_enable(device: str = "bodycam-01", enabled: int = 1):
         raise HTTPException(503, "face engine not ready")
     face_engine.set_enabled(device, bool(enabled))
     return {"ok": True, "device": device, "enabled": bool(enabled)}
+
+
+@app.post("/api/v1/faces/watch")
+def faces_watch(device: str = "", on: int = 1):
+    """Heartbeat from the dashboard that has this camera fullscreen."""
+    if not face_engine:
+        raise HTTPException(503, "face engine not ready")
+    device = (device or "").strip()
+    if not device:
+        raise HTTPException(400, "device required")
+    face_engine.note_watch(device, bool(on))
+    return {"ok": True, "device": device, "watching": face_engine.watching(device)}
 
 
 @app.patch("/api/v1/faces/{face_id}")

@@ -1643,10 +1643,6 @@
               return;
             }
             if (msg && msg.t === "faces") {
-              if (typeof msg.enabled === "boolean") {
-                faceOn = msg.enabled;
-                updateFeedControls();
-              }
               drawFaceOverlay(msg);
             }
           } catch (_) {}
@@ -1682,7 +1678,7 @@
       const f = feeds.get(currentDevice);
       if (!f || !f.faceLayer) return;
       f.faceLayer.innerHTML = "";
-      if (!faceOn || !st) return;
+      if (!faceOn || !st || st.enabled === false) return;
       const boxes = st.bboxes || [];
       const names = st.names || [];
       const fw = (st.frame && st.frame[0]) || (f.liveCanvas && f.liveCanvas.width) || f.img.naturalWidth || 0;
@@ -1914,15 +1910,27 @@
       else stopSpeaker();
     }
 
+    let faceWatchDevice = "";
+
+    function watchFace(device, on) {
+      const id = (device || "").trim();
+      const want = !!on && !!id && !document.hidden && faceOn;
+      const prev = faceWatchDevice;
+      if (prev && prev !== id) {
+        fetch("/api/v1/faces/watch?device=" + encodeURIComponent(prev) + "&on=0", { method: "POST" }).catch(() => {});
+      }
+      faceWatchDevice = want ? id : "";
+      if (!id) return;
+      fetch(
+        "/api/v1/faces/watch?device=" + encodeURIComponent(id) + "&on=" + (want ? "1" : "0"),
+        { method: "POST" }
+      ).catch(() => {});
+    }
+
     async function setFaceEnabled(on) {
       faceOn = on;
       updateFeedControls();
-      try {
-        await fetch(
-          "/api/v1/faces/enable?device=" + encodeURIComponent(currentDevice) + "&enabled=" + (on ? 1 : 0),
-          { method: "POST" }
-        );
-      } catch (_) {}
+      watchFace(currentDevice, on);
     }
 
     async function startUiRecord(mode) {
@@ -2619,6 +2627,7 @@
       renderStrip();
       renderDeviceList();
       updateOpsMap(true);
+      watchFace(id, faceOn);
 
       setFaceEnabled(faceOn);
       refreshFaces();
@@ -2702,10 +2711,6 @@
         faceLive.textContent = st.enabled
           ? (n ? ("TRACK " + n + " FACE @ " + unit) : ("SCAN ACTIVE @ " + unit))
           : ("SCAN OFF @ " + unit);
-        if (typeof st.enabled === "boolean" && unit === currentDevice) {
-          faceOn = st.enabled;
-          updateFeedControls();
-        }
         if (unit === currentDevice) drawFaceOverlay(st);
         const items = (data.items || []).filter((i) => !(i.label || "").trim());
         const ids = items.map((i) => i.id).join(",");
@@ -3061,10 +3066,12 @@
     });
     document.addEventListener("visibilitychange", () => {
       if (document.hidden) {
+        watchFace(currentDevice, false);
         stopLiveCall();
         stopAudioSocket();
         return;
       }
+      watchFace(currentDevice, faceOn);
       startLiveCall(currentDevice);
       if (speakerOn) startAudioSocket(currentDevice);
       refreshDevices();
@@ -3073,6 +3080,11 @@
       if (document.hidden) return;
       refreshDevices();
     }, 2500);
+    setInterval(() => {
+      if (!document.hidden && faceOn && currentDevice && currentView() === "live") {
+        watchFace(currentDevice, true);
+      }
+    }, 3000);
     setInterval(() => {
       if (document.hidden || currentView() !== "videos") return;
       refreshRecordings();
