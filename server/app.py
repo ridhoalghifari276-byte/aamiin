@@ -109,8 +109,10 @@ face_engine: FaceEngine | None = None
 device_state: dict[str, dict] = {}
 ONLINE_TTL = 8.0
 TARGET_FPS = 20
-LIVE_FPS = 20
-LIVE_MAX_SIDE = 480  # 360p, keep native 4:3 / 3:4 — never crop
+LIVE_FPS = 12
+LIVE_MAX_SIDE = 640
+# Frames above this are record-HD. Viewers get a downscaled copy, not the original.
+LIVE_PREVIEW_MAX = 48 * 1024
 FACE_INTERVAL_SEC = 0.75
 MAX_RECORDINGS_PER_DEVICE = 80
 last_face_submit: dict[str, float] = defaultdict(float)
@@ -122,9 +124,11 @@ _mjpeg_gate = threading.Lock()
 
 def ingest_loop():
     while True:
-        device, data, rec_path, do_face = ingest_q.get()
+        item = ingest_q.get()
+        device, data, rec_path, do_face = item[:4]
+        preview = bool(item[4]) if len(item) > 4 else False
         try:
-            process_frame_work(device, data, rec_path, do_face)
+            process_frame_work(device, data, rec_path, do_face, preview)
         except Exception as e:
             print(f"[frame] ingest error: {e}", flush=True)
 
@@ -943,6 +947,48 @@ def store_live_frame(device: str, data: bytes) -> float:
     return now
 
 
+def _face_due(device: str, now: float) -> bool:
+    """Stretch face checks as more units come online so dozens do not pin the CPU."""
+    if face_engine is None:
+        return False
+    n = max(1, len(online_ids()))
+    interval = max(FACE_INTERVAL_SEC, 0.15 * n)
+    if (now - last_face_submit[device]) < interval:
+        return False
+    last_face_submit[device] = now
+    return True
+
+
+def enqueue_frame(item: tuple):
+    try:
+        ingest_q.put_nowait(item)
+    except queue.Full:
+        try:
+            ingest_q.get_nowait()
+        except queue.Empty:
+            pass
+        try:
+            ingest_q.put_nowait(item)
+        except queue.Full:
+            pass
+
+
+def accept_jpeg(device: str, data: bytes, session_id: str | None, session_mode: str | None):
+    """LD frames go straight to viewers. HD record frames are preview-scaled off-loop."""
+    now = time.time()
+    heavy = len(data) > LIVE_PREVIEW_MAX
+    if not heavy:
+        store_live_frame(device, data)
+    else:
+        with lock:
+            touch_device(device)
+            video_bytes[device] += len(data)
+            video_frames[device] += 1
+    rec_path, do_face = claim_frame_work(device, now, session_id, session_mode)
+    if heavy or rec_path is not None or do_face:
+        enqueue_frame((device, data, rec_path, do_face, heavy))
+
+
 def claim_frame_work(device: str, now: float, session_id: str | None, session_mode: str | None):
     """Decide whether this frame needs CPU (recording to disk / face detect)."""
     rec_path = None
@@ -956,9 +1002,7 @@ def claim_frame_work(device: str, now: float, session_id: str | None, session_mo
                 need_mkdir = frames_dir
             rec_path = sess.frames_dir / f"{sess.frame_count:06d}.jpg"
             sess.frame_count += 1
-        do_face = face_engine is not None and (now - last_face_submit[device]) >= FACE_INTERVAL_SEC
-        if do_face:
-            last_face_submit[device] = now
+        do_face = _face_due(device, now)
     if need_mkdir is not None:
         try:
             need_mkdir.mkdir(parents=True, exist_ok=True)
@@ -968,18 +1012,22 @@ def claim_frame_work(device: str, now: float, session_id: str | None, session_mo
     return rec_path, do_face
 
 
-def process_frame_work(device: str, data: bytes, rec_path, do_face: bool):
-    """Cold path: only runs while recording or when a face check is due."""
-    if rec_path is None and not do_face:
+def process_frame_work(device: str, data: bytes, rec_path, do_face: bool, preview: bool = False):
+    """Cold path: recording, face check, or HD→LD preview. Never on the event loop."""
+    if rec_path is None and not do_face and not preview:
         return
     arr = np.frombuffer(data, dtype=np.uint8)
     img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
     if img is None:
         return
+    if preview:
+        small = _encode_jpg(_scale_fit(img, LIVE_MAX_SIDE), 62)
+        if small:
+            store_live_frame(device, small)
     if CAMERA_ROTATE:
         img = _rotate_bgr(img, CAMERA_ROTATE)
     if rec_path is not None:
-        rec_bytes = _encode_jpg(img, 75)
+        rec_bytes = _encode_jpg(img, 88)
         if rec_bytes:
             rec_path.write_bytes(rec_bytes)
     if do_face and face_engine is not None:
@@ -989,9 +1037,7 @@ def process_frame_work(device: str, data: bytes, rec_path, do_face: bool):
 
 
 def append_frame(device: str, data: bytes, session_id: str | None, session_mode: str | None = None):
-    now = store_live_frame(device, data)
-    rec_path, do_face = claim_frame_work(device, now, session_id, session_mode)
-    process_frame_work(device, data, rec_path, do_face)
+    accept_jpeg(device, data, session_id, session_mode)
 
 
 @app.on_event("startup")
@@ -1232,21 +1278,7 @@ async def frame(
     # Compatibility fallback. New firmware uses /ws/device instead.
     auth(x_device_id, x_token)
     data = await req.body()
-    now = store_live_frame(x_device_id, data)
-    rec_path, do_face = claim_frame_work(x_device_id, now, x_session_id, x_session_mode)
-    if rec_path is not None or do_face:
-        item = (x_device_id, data, rec_path, do_face)
-        try:
-            ingest_q.put_nowait(item)
-        except queue.Full:
-            try:
-                ingest_q.get_nowait()
-            except queue.Empty:
-                pass
-            try:
-                ingest_q.put_nowait(item)
-            except queue.Full:
-                pass
+    accept_jpeg(x_device_id, data, x_session_id, x_session_mode)
     return {"ok": True, "bytes": len(data), "transport": "http-fallback"}
 
 
@@ -1613,21 +1645,7 @@ async def ws_device(websocket: WebSocket):
                 if kind == 0x02:
                     enqueue_pcm(device, payload, None, None)
                 elif kind == 0x01:
-                    now = store_live_frame(device, payload)
-                    rec_path, do_face = claim_frame_work(device, now, None, "video")
-                    if rec_path is not None or do_face:
-                        item = (device, payload, rec_path, do_face)
-                        try:
-                            ingest_q.put_nowait(item)
-                        except queue.Full:
-                            try:
-                                ingest_q.get_nowait()
-                            except queue.Empty:
-                                pass
-                            try:
-                                ingest_q.put_nowait(item)
-                            except queue.Full:
-                                pass
+                    accept_jpeg(device, payload, None, "video")
                 touch_device(device)
             except Exception as e:
                 print(f"[ws-device] ingest {device}: {e}", flush=True)

@@ -7,7 +7,7 @@
 // Device ID + Wi-Fi are entered there and stored in NVS.
 // These two strings are compile-time fallbacks only; leave them
 // empty so the portal always runs until the unit is provisioned.
-// Hold record-audio (GPIO 1) for 7 seconds during operation to
+// Hold the VIDEO record button (GPIO 3) for 8 seconds during operation to
 // clear Wi-Fi and re-open the portal. Hold GPIO 21 at boot also
 // forces the portal.
 // ============================================================
@@ -50,13 +50,24 @@
 #define CAM_HMIRROR     0
 
 // ============================================================
-// VIDEO — outdoor bodycam. Small JPEGs so FPS stays steady while running
-// over public Wi-Fi. q=12 overflowed the camera (FB-OVF / NO SIGNAL).
+// VIDEO — outdoor bodycam.
+// Live (no record): VGA, moderate JPEG, steady FPS. Small frames stay
+// smooth while walking/running and keep the server light.
+// Record: 720p. Sharper file, slower FPS so the sensor does not overflow.
+// ESP JPEG q: lower number = sharper, larger file. q=12 overflowed (FB-OVF).
 // ============================================================
-#define STREAM_WIDTH    640
-#define STREAM_HEIGHT   480
-#define JPEG_QUALITY    28
-#define STREAM_FPS      15
+#define LIVE_WIDTH      640
+#define LIVE_HEIGHT     480
+#define LIVE_JPEG_Q     22
+#define LIVE_FPS        12
+#define REC_WIDTH       1280
+#define REC_HEIGHT      720
+#define REC_JPEG_Q      18
+#define REC_FPS         8
+#define STREAM_WIDTH    LIVE_WIDTH
+#define STREAM_HEIGHT   LIVE_HEIGHT
+#define JPEG_QUALITY    LIVE_JPEG_Q
+#define STREAM_FPS      LIVE_FPS
 
 // ============================================================
 // INMP441
@@ -80,7 +91,7 @@
 // ============================================================
 // BUTTON
 // ============================================================
-#define BTN_AUDIO       1   // short: audio record. hold 7s: reset Wi-Fi / portal
+#define BTN_AUDIO       1   // short: audio record
 #define BTN_VIDEO       3   // toggle video+audio record
 #define BTN_PTT         14  // hold-to-talk → PQTALKIE (was night vision)
 #define BTN_SOS         21  // short: SOS on PQTALKIE. hold at boot: open portal
@@ -90,14 +101,17 @@
 #define NIGHT_IR_PIN    -1
 
 // ============================================================
-// SPEAKER — MAX98357 (I2S_NUM_1)
+// SPEAKER — MAX98357 via ESP_I2S (same path as radio FW 1.0.30)
 //   VIN -> 5V   GND -> GND
 //   DIN -> GPIO 38   BCLK -> GPIO 40   LRC -> GPIO 39
-//   GAIN -> float   SD -> float (stereo; firmware writes L=R)
+//   GAIN -> float
+//   SD  -> 3V3 (hardwired RIGHT; amp listens to right I2S slot)
+// Software: ESP_I2S STEREO @ 16 kHz, write L=R, 2 boot beeps, gain 1x
 // ============================================================
 #define SPK_I2S_DOUT    38
 #define SPK_I2S_BCLK    40
 #define SPK_I2S_LRC     39
+#define SPK_SD_PIN      -1   // SD already tied to 3V3 on the board
 
 // ============================================================
 // GPS — UART1 receive-only (NMEA 9600)
@@ -116,4 +130,4 @@
 #define RGB_LED         48
 #define USE_RGB_LED     1
 #define POWER_HOLD_MS       3000   // boot: hold SOS to force portal
-#define WIFI_RESET_HOLD_MS  7000   // hold record-audio to clear Wi-Fi / portal
+#define WIFI_RESET_HOLD_MS  8000   // hold video button for 8s to clear Wi-Fi / portal

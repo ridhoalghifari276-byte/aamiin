@@ -138,8 +138,8 @@ static void applyCamNight(bool on) {
     s->set_awb_gain(s, 1);
     s->set_wb_mode(s, 0);
     s->set_special_effect(s, 0);
-    s->set_quality(s, JPEG_QUALITY);
-    s->set_framesize(s, FRAMESIZE_VGA);
+    s->set_sharpness(s, 1);
+    s->set_denoise(s, 0);
     s->set_vflip(s, CAM_VFLIP);
     s->set_hmirror(s, CAM_HMIRROR);
     s->set_raw_gma(s, 1);
@@ -253,6 +253,7 @@ static void postDeviceState() {
   String body = String("{\"stream\":") + (streamEnabled ? "true" : "false") +
                 ",\"audio\":" + (audioEnabled ? "true" : "false") +
                 ",\"video\":" + (videoEnabled ? "true" : "false") +
+                ",\"profile\":\"" + (videoEnabled ? "hd" : "ld") + "\"" +
                 ",\"visual\":" + (visualOn() ? "true" : "false") +
                 ",\"nightvision\":false" +
                 ",\"ptt\":" + (pttHeld ? "true" : "false") +
@@ -447,6 +448,27 @@ static void drainCamFb() {
   if (fb) esp_camera_fb_return(fb);
 }
 
+static bool camIsHd = false;
+
+static void ensureCamProfile(bool hd) {
+  if (camIsHd == hd) return;
+  sensor_t *s = esp_camera_sensor_get();
+  if (!s) return;
+  if (hd) {
+    s->set_framesize(s, FRAMESIZE_HD);
+    s->set_quality(s, REC_JPEG_Q);
+  } else {
+    s->set_framesize(s, FRAMESIZE_VGA);
+    s->set_quality(s, LIVE_JPEG_Q);
+  }
+  s->set_sharpness(s, hd ? 2 : 1);
+  camIsHd = hd;
+  drainCamFb();
+  drainCamFb();
+  Serial.printf("[CAM] %s %s q=%d\n", hd ? "HD-record" : "LD-live",
+                hd ? "1280x720" : "640x480", hd ? REC_JPEG_Q : LIVE_JPEG_Q);
+}
+
 static bool sendVideoFrame() {
   // Grab + free the sensor buffer BEFORE sendBIN. Holding the FB across a
   // WebSocket write is what caused cam_hal FB-OVF and NO SIGNAL.
@@ -608,8 +630,10 @@ static bool initCam() {
     s->set_brightness(s, 0);
     s->set_contrast(s, 1);
     s->set_saturation(s, 0);
+    s->set_sharpness(s, 1);
+    s->set_denoise(s, 0);
     s->set_framesize(s, FRAMESIZE_VGA);
-    s->set_quality(s, JPEG_QUALITY);
+    s->set_quality(s, LIVE_JPEG_Q);
     s->set_vflip(s, CAM_VFLIP);
     s->set_hmirror(s, CAM_HMIRROR);
     s->set_gainceiling(s, GAINCEILING_16X);
@@ -624,8 +648,9 @@ static bool initCam() {
     s->set_raw_gma(s, 1);
   }
 
-  Serial.printf("[CAM] VGA %dx%d JPEG q=%d @ %d FPS (outdoor / run-stable)\n",
-                STREAM_WIDTH, STREAM_HEIGHT, JPEG_QUALITY, STREAM_FPS);
+  Serial.printf("[CAM] live VGA %dx%d q=%d @ %d FPS · record HD %dx%d q=%d @ %d FPS\n",
+                LIVE_WIDTH, LIVE_HEIGHT, LIVE_JPEG_Q, LIVE_FPS,
+                REC_WIDTH, REC_HEIGHT, REC_JPEG_Q, REC_FPS);
   return true;
 }
 
@@ -786,7 +811,6 @@ static void houseKeepTask(void *) {
 
 // Video only. No HTTP, no audio — nothing here may block for more than a frame.
 static void streamTxTask(void *) {
-  const uint32_t framePeriod = 1000 / STREAM_FPS;
   uint32_t nextFrame = millis();
 
   for (;;) {
@@ -808,16 +832,17 @@ static void streamTxTask(void *) {
       continue;
     }
 
+    // HD only while a video file is recording. Live viewers stay on VGA.
+    bool hd = videoEnabled;
+    ensureCamProfile(hd);
+    const uint32_t framePeriod = 1000 / (hd ? REC_FPS : LIVE_FPS);
+
     uint32_t now = millis();
     if ((int32_t)(now - nextFrame) >= 0) {
-      uint32_t t0 = now;
       sendVideoFrame();
       now = millis();
-      nextFrame = t0 + framePeriod;
-      if ((int32_t)(now - nextFrame) >= 0) {
-        // WAN slower than the target FPS: send the next (latest) frame now.
-        nextFrame = now;
-      }
+      // If the WAN is late, wait a full period. Catch-up bursts look like stutter.
+      nextFrame = now + framePeriod;
     }
 
     now = millis();
@@ -855,7 +880,7 @@ void setup() {
   speakerBegin();
 
   // Drain the sensor immediately so DMA cannot overflow during WS connect.
-  txPacketCap = 96 * 1024;
+  txPacketCap = 160 * 1024;
   txPacket = (uint8_t *)heap_caps_malloc(txPacketCap, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
   if (!txPacket) {
     txPacketCap = 48 * 1024;
@@ -891,6 +916,9 @@ void loop() {
   static bool audioDown = false;
   static uint32_t audioAt = 0;
   static bool audioResetDone = false;
+  static bool videoDown = false;
+  static uint32_t videoAt = 0;
+  static bool videoResetDone = false;
   static bool pttArmed = false;
   static bool pttRawLast = false;
   static uint32_t pttEdgeAt = 0;
@@ -902,24 +930,18 @@ void loop() {
     seeded = true;
   }
 
-  // GPIO 1: short press = audio record; hold 7s = reset Wi-Fi / captive portal.
+  // GPIO 1: short press = audio record.
   bool audioRaw = digitalRead(BTN_AUDIO) == LOW;
   if (audioRaw) {
     if (!audioDown) {
       audioDown = true;
       audioAt = millis();
       audioResetDone = false;
-    } else if (!audioResetDone && (millis() - audioAt) >= WIFI_RESET_HOLD_MS) {
-      Serial.println("[BTN] hold GPIO1 7s — reset WiFi / captive portal");
-      rgb(255, 80, 0);
-      portalClear();
-      delay(400);
-      ESP.restart();
     }
   } else if (audioDown) {
     uint32_t held = millis() - audioAt;
     audioDown = false;
-    if (!audioResetDone && held >= 40 && held < WIFI_RESET_HOLD_MS) {
+    if (!audioResetDone && held >= 40) {
       audioEnabled = !audioEnabled;
       if (audioEnabled) {
         videoEnabled = false;
@@ -935,20 +957,43 @@ void loop() {
     }
   }
 
-  // GPIO 3: video recording + microphone.
-  if (btnPressed(bVideo)) {
-    videoEnabled = !videoEnabled;
-    if (videoEnabled) {
-      audioEnabled = false;
-      ringClear();
-      sessionCmd = 2;
-    } else {
-      sessionCmd = 3;
+  // GPIO 3: VIDEO record button.
+  // Short press (< 8s) = toggle video recording.
+  // Hold for 8s = clear Wi-Fi credentials and reboot into captive portal.
+  bool videoRaw = digitalRead(BTN_VIDEO) == LOW;
+  uint32_t videoNow = millis();
+  if (videoRaw) {
+    if (!videoDown) {
+      videoDown = true;
+      videoAt = videoNow;
+      videoResetDone = false;
+    } else if (!videoResetDone && (videoNow - videoAt) >= WIFI_RESET_HOLD_MS) {
+      videoResetDone = true;
+      Serial.println("[BTN] hold VIDEO 8s — reset WiFi / captive portal");
+      rgb(255, 80, 0);
+      portalClear();
+      delay(400);
+      ESP.restart();
     }
-    stateDirty = true;
-    stateLed();
-    Serial.printf("[BTN] video=%d visual=%d stream=%d\n",
-                  (int)videoEnabled, visualOn(), (int)streamEnabled);
+  } else if (videoDown) {
+    uint32_t held = videoNow - videoAt;
+    videoDown = false;
+
+    // Long press is consumed by the Wi-Fi reset above.
+    if (!videoResetDone && held >= 40 && held < WIFI_RESET_HOLD_MS) {
+      videoEnabled = !videoEnabled;
+      if (videoEnabled) {
+        audioEnabled = false;
+        ringClear();
+        sessionCmd = 2;
+      } else {
+        sessionCmd = 3;
+      }
+      stateDirty = true;
+      stateLed();
+      Serial.printf("[BTN] video=%d visual=%d stream=%d\n",
+                    (int)videoEnabled, visualOn(), (int)streamEnabled);
+    }
   }
 
   // GPIO 14: hold-to-talk (PQTALKIE). Replaces night vision.
