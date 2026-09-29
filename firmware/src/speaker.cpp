@@ -7,19 +7,14 @@
 #include <math.h>
 #include <string.h>
 
-// Playback only. Mic stays on I2S_NUM_0 and is not touched here.
+// Mic stays on legacy I2S_NUM_0 — ESP_I2S (new driver) cannot share the chip
+// with the legacy driver ("CONFLICT! The new i2s driver can't work along with
+// the legacy i2s driver"). Speaker uses legacy I2S_NUM_1 with the same audio
+// behaviour as PQTALKIE radio FW 1.0.30: STEREO @ 16 kHz, L=R, 2 boot beeps.
 //
-// IMPORTANT: never touch SPIRAM inside portENTER_CRITICAL — that disables the
-// flash/PSRAM cache and causes "Cache error / MMU entry fault" on ESP32-S3
-// when HT downlink starts pushing PCM. Use a FreeRTOS mutex instead.
-//
-// MAX98357 SD/MODE (user wiring: SD not connected = floating):
-//   float = stereo  → write L=R samples
-//   VIN/3V3 = RIGHT only
-//   GND = LEFT only / shutdown (depending on board)
+// Wiring (unchanged): DIN38 BCLK40 LRC39, SD hardwired to 3V3 (RIGHT slot).
 
 static const size_t SPK_RING = 8000;  // 0.5 s s16le mono
-// Gateway already normalizes speech peak (~10k). Extra ×N here → square-wave crit.
 static const int SPK_GAIN = 1;
 static int16_t *spkRing = nullptr;
 static volatile size_t spkW = 0;
@@ -63,7 +58,7 @@ void speakerPush(const uint8_t *pcm, size_t bytes) {
 }
 
 static void speakerTask(void *) {
-  // Stereo interleaved L,R — required when MAX98357 SD is floating.
+  // Interleaved L,R — SD=3V3 uses RIGHT; L=R keeps both slots filled like radio FW.
   int16_t stereo[256];
   for (;;) {
     if (muted || !spkRing || !spkMu) {
@@ -92,9 +87,8 @@ static void speakerTask(void *) {
 }
 
 static void bootBeep() {
-  // Direct I2S tone so amp/wiring can be verified without HT.
   const int rate = MIC_SAMPLE_RATE;
-  const int n = rate / 5;  // 200 ms
+  const int n = rate / 5;
   int16_t *buf = (int16_t *)malloc((size_t)n * 2 * sizeof(int16_t));
   if (!buf) return;
   Serial.println("[SPK] boot beep start");
@@ -136,7 +130,6 @@ void speakerBegin() {
   c.mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX);
   c.sample_rate = MIC_SAMPLE_RATE;
   c.bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT;
-  // SD floating → stereo; duplicate mono into L and R.
   c.channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT;
   c.communication_format = I2S_COMM_FORMAT_STAND_I2S;
   c.intr_alloc_flags = ESP_INTR_FLAG_LEVEL1;
@@ -159,8 +152,9 @@ void speakerBegin() {
   i2s_set_pin(I2S_NUM_1, &p);
   i2s_set_clk(I2S_NUM_1, MIC_SAMPLE_RATE, I2S_BITS_PER_SAMPLE_16BIT, I2S_CHANNEL_STEREO);
   i2s_zero_dma_buffer(I2S_NUM_1);
-  Serial.printf("[SPK] I2S1 DOUT=%d BCLK=%d LRC=%d gain=%dx STEREO\n",
-                SPK_I2S_DOUT, SPK_I2S_BCLK, SPK_I2S_LRC, SPK_GAIN);
+
+  Serial.printf("[SPK] OK STEREO %dHz BCLK%d LRC%d DIN%d (SD=3V3 RIGHT)\n",
+                MIC_SAMPLE_RATE, SPK_I2S_BCLK, SPK_I2S_LRC, SPK_I2S_DOUT);
   bootBeep();
   xTaskCreatePinnedToCore(speakerTask, "spk", 4096, nullptr, 3, nullptr, 0);
 }

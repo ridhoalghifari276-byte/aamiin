@@ -1,0 +1,32 @@
+# Copied from working ESP on COM24 — do NOT flash/overwrite that board.
+# Serial banner: PQTALKIE ESP32-S3 radio FW 1.0.30 (mic ~16:11)
+# Query via serial: "pins" → BCLK17 LRC16 DIN18
+
+fw_name: PQTALKIE ESP32-S3 radio FW
+fw_version: 1.0.30
+chip: ESP32-S3
+mac: 28:84:85:57:a4:e0
+
+speaker_i2s:
+  api: ESP_I2S          # Arduino ESP_I2S (not legacy driver/i2s.h)
+  mode: STEREO
+  sample_rate_hz: 16000
+  bits: 16
+  bclk_gpio: 17
+  lrc_gpio: 16          # WS
+  din_gpio: 18          # DOUT from ESP → amp DIN
+  sd_gpio: 8            # MAX98357 SD driven HIGH to enable
+  pin_swap: false       # "RX berulang tanpa swap pin"
+  boot_beeps: 2
+
+serial_commands:
+  - pins
+  - beep
+  - beep2
+  - tone
+  - recover
+  - ptt
+
+notes: |
+  Bodycam unit uses different physical pins (DIN38 BCLK40 LRC39).
+  Software path copied: ESP_I2S stereo @ 16 kHz + L=R write + 2 boot beeps.

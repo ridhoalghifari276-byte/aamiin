@@ -1,0 +1,31 @@
+# PlatformIO build + downloaded libs
+.pio/
+firmware/.pio/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Secrets and local env
+.env
+.env.*
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Runtime captures (keep JSON indexes)
+server/data/**/*.jpg
+server/data/**/*.jpeg
+server/data/**/*.png
+server/data/**/*.mp4
+server/data/**/*.pcm
+server/data/**/*.wav
+server/data/**/*.m4a
+ai-service/app/models/*
+!ai-service/app/models/.gitkeep
