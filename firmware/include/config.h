@@ -58,7 +58,7 @@
 // ============================================================
 #define LIVE_WIDTH      640
 #define LIVE_HEIGHT     480
-#define LIVE_JPEG_Q     22
+#define LIVE_JPEG_Q     28
 #define LIVE_FPS        12
 #define REC_WIDTH       1280
 #define REC_HEIGHT      720

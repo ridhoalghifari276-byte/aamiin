@@ -43,7 +43,7 @@ static size_t txPacketCap = 0;
 static int16_t *audioRing = nullptr;
 static volatile size_t ringWrite = 0;
 static volatile size_t ringRead = 0;
-static portMUX_TYPE ringMux = portMUX_INITIALIZER_UNLOCKED;
+static SemaphoreHandle_t ringMu = nullptr;
 
 // Public VPS. Do not scan the STA /24 — that floods TCP and aborts /ws/device.
 static String serverHost = SERVER_HOST;
@@ -122,15 +122,15 @@ static void applyCamNight(bool on) {
     s->set_raw_gma(s, 1);
     s->set_dcw(s, 1);
   } else {
-    // Outdoor / running: short exposure so motion does not smear, AGC for
-    // brightness instead of dropping the frame rate (aec2).
+    // Outdoor / running: short exposure so motion does not smear.
+    // aec2 stays off — that mode drops the frame rate to lengthen exposure.
     s->set_gain_ctrl(s, 1);
     s->set_exposure_ctrl(s, 1);
     s->set_aec2(s, 0);
-    s->set_gainceiling(s, GAINCEILING_16X);
+    s->set_gainceiling(s, GAINCEILING_8X);
     s->set_agc_gain(s, 0);
-    s->set_aec_value(s, 180);
-    s->set_ae_level(s, -1);
+    s->set_aec_value(s, 120);
+    s->set_ae_level(s, -2);
     s->set_brightness(s, 0);
     s->set_contrast(s, 1);
     s->set_saturation(s, 0);
@@ -164,22 +164,32 @@ static size_t ringCountUnsafe() {
   return (ringWrite + AUDIO_RING_SAMPLES - ringRead) % AUDIO_RING_SAMPLES;
 }
 
+static void ringLock() {
+  if (ringMu) xSemaphoreTake(ringMu, portMAX_DELAY);
+}
+
+static void ringUnlock() {
+  if (ringMu) xSemaphoreGive(ringMu);
+}
+
 static size_t ringCount() {
-  portENTER_CRITICAL(&ringMux);
+  ringLock();
   size_t n = ringCountUnsafe();
-  portEXIT_CRITICAL(&ringMux);
+  ringUnlock();
   return n;
 }
 
 static void ringClear() {
-  portENTER_CRITICAL(&ringMux);
+  ringLock();
   ringWrite = 0;
   ringRead = 0;
-  portEXIT_CRITICAL(&ringMux);
+  ringUnlock();
 }
 
 static void ringPush(const int16_t *src, size_t n) {
-  portENTER_CRITICAL(&ringMux);
+  // Mutex, not a critical section: the ring lives in PSRAM and a
+  // cache-off critical section corrupts audio while Wi-Fi is busy.
+  ringLock();
   for (size_t i = 0; i < n; i++) {
     size_t next = (ringWrite + 1) % AUDIO_RING_SAMPLES;
     if (next == ringRead) {
@@ -188,11 +198,11 @@ static void ringPush(const int16_t *src, size_t n) {
     audioRing[ringWrite] = src[i];
     ringWrite = next;
   }
-  portEXIT_CRITICAL(&ringMux);
+  ringUnlock();
 }
 
 static size_t ringPop(int16_t *dst, size_t n) {
-  portENTER_CRITICAL(&ringMux);
+  ringLock();
   size_t avail = ringCountUnsafe();
   size_t take = n < avail ? n : avail;
   size_t first = AUDIO_RING_SAMPLES - ringRead;
@@ -200,7 +210,7 @@ static size_t ringPop(int16_t *dst, size_t n) {
   memcpy(dst, audioRing + ringRead, first * sizeof(int16_t));
   if (take > first) memcpy(dst + first, audioRing, (take - first) * sizeof(int16_t));
   ringRead = (ringRead + take) % AUDIO_RING_SAMPLES;
-  portEXIT_CRITICAL(&ringMux);
+  ringUnlock();
   return take;
 }
 
@@ -344,7 +354,7 @@ static void startAudioWebSocket() {
   if (audioWsStarted) return;
   String path = String("/ws/audio?device=") + deviceId + "&token=" + SERVER_TOKEN;
   audioWs.onEvent(audioWsEvent);
-  audioWs.setReconnectInterval(10000);
+  audioWs.setReconnectInterval(3000);
   audioWs.begin(serverHost.c_str(), SERVER_PORT, path.c_str(), "");
   audioWsStarted = true;
   Serial.printf("[WS-AUDIO] connecting %s:%d%s\n", serverHost.c_str(), SERVER_PORT, path.c_str());
@@ -375,7 +385,7 @@ static void startWebSocket() {
                 "&token=" + SERVER_TOKEN;
 
   streamWs.onEvent(wsEvent);
-  streamWs.setReconnectInterval(10000);
+  streamWs.setReconnectInterval(3000);
   // Empty subprotocol: FastAPI rejects Sec-WebSocket-Protocol: arduino.
   streamWs.begin(serverHost.c_str(), SERVER_PORT, path.c_str(), "");
   wsStarted = true;
@@ -449,6 +459,19 @@ static void drainCamFb() {
 }
 
 static bool camIsHd = false;
+static int liveQ = LIVE_JPEG_Q;
+
+static void tuneLiveSize(size_t jpegBytes) {
+  if (camIsHd || jpegBytes < 128) return;
+  int next = liveQ;
+  if (jpegBytes > 28000 && liveQ < 40) next = liveQ + 2;
+  else if (jpegBytes < 14000 && liveQ > 24) next = liveQ - 1;
+  if (next == liveQ) return;
+  liveQ = next;
+  sensor_t *s = esp_camera_sensor_get();
+  if (s) s->set_quality(s, liveQ);
+  Serial.printf("[CAM] live q=%d bytes=%u\n", liveQ, (unsigned)jpegBytes);
+}
 
 static void ensureCamProfile(bool hd) {
   if (camIsHd == hd) return;
@@ -459,9 +482,9 @@ static void ensureCamProfile(bool hd) {
     s->set_quality(s, REC_JPEG_Q);
   } else {
     s->set_framesize(s, FRAMESIZE_VGA);
-    s->set_quality(s, LIVE_JPEG_Q);
+    s->set_quality(s, liveQ);
   }
-  s->set_sharpness(s, hd ? 2 : 1);
+  s->set_sharpness(s, hd ? 1 : 0);
   camIsHd = hd;
   drainCamFb();
   drainCamFb();
@@ -485,6 +508,7 @@ static bool sendVideoFrame() {
     memcpy(txPacket + 1, fb->buf, len);
   }
   esp_camera_fb_return(fb);
+  if (!camIsHd) tuneLiveSize(len);
   if (!copy_ok) {
     ++txVideoDrops;
     return false;
@@ -530,19 +554,32 @@ static void audioCaptureTask(void *) {
     if (!live) continue;
     if (e != ESP_OK || bytes < sizeof(int32_t)) continue;
     size_t n = bytes / sizeof(int32_t);
-    // Outdoor wind rumble sits below ~100 Hz. Cut it on-device so the
-    // live feed is speech, not road/wind noise. R ≈ 0.961 at 16 kHz.
-    static int32_t hpX = 0;
-    static int32_t hpY = 0;
+    // Two poles near 150 Hz cut footfall and wind. One extra shift leaves
+    // headroom so a gust clips the gain, not the waveform.
+    // R = exp(-2*pi*150/16000) ≈ 0.943 → 241/256.
+    static int32_t x1 = 0, y1 = 0, x2 = 0, y2 = 0;
+    static int gain = 384;  // 1.5x restores the extra shift
+    int32_t peak = 0;
+    const int R = 241;
     for (size_t i = 0; i < n; i++) {
-      int32_t s = raw[i] >> MIC_SHIFT;
-      int32_t y = s - hpX + ((hpY * 246) >> 8);
-      hpX = s;
-      hpY = y;
+      int32_t s = raw[i] >> (MIC_SHIFT + 1);
+      int32_t a = s - x1 + ((y1 * R) >> 8);
+      x1 = s;
+      y1 = a;
+      int32_t b = a - x2 + ((y2 * R) >> 8);
+      x2 = a;
+      y2 = b;
+      int32_t y = (b * gain) >> 8;
+      if (y > 26000) y = 26000 + ((y - 26000) >> 2);
+      if (y < -26000) y = -26000 + ((y + 26000) >> 2);
       if (y > 32767) y = 32767;
       if (y < -32768) y = -32768;
+      int32_t mag = y < 0 ? -y : y;
+      if (mag > peak) peak = mag;
       pcm[i] = (int16_t)y;
     }
+    if (peak > 22000 && gain > 96) gain = (gain * 3) / 4;
+    else if (peak < 5000 && gain < 512) gain += 1;
     ringPush(pcm, n);
   }
 }
@@ -559,6 +596,7 @@ static void initMic() {
     return;
   }
   memset(audioRing, 0, AUDIO_RING_SAMPLES * sizeof(int16_t));
+  if (!ringMu) ringMu = xSemaphoreCreateMutex();
 
   i2s_config_t c = {};
   c.mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX);
@@ -636,9 +674,10 @@ static bool initCam() {
     s->set_quality(s, LIVE_JPEG_Q);
     s->set_vflip(s, CAM_VFLIP);
     s->set_hmirror(s, CAM_HMIRROR);
-    s->set_gainceiling(s, GAINCEILING_16X);
+    s->set_gainceiling(s, GAINCEILING_8X);
     s->set_aec2(s, 0);
-    s->set_ae_level(s, -1);
+    s->set_ae_level(s, -2);
+    s->set_aec_value(s, 120);
     s->set_whitebal(s, 1);
     s->set_awb_gain(s, 1);
     s->set_wb_mode(s, 0);
