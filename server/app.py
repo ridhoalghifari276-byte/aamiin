@@ -5,7 +5,7 @@ from fastapi.staticfiles import StaticFiles
 from pathlib import Path
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
-import asyncio, time, os, wave, struct, subprocess, threading, uuid, json, queue
+import asyncio, time, os, wave, struct, subprocess, threading, uuid, json, queue, socket
 import shutil
 
 import cv2
@@ -106,6 +106,7 @@ def _udp_finish(kind: int, device: str, blob: bytes):
         _udp_frames += 1
     elif kind == 2 and len(blob) >= 2:
         enqueue_pcm(device, blob)
+    _udp_touch_radio(device)
     if _udp_frames and _udp_frames % 100 == 0:
         print(f"[udp] frames={_udp_frames} device={device}", flush=True)
 
@@ -156,20 +157,41 @@ def _on_udp_media(data: bytes, addr):
     _udp_finish(kind, device, blob)
 
 
-class _UdpMedia(asyncio.DatagramProtocol):
-    def datagram_received(self, data, addr):
+_udp_standby_at: dict[str, float] = {}
+
+
+def _udp_touch_radio(device: str):
+    now = time.monotonic()
+    if now - _udp_standby_at.get(device, 0.0) < 5.0:
+        return
+    _udp_standby_at[device] = now
+    try:
+        pqtalkie.ensure_standby(device)
+    except Exception as e:
+        print(f"[udp] standby {device}: {e}", flush=True)
+
+
+def _udp_thread():
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind(("0.0.0.0", UDP_MEDIA_PORT))
+    except OSError as e:
+        print(f"[udp] bind {UDP_MEDIA_PORT} failed: {e} — HT stays on TCP", flush=True)
+        sock.close()
+        return
+    print(f"[udp] listening 0.0.0.0:{UDP_MEDIA_PORT}", flush=True)
+    while True:
         try:
+            data, addr = sock.recvfrom(2048)
             _on_udp_media(data, addr)
         except Exception as e:
             print(f"[udp] {e}", flush=True)
+            time.sleep(0.2)
 
 
-async def _start_udp_media():
-    loop = asyncio.get_running_loop()
-    await loop.create_datagram_endpoint(
-        _UdpMedia, local_addr=("0.0.0.0", UDP_MEDIA_PORT)
-    )
-    print(f"[udp] listening 0.0.0.0:{UDP_MEDIA_PORT}", flush=True)
+def _start_udp_media():
+    threading.Thread(target=_udp_thread, name="udp-media", daemon=True).start()
 
 
 async def _arm_watchdog():
@@ -181,7 +203,7 @@ async def _arm_watchdog():
 
     asyncio.create_task(beat())
     threading.Thread(target=_event_loop_watchdog, name="watchdog", daemon=True).start()
-    await _start_udp_media()
+    _start_udp_media()
 
 
 ingest_q: queue.Queue = queue.Queue(maxsize=48)

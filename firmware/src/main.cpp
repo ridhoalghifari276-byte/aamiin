@@ -41,7 +41,6 @@ static SemaphoreHandle_t udpMu = nullptr;
 static WiFiUDP mediaUdp;
 static bool udpBegun = false;
 static uint16_t udpVideoSeq = 0;
-static uint16_t udpAudioSeq = 0;
 
 // SO_SNDBUF is not supported on this lwIP (errno 109). A short write
 // timeout is what keeps one JPEG from holding the radio for seconds.
@@ -484,8 +483,6 @@ static int pumpAudio() {
   if (n < 0) {
     audioLen = 0;
     ++txAudioDrops;
-    audioWs.disconnect();
-    audioWsConnected = false;
     return -1;
   }
   if (n > 0) audioOff += (size_t)n;
@@ -716,19 +713,6 @@ static bool sendVideoFrame() {
   lastJpegBytes = len;
   ++txVideoFrames;
   if (!camIsHd) tuneLiveSize(len, lastVideoSendMs);
-  return true;
-}
-
-static bool sendAudioUdp() {
-  static int16_t txBuf[AUDIO_TX_SAMPLES];
-  if (!audioRing || ringCount() < (size_t)AUDIO_TX_SAMPLES) return false;
-  size_t n = ringPop(txBuf, AUDIO_TX_SAMPLES);
-  if (!n) return false;
-  if (!udpSend(2, ++udpAudioSeq, 0, 1, (const uint8_t *)txBuf, n * sizeof(int16_t))) {
-    ++txAudioDrops;
-    return false;
-  }
-  ++txAudioPackets;
   return true;
 }
 
@@ -992,13 +976,15 @@ static void audioTxTask(void *) {
       vTaskDelay(pdMS_TO_TICKS(20));
       continue;
     }
-    if (audioWsConnected || WiFi.status() == WL_CONNECTED) {
-      // Mic leaves on UDP. The audio socket stays up only for speaker downlink.
+    if (audioWsConnected) {
+      // Mic stays on this socket. That is what feeds the HT and the speaker
+      // downlink. UDP is video only, so a late picture cannot drop the radio.
       if (ringCount() > (size_t)AUDIO_TX_SAMPLES * 4) {
         ringKeepLatest((size_t)AUDIO_TX_SAMPLES * 2);
       }
-      sendAudioUdp();
-      vTaskDelay(pdMS_TO_TICKS(5));
+      if (audioLen) pumpAudio();
+      else sendAudioWs();
+      vTaskDelay(pdMS_TO_TICKS(audioLen ? 1 : 5));
       continue;
     }
     // HTTP fallback only while recording a file. Live stays on WS so a
