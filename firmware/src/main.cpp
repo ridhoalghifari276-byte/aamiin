@@ -1,8 +1,12 @@
+// Absolute cap for library writes (audio + ping). Video uses its own pump.
+#define WEBSOCKETS_TCP_TIMEOUT (80)
 #include <Arduino.h>
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <WiFiClient.h>
 #include <WebSocketsClient.h>
+#include <lwip/sockets.h>
+#include <esp_wifi.h>
 #include <esp_camera.h>
 #include <esp_heap_caps.h>
 #include <driver/i2s.h>
@@ -31,14 +35,59 @@ static volatile bool stateDirty = false;
 
 static Adafruit_NeoPixel pixel(1, RGB_LED, NEO_GRB + NEO_KHZ800);
 static SemaphoreHandle_t stateMux = nullptr;
-static WebSocketsClient streamWs;
+static SemaphoreHandle_t txMu = nullptr;
+
+// SO_SNDBUF is not supported on this lwIP (errno 109). A short write
+// timeout is what keeps one JPEG from holding the radio for seconds.
+class TunedWs : public WebSocketsClient {
+ public:
+  void tuneLink(const char *tag) {
+    if (!_client.tcp) return;
+    _client.tcp->setNoDelay(true);
+    _client.tcp->setConnectionTimeout(5);
+    Serial.printf("[WS] %s nodelay\n", tag);
+  }
+
+  // One non-blocking slice. tcp->write() keeps going while any byte is
+  // accepted, so a slow link held the camera task for seconds.
+  int pushRaw(const uint8_t *data, size_t n) {
+    if (!_client.tcp || !_client.tcp->connected() || !data || !n) return -1;
+    int sock = _client.tcp->fd();
+    if (sock < 0) return -1;
+    int r = ::send(sock, data, n, MSG_DONTWAIT);
+    if (r > 0) return r;
+    if (r == 0 || errno == EAGAIN || errno == EWOULDBLOCK) return 0;
+    return -1;
+  }
+
+  bool canSend() {
+    if (!_client.tcp) return false;
+    int sock = _client.tcp->fd();
+    if (sock < 0) return false;
+    fd_set wfds;
+    FD_ZERO(&wfds);
+    FD_SET(sock, &wfds);
+    struct timeval tv;
+    tv.tv_sec = 0;
+    tv.tv_usec = 0;
+    return select(sock + 1, nullptr, &wfds, nullptr, &tv) > 0;
+  }
+};
+
+static TunedWs streamWs;
 static volatile bool wsConnected = false;
 static bool wsStarted = false;
-static WebSocketsClient audioWs;
+static TunedWs audioWs;
 static volatile bool audioWsConnected = false;
 static bool audioWsStarted = false;
 static uint8_t *txPacket = nullptr;   // reused video packet buffer (no per-frame malloc)
 static size_t txPacketCap = 0;
+static uint8_t *wsFrame = nullptr;    // masked websocket frame, sent in slices
+static size_t wsFrameCap = 0;
+static size_t wsLen = 0;
+static size_t wsOff = 0;
+static uint32_t wsT0 = 0;
+static size_t lastJpegBytes = 0;
 
 static int16_t *audioRing = nullptr;
 static volatile size_t ringWrite = 0;
@@ -63,6 +112,8 @@ static uint32_t txAudioPackets = 0;
 static uint32_t txVideoFrames = 0;
 static uint32_t txAudioDrops = 0;
 static uint32_t txVideoDrops = 0;
+static uint32_t txVideoSkips = 0;
+static volatile uint32_t lastVideoSendMs = 0;
 static uint32_t lastStats = 0;
 
 static void led(bool on) {
@@ -83,9 +134,9 @@ static void rgb(uint8_t r, uint8_t g, uint8_t b) {
 }
 
 static bool visualOn() {
-  // Audio-only record: no live picture. GPIO 21 off: no live picture
-  // unless a video file is being recorded (frames still needed for mux).
-  return videoEnabled || (streamEnabled && !audioEnabled);
+  // Keep the live picture up during audio record. Blanking it made the
+  // dashboard freeze every time the audio button was pressed.
+  return streamEnabled || videoEnabled;
 }
 
 static void nightIr(bool on) {
@@ -127,11 +178,11 @@ static void applyCamNight(bool on) {
     s->set_gain_ctrl(s, 1);
     s->set_exposure_ctrl(s, 1);
     s->set_aec2(s, 0);
-    s->set_gainceiling(s, GAINCEILING_8X);
+    s->set_gainceiling(s, GAINCEILING_16X);
     s->set_agc_gain(s, 0);
-    s->set_aec_value(s, 120);
-    s->set_ae_level(s, -2);
-    s->set_brightness(s, 0);
+    s->set_aec_value(s, 200);
+    s->set_ae_level(s, 1);
+    s->set_brightness(s, 1);
     s->set_contrast(s, 1);
     s->set_saturation(s, 0);
     s->set_whitebal(s, 1);
@@ -214,6 +265,15 @@ static size_t ringPop(int16_t *dst, size_t n) {
   return take;
 }
 
+static void ringKeepLatest(size_t keep) {
+  ringLock();
+  size_t avail = ringCountUnsafe();
+  if (avail > keep) {
+    ringRead = (ringWrite + AUDIO_RING_SAMPLES - keep) % AUDIO_RING_SAMPLES;
+  }
+  ringUnlock();
+}
+
 static void copySessionHeaders(HTTPClient &h) {
   h.addHeader("X-Device-ID", deviceId.c_str());
   h.addHeader("X-Token", SERVER_TOKEN);
@@ -288,15 +348,19 @@ static void wsEvent(WStype_t type, uint8_t *payload, size_t length) {
     case WStype_CONNECTED:
       wsConnected = true;
       WiFi.setSleep(false);
+      esp_wifi_set_ps(WIFI_PS_NONE);
+      streamWs.tuneLink("video");
       streamWs.enableHeartbeat(15000, 3000, 2);
       Serial.printf("[WS] connected: %s\n", payload ? (char *)payload : "");
       break;
     case WStype_DISCONNECTED:
       wsConnected = false;
+      wsLen = 0;
       Serial.println("[WS] disconnected");
       break;
     case WStype_ERROR:
       wsConnected = false;
+      wsLen = 0;
       Serial.println("[WS] error");
       break;
     case WStype_TEXT:
@@ -319,6 +383,7 @@ static void audioWsEvent(WStype_t type, uint8_t *payload, size_t length) {
   switch (type) {
     case WStype_CONNECTED:
       audioWsConnected = true;
+      audioWs.tuneLink("audio");
       audioWs.enableHeartbeat(15000, 3000, 2);
       ringClear();  // start live, not with whatever piled up while offline
       Serial.println("[WS-AUDIO] connected");
@@ -402,25 +467,42 @@ static bool sendWsPacket(uint8_t type, const uint8_t *data, size_t len) {
 }
 
 // Voice goes out on its own socket, so it is never stuck behind a JPEG.
+static uint8_t audioFrame[768];
+static size_t audioLen = 0;
+static size_t audioOff = 0;
+static bool queueBin(uint8_t *dst, size_t cap, size_t *outLen, const uint8_t *payload, size_t len);
+
+static int pumpAudio() {
+  if (!audioLen) return 1;
+  int n = audioWs.pushRaw(audioFrame + audioOff, audioLen - audioOff);
+  if (n < 0) {
+    audioLen = 0;
+    ++txAudioDrops;
+    audioWs.disconnect();
+    audioWsConnected = false;
+    return -1;
+  }
+  if (n > 0) audioOff += (size_t)n;
+  if (audioOff >= audioLen) {
+    audioLen = 0;
+    ++txAudioPackets;
+    return 1;
+  }
+  return 0;
+}
+
 static bool sendAudioWs() {
   static int16_t txBuf[AUDIO_TX_SAMPLES];
-  if (!audioWsConnected || !audioRing) return false;
-  bool any = false;
-  int sent = 0;
-  // Two 125 ms packets = one firmware.zip 250 ms batch, without a single
-  // 8000-byte send that would stall lwIP.
-  while (ringCount() >= (size_t)AUDIO_TX_SAMPLES && sent < 2) {
-    size_t n = ringPop(txBuf, AUDIO_TX_SAMPLES);
-    if (!n) break;
-    if (!audioWs.sendBIN((uint8_t *)txBuf, n * sizeof(int16_t))) {
-      ++txAudioDrops;
-      break;
-    }
-    ++txAudioPackets;
-    any = true;
-    ++sent;
+  if (!audioWsConnected || !audioRing || audioLen) return false;
+  if (ringCount() < (size_t)AUDIO_TX_SAMPLES) return false;
+  size_t n = ringPop(txBuf, AUDIO_TX_SAMPLES);
+  if (!n) return false;
+  audioOff = 0;
+  if (!queueBin(audioFrame, sizeof(audioFrame), &audioLen, (uint8_t *)txBuf, n * sizeof(int16_t))) {
+    ++txAudioDrops;
+    return false;
   }
-  return any;
+  return true;
 }
 
 static bool sendAudioChunk() {
@@ -461,16 +543,19 @@ static void drainCamFb() {
 static bool camIsHd = false;
 static int liveQ = LIVE_JPEG_Q;
 
-static void tuneLiveSize(size_t jpegBytes) {
+static void tuneLiveSize(size_t jpegBytes, uint32_t sendMs) {
+  (void)sendMs;
   if (camIsHd || jpegBytes < 128) return;
   int next = liveQ;
-  if (jpegBytes > 28000 && liveQ < 40) next = liveQ + 2;
-  else if (jpegBytes < 14000 && liveQ > 24) next = liveQ - 1;
+  // Send time here is mostly the link RTT. Raising q on a 150 ms send
+  // only made the picture blockier.
+  if (jpegBytes > 16000 && liveQ < 36) next = liveQ + 1;
+  else if (jpegBytes < 8000 && liveQ > 24) next = liveQ - 1;
   if (next == liveQ) return;
   liveQ = next;
   sensor_t *s = esp_camera_sensor_get();
   if (s) s->set_quality(s, liveQ);
-  Serial.printf("[CAM] live q=%d bytes=%u\n", liveQ, (unsigned)jpegBytes);
+  Serial.printf("[CAM] live q=%d bytes=%u send=%ums\n", liveQ, (unsigned)jpegBytes, (unsigned)sendMs);
 }
 
 static void ensureCamProfile(bool hd) {
@@ -478,45 +563,107 @@ static void ensureCamProfile(bool hd) {
   sensor_t *s = esp_camera_sensor_get();
   if (!s) return;
   if (hd) {
-    s->set_framesize(s, FRAMESIZE_HD);
+    s->set_framesize(s, FRAMESIZE_QVGA);
     s->set_quality(s, REC_JPEG_Q);
   } else {
-    s->set_framesize(s, FRAMESIZE_VGA);
+    s->set_framesize(s, FRAMESIZE_QVGA);
     s->set_quality(s, liveQ);
   }
   s->set_sharpness(s, hd ? 1 : 0);
   camIsHd = hd;
-  drainCamFb();
-  drainCamFb();
-  Serial.printf("[CAM] %s %s q=%d\n", hd ? "HD-record" : "LD-live",
-                hd ? "1280x720" : "640x480", hd ? REC_JPEG_Q : LIVE_JPEG_Q);
+  // The DMA logs FB-OVF if old frames are still queued across the switch.
+  for (int i = 0; i < 6; i++) drainCamFb();
+  Serial.printf("[CAM] %s 320x240 q=%d\n", hd ? "record" : "live",
+                hd ? REC_JPEG_Q : liveQ);
+}
+
+static bool queueBin(uint8_t *dst, size_t cap, size_t *outLen, const uint8_t *payload, size_t len) {
+  if (!dst || !outLen || *outLen || len < 1 || len > 65535) return false;
+  if (len + 8 > cap) return false;
+  uint32_t r = esp_random();
+  uint8_t mask[4] = {
+    (uint8_t)r, (uint8_t)(r >> 8), (uint8_t)(r >> 16), (uint8_t)(r >> 24)
+  };
+  size_t h;
+  dst[0] = 0x82;
+  if (len < 126) {
+    dst[1] = (uint8_t)(0x80 | len);
+    h = 2;
+  } else {
+    dst[1] = 0x80 | 126;
+    dst[2] = (uint8_t)(len >> 8);
+    dst[3] = (uint8_t)len;
+    h = 4;
+  }
+  memcpy(dst + h, mask, 4);
+  h += 4;
+  uint8_t *body = dst + h;
+  for (size_t i = 0; i < len; i++) body[i] = payload[i] ^ mask[i & 3];
+  *outLen = h + len;
+  return true;
+}
+
+static bool queueVideoFrame(const uint8_t *payload, size_t len) {
+  if (wsLen) return false;
+  if (!queueBin(wsFrame, wsFrameCap, &wsLen, payload, len)) return false;
+  wsOff = 0;
+  wsT0 = millis();
+  return true;
+}
+
+// 1 = idle (frame finished or nothing queued), 0 = still sending, -1 = dropped.
+static int pumpVideo() {
+  if (!wsLen) return 1;
+  int n = streamWs.pushRaw(wsFrame + wsOff, wsLen - wsOff);
+  if (n < 0) {
+    wsLen = 0;
+    ++txVideoDrops;
+    streamWs.disconnect();
+    wsConnected = false;
+    return -1;
+  }
+  if (n > 0) wsOff += (size_t)n;
+  if (wsOff >= wsLen) {
+    lastVideoSendMs = millis() - wsT0;
+    wsLen = 0;
+    ++txVideoFrames;
+    if (!camIsHd) tuneLiveSize(lastJpegBytes, lastVideoSendMs);
+    return 1;
+  }
+  // A healthy frame on this link is ~150 ms. Cutting it at 350 ms closed
+  // the socket mid-message and the client reconnected in a loop.
+  if (millis() - wsT0 > 8000) {
+    Serial.printf("[WS] video send stuck %lums\n", (unsigned long)(millis() - wsT0));
+    wsLen = 0;
+    ++txVideoDrops;
+    streamWs.disconnect();
+    wsConnected = false;
+    return -1;
+  }
+  return 0;
 }
 
 static bool sendVideoFrame() {
-  // Grab + free the sensor buffer BEFORE sendBIN. Holding the FB across a
-  // WebSocket write is what caused cam_hal FB-OVF and NO SIGNAL.
+  // Grab + free the sensor buffer BEFORE any TCP write.
   camera_fb_t *fb = esp_camera_fb_get();
   if (!fb) {
     ++txVideoDrops;
     return false;
   }
   size_t len = fb->len;
-  bool copy_ok = wsConnected && visualOn() && txPacket &&
+  bool copy_ok = wsConnected && visualOn() && txPacket && wsFrame &&
                  len > 128 && len + 1 <= txPacketCap;
   if (copy_ok) {
     txPacket[0] = 0x01;
     memcpy(txPacket + 1, fb->buf, len);
+    lastJpegBytes = len;
   }
   esp_camera_fb_return(fb);
-  if (!camIsHd) tuneLiveSize(len);
-  if (!copy_ok) {
+  if (!copy_ok || !queueVideoFrame(txPacket, len + 1)) {
     ++txVideoDrops;
     return false;
   }
-  bool ok = streamWs.sendBIN(txPacket, len + 1);
-  if (ok) ++txVideoFrames;
-  else ++txVideoDrops;
-  return ok;
+  return true;
 }
 
 static void applySessionCmd() {
@@ -651,9 +798,9 @@ static bool initCam() {
   c.pin_reset = CAM_PIN_RESET;
   c.xclk_freq_hz = 20000000;
   c.pixel_format = PIXFORMAT_JPEG;
-  c.frame_size = FRAMESIZE_VGA;
+  c.frame_size = FRAMESIZE_QVGA;
   c.jpeg_quality = JPEG_QUALITY;
-  c.fb_count = 3;
+  c.fb_count = 2;
   c.grab_mode = CAMERA_GRAB_LATEST;
   c.fb_location = CAMERA_FB_IN_PSRAM;
 
@@ -665,19 +812,19 @@ static bool initCam() {
 
   sensor_t *s = esp_camera_sensor_get();
   if (s) {
-    s->set_brightness(s, 0);
+    s->set_brightness(s, 1);
     s->set_contrast(s, 1);
     s->set_saturation(s, 0);
     s->set_sharpness(s, 1);
     s->set_denoise(s, 0);
-    s->set_framesize(s, FRAMESIZE_VGA);
+    s->set_framesize(s, FRAMESIZE_QVGA);
     s->set_quality(s, LIVE_JPEG_Q);
     s->set_vflip(s, CAM_VFLIP);
     s->set_hmirror(s, CAM_HMIRROR);
-    s->set_gainceiling(s, GAINCEILING_8X);
+    s->set_gainceiling(s, GAINCEILING_16X);
     s->set_aec2(s, 0);
-    s->set_ae_level(s, -2);
-    s->set_aec_value(s, 120);
+    s->set_ae_level(s, 1);
+    s->set_aec_value(s, 200);
     s->set_whitebal(s, 1);
     s->set_awb_gain(s, 1);
     s->set_wb_mode(s, 0);
@@ -780,8 +927,14 @@ static void audioTxTask(void *) {
       continue;
     }
     if (audioWsConnected) {
-      sendAudioWs();
-      vTaskDelay(pdMS_TO_TICKS(ringCount() >= (size_t)AUDIO_TX_SAMPLES ? 1 : 15));
+      // 20 ms packets. Drop only if more than 80 ms is waiting, so a stall
+      // does not become a gap (crackle) or a growing delay.
+      if (ringCount() > (size_t)AUDIO_TX_SAMPLES * 4) {
+        ringKeepLatest((size_t)AUDIO_TX_SAMPLES * 2);
+      }
+      if (audioLen) pumpAudio();
+      else sendAudioWs();
+      vTaskDelay(pdMS_TO_TICKS(audioLen ? 1 : 5));
       continue;
     }
     // HTTP fallback only while recording a file. Live stays on WS so a
@@ -825,7 +978,7 @@ static void houseKeepTask(void *) {
     if (now - lastHb >= 5000) {
       lastHb = now;
       postDeviceState();
-      Serial.printf("[STAT] ws=%d aws=%d ptt=%d sos=%d gps=%d rx=%d sats=%d audio=%lu drops=%lu video=%lu drops=%lu ring=%u RSSI=%d\n",
+      Serial.printf("[STAT] ws=%d aws=%d ptt=%d sos=%d gps=%d rx=%d sats=%d audio=%lu drops=%lu video=%lu drops=%lu skip=%lu send=%ums ring=%u RSSI=%d\n",
                     wsConnected,
                     audioWsConnected,
                     (int)pttHeld,
@@ -837,6 +990,8 @@ static void houseKeepTask(void *) {
                     (unsigned long)txAudioDrops,
                     (unsigned long)txVideoFrames,
                     (unsigned long)txVideoDrops,
+                    (unsigned long)txVideoSkips,
+                    (unsigned)lastVideoSendMs,
                     (unsigned)ringCount(),
                     WiFi.RSSI());
     }
@@ -853,10 +1008,9 @@ static void streamTxTask(void *) {
   uint32_t nextFrame = millis();
 
   for (;;) {
-    streamWs.loop();
-
     if (WiFi.status() != WL_CONNECTED) {
       stopWebSocket();
+      wsLen = 0;
       drainCamFb();
       vTaskDelay(pdMS_TO_TICKS(200));
       continue;
@@ -864,30 +1018,50 @@ static void streamTxTask(void *) {
 
     startWebSocket();
     WiFi.setSleep(false);
+    esp_wifi_set_ps(WIFI_PS_NONE);
 
     if (!wsConnected) {
+      wsLen = 0;
       drainCamFb();
-      vTaskDelay(pdMS_TO_TICKS(250));
+      streamWs.loop();
+      vTaskDelay(pdMS_TO_TICKS(20));
       continue;
     }
 
-    // HD only while a video file is recording. Live viewers stay on VGA.
-    bool hd = videoEnabled;
-    ensureCamProfile(hd);
-    const uint32_t framePeriod = 1000 / (hd ? REC_FPS : LIVE_FPS);
+    // Finish the current websocket message in short slices. loop() is not
+    // called mid-frame so a ping cannot land inside the JPEG.
+    if (wsLen) {
+      pumpVideo();
+      vTaskDelay(pdMS_TO_TICKS(1));
+      continue;
+    }
+
+    streamWs.loop();
+
+    // Stay on 320x240. A framesize switch overflows the sensor and a VGA
+    // JPEG takes the whole radio for about a second.
+    ensureCamProfile(false);
+    const uint32_t framePeriod = 1000 / LIVE_FPS;
 
     uint32_t now = millis();
     if ((int32_t)(now - nextFrame) >= 0) {
-      sendVideoFrame();
+      bool sent = false;
+      if (!visualOn()) {
+        drainCamFb();
+      } else if (streamWs.canSend()) {
+        sent = sendVideoFrame();
+      } else {
+        ++txVideoSkips;
+        drainCamFb();
+      }
       now = millis();
-      // If the WAN is late, wait a full period. Catch-up bursts look like stutter.
-      nextFrame = now + framePeriod;
+      nextFrame = now + (sent ? framePeriod : 15);
     }
 
     now = millis();
     int32_t waitMs = visualOn() ? (int32_t)(nextFrame - now) : 10;
     if (waitMs < 1) waitMs = 1;
-    if (waitMs > 10) waitMs = 10;
+    if (waitMs > 8) waitMs = 8;
     vTaskDelay(pdMS_TO_TICKS((uint32_t)waitMs));
   }
 }
@@ -895,6 +1069,7 @@ static void streamTxTask(void *) {
 void setup() {
   Serial.begin(115200);
   delay(300);
+  txMu = xSemaphoreCreateMutex();
 
   led(true);
 #if USE_RGB_LED
@@ -929,6 +1104,15 @@ void setup() {
     txPacketCap = 0;
     Serial.println("[WS] tx buffer alloc failed");
   }
+  wsFrameCap = txPacketCap ? txPacketCap + 16 : 0;
+  if (wsFrameCap) {
+    wsFrame = (uint8_t *)heap_caps_malloc(wsFrameCap, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!wsFrame) wsFrame = (uint8_t *)malloc(wsFrameCap);
+  }
+  if (!wsFrame) {
+    wsFrameCap = 0;
+    Serial.println("[WS] frame buffer alloc failed");
+  }
   streamEnabled = true;
   xTaskCreatePinnedToCore(streamTxTask, "streamtx", 12288, nullptr, 4, nullptr, 1);
 
@@ -940,7 +1124,7 @@ void setup() {
   stateLed();
   postDeviceState();
 
-  xTaskCreatePinnedToCore(audioTxTask, "audiotx", 8192, nullptr, 5, nullptr, 0);
+  xTaskCreatePinnedToCore(audioTxTask, "audiotx", 8192, nullptr, 3, nullptr, 0);
   xTaskCreatePinnedToCore(houseKeepTask, "house", 8192, nullptr, 1, nullptr, 0);
 
   led(false);

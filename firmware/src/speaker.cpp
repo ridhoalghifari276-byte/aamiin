@@ -78,7 +78,10 @@ static void speakerTask(void *) {
       xSemaphoreGive(spkMu);
     }
     if (!take) {
-      vTaskDelay(pdMS_TO_TICKS(5));
+      // Stopping the I2S clock between packets is the click/crackle.
+      memset(stereo, 0, 64 * 2 * sizeof(int16_t));
+      size_t written = 0;
+      i2s_write(I2S_NUM_1, stereo, 64 * 2 * sizeof(int16_t), &written, pdMS_TO_TICKS(20));
       continue;
     }
     size_t written = 0;

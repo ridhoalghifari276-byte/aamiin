@@ -1779,8 +1779,9 @@ async def ws_live_audio(websocket: WebSocket, device: str = "bodycam-01", raw: i
                     # the session already a second behind.
                     last_seq = buf[-1][0] - 1
                     primed = True
-                elif buf[-1][0] - last_seq > 5:
-                    # Chunks are 125 ms, so five of them is ~625 ms behind.
+                elif buf[-1][0] - last_seq > 15:
+                    # Packets are 20 ms. Fifteen behind is 300 ms — join the
+                    # live edge instead of playing a late backlog.
                     last_seq = buf[-1][0] - 1
                 for seq, chunk in buf:
                     if seq > last_seq:
@@ -1827,8 +1828,7 @@ async def ws_live(websocket: WebSocket, device: str = "bodycam-01"):
                         last_overlay = blob
                         await websocket.send_text(blob)
 
-            elapsed = time.monotonic() - t0
-            await asyncio.sleep(max(0.001, (1.0 / LIVE_FPS) - elapsed))
+            await asyncio.sleep(0.015)
 
     try:
         await _ws_send_until_close(websocket, sender)
@@ -2175,8 +2175,7 @@ async def ws_ext_live(websocket: WebSocket, device: str = "bodycam-01"):
                     if blob != last_overlay:
                         last_overlay = blob
                         await websocket.send_text(blob)
-            elapsed = time.monotonic() - t0
-            await asyncio.sleep(max(0.001, (1.0 / LIVE_FPS) - elapsed))
+            await asyncio.sleep(0.015)
 
     try:
         await _ws_send_until_close(websocket, sender)

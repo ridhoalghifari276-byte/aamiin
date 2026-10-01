@@ -56,14 +56,14 @@
 // Record: 720p. Sharper file, slower FPS so the sensor does not overflow.
 // ESP JPEG q: lower number = sharper, larger file. q=12 overflowed (FB-OVF).
 // ============================================================
-#define LIVE_WIDTH      640
-#define LIVE_HEIGHT     480
-#define LIVE_JPEG_Q     28
-#define LIVE_FPS        12
-#define REC_WIDTH       1280
-#define REC_HEIGHT      720
-#define REC_JPEG_Q      18
-#define REC_FPS         8
+#define LIVE_WIDTH      320
+#define LIVE_HEIGHT     240
+#define LIVE_JPEG_Q     24
+#define LIVE_FPS        15
+#define REC_WIDTH       320
+#define REC_HEIGHT      240
+#define REC_JPEG_Q      24
+#define REC_FPS         12
 #define STREAM_WIDTH    LIVE_WIDTH
 #define STREAM_HEIGHT   LIVE_HEIGHT
 #define JPEG_QUALITY    LIVE_JPEG_Q
@@ -82,7 +82,7 @@
 // 8×256 DMA, LEFT slot). Live still goes out on /ws/audio as 125 ms
 // packets so one send fits the TCP buffer; two sends = one zip chunk.
 // ============================================================
-#define AUDIO_CHUNK_MS  125
+#define AUDIO_CHUNK_MS  20
 #define AUDIO_RING_MS   3000
 #define AUDIO_TX_SAMPLES ((MIC_SAMPLE_RATE * AUDIO_CHUNK_MS) / 1000)
 #define AUDIO_RING_SAMPLES ((MIC_SAMPLE_RATE * AUDIO_RING_MS) / 1000)
