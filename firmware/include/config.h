@@ -64,12 +64,12 @@
 // Record: 720p. Sharper file, slower FPS so the sensor does not overflow.
 // ESP JPEG q: lower number = sharper, larger file. q=12 overflowed (FB-OVF).
 // ============================================================
-#define LIVE_WIDTH      320
-#define LIVE_HEIGHT     240
-#define LIVE_JPEG_Q     52
+#define LIVE_WIDTH      640
+#define LIVE_HEIGHT     480
+#define LIVE_JPEG_Q     28
 #define LIVE_FPS        10
-#define REC_WIDTH       320
-#define REC_HEIGHT      240
+#define REC_WIDTH       640
+#define REC_HEIGHT      480
 #define REC_JPEG_Q      24
 #define REC_FPS         12
 #define STREAM_WIDTH    LIVE_WIDTH

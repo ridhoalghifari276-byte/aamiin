@@ -246,5 +246,5 @@ void rtAdaptCam() {
 void rtApplyCam() {
   sensor_t *s = esp_camera_sensor_get();
   if (!s) return;
-  Serial.printf("[RT] sensor 0x%04x — live stays 320x240\n", s->id.PID);
+  Serial.printf("[RT] sensor 0x%04x — live stays 640x480\n", s->id.PID);
 }

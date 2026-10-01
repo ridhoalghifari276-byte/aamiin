@@ -1,5 +1,7 @@
-// Absolute cap for library writes (audio + ping). Video uses its own pump.
-#define WEBSOCKETS_TCP_TIMEOUT (80)
+// Handshake budget. 80 ms expired before the VPS answered, so the
+// socket died with "disconnected" and never printed "connected".
+// Video and mic do not use this write path.
+#define WEBSOCKETS_TCP_TIMEOUT (3000)
 #include <Arduino.h>
 #include <WiFi.h>
 #include <fcntl.h>
@@ -92,6 +94,10 @@ static TunedWs audioWs;
 static volatile bool audioWsConnected = false;
 static bool audioWsStarted = false;
 static uint8_t *txPacket = nullptr;   // reused video packet buffer (no per-frame malloc)
+static uint8_t *grabBuf = nullptr;
+static size_t grabLen = 0;
+static uint32_t grabSeq = 0;
+static SemaphoreHandle_t grabMu = nullptr;
 static size_t txPacketCap = 0;
 static uint8_t *wsFrame = nullptr;    // masked websocket frame, sent in slices
 static size_t wsFrameCap = 0;
@@ -184,31 +190,17 @@ static void applyCamNight(bool on) {
     s->set_raw_gma(s, 1);
     s->set_dcw(s, 1);
   } else {
-    // Outdoor / running: short exposure so motion does not smear.
-    // aec2 stays off — that mode drops the frame rate to lengthen exposure.
-    s->set_gain_ctrl(s, 1);
-    s->set_exposure_ctrl(s, 1);
-    s->set_aec2(s, 0);
-    s->set_gainceiling(s, GAINCEILING_16X);
-    s->set_agc_gain(s, 0);
-    s->set_aec_value(s, 200);
-    s->set_ae_level(s, 1);
-    s->set_brightness(s, 1);
-    s->set_contrast(s, 1);
+    // Match the bright firmware: do not touch exposure, gain, or aec2.
+    // Those overrides turned the live picture dark green.
+    s->set_brightness(s, 0);
+    s->set_contrast(s, 0);
     s->set_saturation(s, 0);
     s->set_whitebal(s, 1);
     s->set_awb_gain(s, 1);
     s->set_wb_mode(s, 0);
     s->set_special_effect(s, 0);
-    s->set_sharpness(s, 1);
-    s->set_denoise(s, 0);
     s->set_vflip(s, CAM_VFLIP);
     s->set_hmirror(s, CAM_HMIRROR);
-    s->set_raw_gma(s, 1);
-    s->set_lenc(s, 1);
-    s->set_bpc(s, 0);
-    s->set_wpc(s, 1);
-    s->set_dcw(s, 1);
   }
   nightIr(on);
 }
@@ -361,13 +353,15 @@ static void wsEvent(WStype_t type, uint8_t *payload, size_t length) {
       WiFi.setSleep(false);
       esp_wifi_set_ps(WIFI_PS_NONE);
       streamWs.tuneLink("video");
-      streamWs.enableHeartbeat(15000, 3000, 2);
+      // Heartbeat ping fires on the first loop because lastPing starts at 0.
+      // If the 8 Wi-Fi TX slots are full the ping fails and the library
+      // closes the socket, which is the connect/disconnect loop.
       Serial.printf("[WS] connected: %s\n", payload ? (char *)payload : "");
       break;
     case WStype_DISCONNECTED:
       wsConnected = false;
       wsLen = 0;
-      Serial.println("[WS] disconnected");
+      Serial.printf("[WS] disconnected %.*s\n", (int)length, (payload && length) ? (char *)payload : "");
       break;
     case WStype_ERROR:
       wsConnected = false;
@@ -554,35 +548,20 @@ static int liveQ = LIVE_JPEG_Q;
 static bool initCam();
 
 static void tuneLiveSize(size_t jpegBytes, uint32_t sendMs) {
+  (void)jpegBytes;
   (void)sendMs;
-  if (camIsHd || jpegBytes < 128) return;
-  int next = liveQ;
-  // Two UDP pieces of 1200. Anything larger is dropped before it can tear.
-  if (jpegBytes > 2200 && liveQ < 63) next = liveQ + 2 > 63 ? 63 : liveQ + 2;
-  else if (jpegBytes < 1400 && liveQ > 36) next = liveQ - 1;
-  if (next == liveQ) return;
-  liveQ = next;
-  sensor_t *s = esp_camera_sensor_get();
-  if (s) s->set_quality(s, liveQ);
-  Serial.printf("[CAM] live q=%d bytes=%u send=%ums\n", liveQ, (unsigned)jpegBytes, (unsigned)sendMs);
+  // Quality stays at the value set in initCam. Raising it while frames
+  // were moving left the JPEG the same size and tore the picture.
 }
 
 static void ensureCamProfile(bool hd) {
   if (camIsHd == hd) return;
   sensor_t *s = esp_camera_sensor_get();
   if (!s) return;
-  if (hd) {
-    s->set_framesize(s, FRAMESIZE_QVGA);
-    s->set_quality(s, REC_JPEG_Q);
-  } else {
-    s->set_framesize(s, FRAMESIZE_QVGA);
-    s->set_quality(s, liveQ);
-  }
+  s->set_quality(s, hd ? REC_JPEG_Q : liveQ);
   s->set_sharpness(s, hd ? 1 : 0);
   camIsHd = hd;
-  // The DMA logs FB-OVF if old frames are still queued across the switch.
-  for (int i = 0; i < 6; i++) drainCamFb();
-  Serial.printf("[CAM] %s 320x240 q=%d\n", hd ? "record" : "live",
+  Serial.printf("[CAM] %s 640x480 q=%d\n", hd ? "record" : "live",
                 hd ? REC_JPEG_Q : liveQ);
 }
 
@@ -623,7 +602,11 @@ static bool queueVideoFrame(const uint8_t *payload, size_t len) {
 // 1 = idle (frame finished or nothing queued), 0 = still sending, -1 = dropped.
 static int pumpVideo() {
   if (!wsLen) return 1;
-  int n = streamWs.pushRaw(wsFrame + wsOff, wsLen - wsOff);
+  // One full VGA JPEG fills every Wi-Fi TX slot. The mic then stalls
+  // (ring hits 47999) and this socket is reset. One slot per turn.
+  size_t left = wsLen - wsOff;
+  size_t slice = left > 640 ? 640 : left;
+  int n = streamWs.pushRaw(wsFrame + wsOff, slice);
   if (n < 0) {
     wsLen = 0;
     ++txVideoDrops;
@@ -638,6 +621,15 @@ static int pumpVideo() {
     ++txVideoFrames;
     if (!camIsHd) tuneLiveSize(lastJpegBytes, lastVideoSendMs);
     return 1;
+  }
+  // One frame that takes seconds freezes a moving picture. Drop it and
+  // reconnect instead of holding the radio for 2–4 s.
+  if (millis() - wsT0 > 400) {
+    wsLen = 0;
+    ++txVideoDrops;
+    streamWs.disconnect();
+    wsConnected = false;
+    return -1;
   }
   if (wsOff == 0 && millis() - wsT0 > 200) {
     wsLen = 0;
@@ -840,81 +832,33 @@ static void freshenFb(void *buf, size_t len) {
 }
 
 static bool sendVideoFrame() {
-  camera_fb_t *fb = esp_camera_fb_get();
-  if (!fb) {
+  // The camera task owns esp_camera_fb_get(). Calling it here blocked the
+  // websocket handshake for seconds, so the dashboard stayed on NO SIGNAL.
+  if (!visualOn() || !txPacket || !grabBuf || !grabMu || !wsConnected) {
     ++txVideoDrops;
     return false;
   }
-  size_t len = fb->len;
-  uint16_t fw = fb->width;
-  uint16_t fh = fb->height;
-  bool wrongSize = fw != 320 || fh != 240;
-  bool tooBig = len > 8000;
-  bool copy_ok = visualOn() && txPacket && !wrongSize && !tooBig &&
-                 len > 128 && len <= txPacketCap;
-  if (copy_ok) {
-    freshenFb(fb->buf, len);
-    memcpy(txPacket, fb->buf, len);
-    uint32_t sig = (uint32_t)len * 16777619u;
-    size_t step = len / 8;
-    if (step < 1) step = 1;
-    for (size_t i = 0; i < 8 && i * step < len; i++) sig = sig * 16777619u ^ txPacket[i * step];
-    jpegSig = sig;
-    static uint32_t prevSig = 0;
-    static int same = 0;
-    static uint32_t lastKick = 0;
-    if (sig == prevSig) {
-      if (++same >= 20 && millis() - lastKick > 20000) {
-        lastKick = millis();
-        same = 0;
-        Serial.printf("[CAM] frozen sig=%08x bytes=%u — restart sensor\n", sig, (unsigned)len);
-        esp_camera_fb_return(fb);
-        esp_camera_deinit();
-        camIsHd = false;
-        initCam();
-        ++txVideoDrops;
-        return false;
-      }
-    } else {
-      same = 0;
-      prevSig = sig;
-    }
-  }
-  esp_camera_fb_return(fb);
-  if (wrongSize) {
-    sensor_t *s = esp_camera_sensor_get();
-    if (s) {
-      s->set_framesize(s, FRAMESIZE_QVGA);
-      s->set_quality(s, liveQ);
-    }
-    Serial.printf("[CAM] size %ux%u — forced 320x240\n", fw, fh);
+  size_t len = 0;
+  static uint32_t lastSeq = 0;
+  if (xSemaphoreTake(grabMu, pdMS_TO_TICKS(15)) != pdTRUE) {
     ++txVideoDrops;
     return false;
   }
-  if (!copy_ok) {
-    if (tooBig) tuneLiveSize(len, 0);
-    ++txVideoDrops;
+  uint32_t seq = grabSeq;
+  len = grabLen;
+  bool fresh = seq != lastSeq && len > 128 && len + 1 <= txPacketCap;
+  if (fresh) {
+    memcpy(txPacket + 1, grabBuf, len);
+    lastSeq = seq;
+  }
+  xSemaphoreGive(grabMu);
+  if (!fresh) {
+    ++txVideoSkips;
     return false;
   }
-  // Whole JPEG, ending at FFD9, each piece in its own buffer.
-#if RT_STREAM
-  uint32_t t0 = millis();
-  if (!rtSendJpeg(txPacket, len, t0)) {
-    if (len > 2200) tuneLiveSize(len, 0);
-    ++txVideoDrops;
-    return false;
-  }
-  lastVideoSendMs = millis() - t0;
-  ++txVideoFrames;
+  txPacket[0] = 0x01;
   lastJpegBytes = len;
-  return true;
-#endif
-  if (len > UDP_CHUNK * UDP_HOLD_CHUNKS) {
-    tuneLiveSize(len, 0);
-    ++txVideoDrops;
-    return false;
-  }
-  if (!sendVideoUdp(txPacket, len)) {
+  if (!queueVideoFrame(txPacket, len + 1)) {
     ++txVideoDrops;
     return false;
   }
@@ -1051,12 +995,15 @@ static bool initCam() {
   c.pin_sccb_scl = CAM_PIN_SIOC;
   c.pin_pwdn = CAM_PIN_PWDN;
   c.pin_reset = CAM_PIN_RESET;
+  // 16 MHz produced no JPEG at all (sig stayed 0) and the link never
+  // finished the handshake. 20 MHz is the clock that actually outputs frames.
   c.xclk_freq_hz = 20000000;
   c.pixel_format = PIXFORMAT_JPEG;
-  c.frame_size = FRAMESIZE_QVGA;
+  c.frame_size = FRAMESIZE_VGA;
   c.jpeg_quality = JPEG_QUALITY;
   c.fb_count = 2;
-  c.grab_mode = CAMERA_GRAB_LATEST;
+  // LATEST can hand back a buffer the sensor is still filling. That is a stripe.
+  c.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
   c.fb_location = CAMERA_FB_IN_PSRAM;
 
   esp_err_t e = esp_camera_init(&c);
@@ -1067,26 +1014,12 @@ static bool initCam() {
 
   sensor_t *s = esp_camera_sensor_get();
   if (s) {
-    s->set_brightness(s, 1);
-    s->set_contrast(s, 1);
+    s->set_brightness(s, 0);
+    s->set_contrast(s, 0);
     s->set_saturation(s, 0);
-    s->set_sharpness(s, 1);
-    s->set_denoise(s, 0);
-    s->set_framesize(s, FRAMESIZE_QVGA);
     s->set_quality(s, LIVE_JPEG_Q);
     s->set_vflip(s, CAM_VFLIP);
     s->set_hmirror(s, CAM_HMIRROR);
-    s->set_gainceiling(s, GAINCEILING_16X);
-    s->set_aec2(s, 0);
-    s->set_ae_level(s, 1);
-    s->set_aec_value(s, 200);
-    s->set_whitebal(s, 1);
-    s->set_awb_gain(s, 1);
-    s->set_wb_mode(s, 0);
-    s->set_dcw(s, 1);
-    s->set_special_effect(s, 0);
-    s->set_lenc(s, 1);
-    s->set_raw_gma(s, 1);
   }
 
   Serial.printf("[CAM] live VGA %dx%d q=%d @ %d FPS · record HD %dx%d q=%d @ %d FPS\n",
@@ -1176,26 +1109,8 @@ static void audioTxTask(void *) {
     // fight for the few lwIP sockets on a filtered meeting LAN.
     if (wsConnected) startAudioWebSocket();
     // Finish a half-sent mic frame before loop() writes anything else.
-    // A leftover tail on a new socket makes the server close it at once.
     if (audioWsConnected && audioLen && audioOff) {
-      static size_t stallOff = 0;
-      static uint32_t stallAt = 0;
-      int pr = pumpAudio();
-      if (pr == 0) {
-        if (audioOff != stallOff) {
-          stallOff = audioOff;
-          stallAt = millis();
-        } else if (!stallAt) {
-          stallAt = millis();
-        } else if (millis() - stallAt > 200) {
-          audioLen = 0;
-          audioOff = 0;
-          stallAt = 0;
-          ++txAudioDrops;
-        }
-      } else {
-        stallAt = 0;
-      }
+      pumpAudio();
       vTaskDelay(pdMS_TO_TICKS(1));
       continue;
     }
@@ -1288,6 +1203,81 @@ static void houseKeepTask(void *) {
 }
 
 // ============================================================
+// CAMERA GRAB — this task is the only one allowed to call fb_get.
+// The websocket task must not block here or the link drops.
+// ============================================================
+static void camGrabTask(void *) {
+  uint32_t prevSig = 0;
+  int same = 0;
+  uint32_t lastKick = 0;
+  uint32_t lastGood = millis();
+  for (;;) {
+    camera_fb_t *fb = esp_camera_fb_get();
+    if (!fb) {
+      if (millis() - lastGood > 5000) {
+        lastGood = millis();
+        Serial.println("[CAM] stalled — restart sensor");
+        esp_camera_deinit();
+        camIsHd = false;
+        initCam();
+      }
+      vTaskDelay(pdMS_TO_TICKS(30));
+      continue;
+    }
+    size_t len = fb->len;
+    bool ok = grabBuf && grabMu && fb->buf && fb->width >= 160 && fb->height >= 120 &&
+              fb->width <= 1280 && fb->height <= 720 &&
+              len > 128 && len <= txPacketCap && len <= 48000;
+    if (ok) {
+      // Look for FFD9 anywhere. Checking only the last 32 bytes threw
+      // away later frames, grabSeq froze, and the dashboard stayed black.
+      size_t end = jpegTrim(fb->buf, len);
+      if (!end) ok = false;
+      else len = end;
+    }
+    if (!ok) {
+      static uint32_t lastBad = 0;
+      if (millis() - lastBad > 2000) {
+        lastBad = millis();
+        Serial.printf("[CAM] drop len=%u\n", (unsigned)fb->len);
+      }
+    }
+    if (ok) {
+      uint32_t sig = (uint32_t)len * 16777619u;
+      size_t step = len / 8;
+      if (step < 1) step = 1;
+      for (size_t i = 0; i < 8 && i * step < len; i++) sig = sig * 16777619u ^ fb->buf[i * step];
+      if (xSemaphoreTake(grabMu, pdMS_TO_TICKS(40)) == pdTRUE) {
+        memcpy(grabBuf, fb->buf, len);
+        grabLen = len;
+        grabSeq++;
+        jpegSig = sig;
+        lastGood = millis();
+        xSemaphoreGive(grabMu);
+      }
+      if (sig == prevSig) {
+        if (++same >= 30 && millis() - lastKick > 20000) {
+          lastKick = millis();
+          same = 0;
+          Serial.printf("[CAM] frozen sig=%08x bytes=%u — restart sensor\n", sig, (unsigned)len);
+          esp_camera_fb_return(fb);
+          esp_camera_deinit();
+          camIsHd = false;
+          initCam();
+          continue;
+        }
+      } else {
+        same = 0;
+        prevSig = sig;
+      }
+    } else {
+      vTaskDelay(pdMS_TO_TICKS(20));
+    }
+    esp_camera_fb_return(fb);
+  }
+}
+
+// ============================================================
 // VIDEO / WS TX — only this task touches WebSocketsClient.
 // ============================================================
 
@@ -1301,8 +1291,15 @@ static void streamTxTask(void *) {
       stopWebSocket();
       wsLen = 0;
       wsUpAt = 0;
-      drainCamFb();
       vTaskDelay(pdMS_TO_TICKS(200));
+      continue;
+    }
+
+    // Finish the JPEG before loop(). loop() peeks the socket and was
+    // resetting the link ("Connection lost") in the middle of a frame.
+    if (wsLen) {
+      pumpVideo();
+      vTaskDelay(pdMS_TO_TICKS(4));
       continue;
     }
 
@@ -1312,32 +1309,21 @@ static void streamTxTask(void *) {
 
     streamWs.loop();
     udpService();
-    if (wsLen) {
-      pumpVideo();
-      vTaskDelay(pdMS_TO_TICKS(2));
-      continue;
-    }
     if (wsConnected) {
       if (!wsUpAt) wsUpAt = millis();
     } else {
       wsUpAt = 0;
     }
 
-    // JPEG leaves on UDP. The video socket is only the online flag.
-    // A dropped socket must not freeze the picture.
-    ensureCamProfile(false);
+    // Whole JPEG on the video socket. UDP pieces were arriving torn.
     const uint32_t framePeriod = 1000 / LIVE_FPS;
 
     uint32_t now = millis();
     if ((int32_t)(now - nextFrame) >= 0) {
       bool sent = false;
-#if RT_STREAM
-      bool hold = false;
-#else
       bool hold = !wsConnected || (millis() - wsUpAt) < 500;
-#endif
       if (!visualOn() || hold) {
-        drainCamFb();
+        sent = false;
       } else {
         sent = sendVideoFrame();
       }
@@ -1396,18 +1382,25 @@ void setup() {
     txPacketCap = 0;
     Serial.println("[WS] tx buffer alloc failed");
   }
-  udpRememberInit();
-  wsFrameCap = txPacketCap ? txPacketCap + 16 : 0;
-  if (wsFrameCap) {
-    wsFrame = (uint8_t *)heap_caps_malloc(wsFrameCap, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!wsFrame) wsFrame = (uint8_t *)malloc(wsFrameCap);
+  grabMu = xSemaphoreCreateMutex();
+  if (txPacketCap) {
+    grabBuf = (uint8_t *)heap_caps_malloc(txPacketCap, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!grabBuf) grabBuf = (uint8_t *)malloc(txPacketCap);
   }
+  if (!grabBuf) Serial.println("[CAM] grab buffer alloc failed");
+  udpRememberInit();
+  // Internal RAM. A PSRAM send buffer was what the Wi-Fi stack aborted
+  // ("Connection lost") after each JPEG. 16 KB covers a live VGA frame.
+  wsFrameCap = 40 * 1024;
+  wsFrame = (uint8_t *)heap_caps_malloc(wsFrameCap, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  if (!wsFrame) wsFrame = (uint8_t *)malloc(wsFrameCap);
   if (!wsFrame) {
     wsFrameCap = 0;
     Serial.println("[WS] frame buffer alloc failed");
   }
   streamEnabled = true;
-  xTaskCreatePinnedToCore(streamTxTask, "streamtx", 12288, nullptr, 4, nullptr, 1);
+  xTaskCreatePinnedToCore(camGrabTask, "camgrab", 8192, nullptr, 3, nullptr, 1);
+  xTaskCreatePinnedToCore(streamTxTask, "streamtx", 12288, nullptr, 4, nullptr, 0);
 
   initMic();
 
