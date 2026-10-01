@@ -1,0 +1,27 @@
+services:
+  mediamtx:
+    image: bluenviron/mediamtx:1.11.3
+    container_name: bodycam-mediamtx
+    restart: unless-stopped
+    volumes:
+      - ./mediamtx.yml:/mediamtx.yml:ro
+    ports:
+      - "8189:8189/udp"
+      - "8889:8889"
+
+  gateway:
+    build: .
+    container_name: bodycam-rt
+    restart: unless-stopped
+    depends_on:
+      - mediamtx
+    environment:
+      RT_TOKEN: X01040688
+      RT_WEB: /web
+      RT_LISTEN: :50310
+      RT_HTTP: :9090
+      RT_RTSP: rtsp://mediamtx:8554
+      RT_MEDIAMTX: http://mediamtx:8889
+    ports:
+      - "50310:50310/udp"
+      - "9090:9090"

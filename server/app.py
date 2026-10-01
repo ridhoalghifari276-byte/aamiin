@@ -90,12 +90,16 @@ def _event_loop_watchdog():
             os._exit(1)
 
 
-# Signaling stays on TCP 7890. Media is UDP 50300 for every bodycam, same split
-# as the Stream SDK: a late packet is dropped instead of blocking the next frame.
+# Signaling stays on TCP 7890. Media is UDP 50300. A missing piece is
+# asked for once (same idea as WebRTC NACK) instead of freezing the last JPEG.
 UDP_MEDIA_PORT = int(os.getenv("BODYCAM_UDP_PORT", "50300"))
 _UDP_HDR = 38
+_UDP_NACK_AFTER = 0.13
+_UDP_HOLD = 0.45
 _udp_parts: dict[tuple, dict] = {}
+_udp_done: dict[tuple, float] = {}
 _udp_frames = 0
+_udp_nacks = 0
 _udp_logged = False
 
 
@@ -109,6 +113,45 @@ def _udp_finish(kind: int, device: str, blob: bytes):
     _udp_touch_radio(device)
     if _udp_frames and _udp_frames % 100 == 0:
         print(f"[udp] frames={_udp_frames} device={device}", flush=True)
+
+
+def _udp_mark_done(device: str, kind: int, seq: int):
+    now = time.monotonic()
+    _udp_done[(device, kind, seq)] = now
+    if len(_udp_done) > 240:
+        for key, at in list(_udp_done.items()):
+            if now - at > 2.0:
+                _udp_done.pop(key, None)
+
+
+def _udp_repair(sock: socket.socket):
+    global _udp_nacks
+    now = time.monotonic()
+    for key, slot in list(_udp_parts.items()):
+        age = now - slot["t0"]
+        missing = [i for i in range(slot["n"]) if i not in slot["parts"]]
+        if (
+            missing
+            and slot.get("addr")
+            and slot["nacks"] < 2
+            and age >= _UDP_NACK_AFTER
+            and now - slot["nack_at"] >= 0.12
+        ):
+            pkt = b"BCN1" + bytes([1, missing[0]]) + int(slot["seq"]).to_bytes(2, "little")
+            try:
+                sock.sendto(pkt, slot["addr"])
+                slot["nacks"] += 1
+                slot["nack_at"] = now
+                _udp_nacks += 1
+                if _udp_nacks <= 8 or _udp_nacks % 50 == 0:
+                    print(
+                        f"[udp] nack {key[0]} seq={slot['seq']} idx={missing[0]}",
+                        flush=True,
+                    )
+            except OSError:
+                pass
+        if age > _UDP_HOLD:
+            _udp_parts.pop(key, None)
 
 
 def _on_udp_media(data: bytes, addr):
@@ -131,20 +174,29 @@ def _on_udp_media(data: bytes, addr):
         _udp_logged = True
         print(f"[udp] media from {addr[0]}:{addr[1]} device={device}", flush=True)
     now = time.monotonic()
+    done_key = (device, kind, seq)
+    if done_key in _udp_done:
+        return
     if len(_udp_parts) > 48:
         _udp_parts.clear()
-    else:
-        stale = [k for k, v in _udp_parts.items() if now - v["t"] > 0.15]
-        for key in stale:
-            _udp_parts.pop(key, None)
     if nchunks == 1:
+        _udp_mark_done(device, kind, seq)
         _udp_finish(kind, device, payload)
         return
     key = (device, kind, seq)
     slot = _udp_parts.get(key)
     if slot is None or slot["n"] != nchunks:
-        slot = {"t": now, "n": nchunks, "parts": {}}
+        slot = {
+            "t0": now,
+            "n": nchunks,
+            "seq": seq,
+            "parts": {},
+            "addr": addr,
+            "nacks": 0,
+            "nack_at": 0.0,
+        }
         _udp_parts[key] = slot
+    slot["addr"] = addr
     slot["parts"][idx] = payload
     if len(slot["parts"]) != nchunks:
         return
@@ -154,6 +206,7 @@ def _on_udp_media(data: bytes, addr):
         _udp_parts.pop(key, None)
         return
     _udp_parts.pop(key, None)
+    _udp_mark_done(device, kind, seq)
     _udp_finish(kind, device, blob)
 
 
@@ -171,6 +224,73 @@ def _udp_touch_radio(device: str):
         print(f"[udp] standby {device}: {e}", flush=True)
 
 
+_BCRT_HDR = 48
+_bcrt_asm: dict[tuple, dict] = {}
+
+
+def _bcrt_newer(a: int, b: int) -> bool:
+    return 0 < ((a - b) & 0xFFFF) < 0x8000
+
+
+def _on_bcrt(data: bytes, addr, sock: socket.socket):
+    if len(data) < _BCRT_HDR or data[4] != 1:
+        return
+    tok = data[36:48].split(b"\x00", 1)[0].decode("ascii", "ignore")
+    if tok != TOKEN:
+        return
+    kind = data[5]
+    nchunks = data[7]
+    frame = int.from_bytes(data[14:16], "little")
+    plen = int.from_bytes(data[16:18], "little")
+    idx = data[18]
+    device = data[20:36].split(b"\x00", 1)[0].decode("ascii", "ignore").strip()
+    if (
+        not device
+        or nchunks < 1
+        or nchunks > 8
+        or idx >= nchunks
+        or _BCRT_HDR + plen > len(data)
+    ):
+        return
+    payload = data[_BCRT_HDR : _BCRT_HDR + plen]
+    if kind == 3:
+        _udp_touch_radio(device)
+        reply = bytearray(_BCRT_HDR + 1)
+        reply[0:4] = b"BCRT"
+        reply[4] = 1
+        reply[5] = 4
+        reply[6] = 1
+        reply[7] = 1
+        reply[16] = 1
+        try:
+            sock.sendto(reply, addr)
+        except OSError:
+            pass
+        return
+    if kind == 2:
+        # Mic for the dashboard and the HT still arrives on /ws/audio.
+        return
+    if kind != 1:
+        return
+    now = time.monotonic()
+    for key in list(_bcrt_asm):
+        if key[0] != device:
+            continue
+        old = _bcrt_asm[key]
+        if _bcrt_newer(frame, key[1]) or now - old["t"] > 0.12:
+            _bcrt_asm.pop(key, None)
+    slot = _bcrt_asm.get((device, frame))
+    if slot is None or slot["n"] != nchunks:
+        slot = {"n": nchunks, "t": now, "parts": {}}
+        _bcrt_asm[(device, frame)] = slot
+    slot["parts"][idx] = payload
+    if len(slot["parts"]) != nchunks or any(i not in slot["parts"] for i in range(nchunks)):
+        return
+    blob = b"".join(slot["parts"][i] for i in range(nchunks))
+    _bcrt_asm.pop((device, frame), None)
+    _udp_finish(1, device, blob)
+
+
 def _udp_thread():
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
@@ -180,14 +300,25 @@ def _udp_thread():
         print(f"[udp] bind {UDP_MEDIA_PORT} failed: {e} — HT stays on TCP", flush=True)
         sock.close()
         return
+    sock.settimeout(0.02)
     print(f"[udp] listening 0.0.0.0:{UDP_MEDIA_PORT}", flush=True)
     while True:
         try:
-            data, addr = sock.recvfrom(2048)
-            _on_udp_media(data, addr)
+            data, addr = sock.recvfrom(8192)
+            if len(data) >= 4 and data[:4] == b"BCRT":
+                _on_bcrt(data, addr, sock)
+            else:
+                _on_udp_media(data, addr)
+        except socket.timeout:
+            pass
         except Exception as e:
             print(f"[udp] {e}", flush=True)
             time.sleep(0.2)
+            continue
+        try:
+            _udp_repair(sock)
+        except Exception as e:
+            print(f"[udp] nack {e}", flush=True)
 
 
 def _start_udp_media():
@@ -1080,6 +1211,9 @@ def enqueue_frame(item: tuple):
 
 def accept_jpeg(device: str, data: bytes, session_id: str | None, session_mode: str | None):
     """LD frames go straight to viewers. HD record frames are preview-scaled off-loop."""
+    # A torn piece still starts with FFD8 and the browser paints a color strip.
+    if len(data) < 128 or data[:2] != b"\xff\xd8" or data[-2:] != b"\xff\xd9":
+        return
     now = time.time()
     heavy = len(data) > LIVE_PREVIEW_MAX
     if not heavy:

@@ -26,12 +26,17 @@
 // Media follows the zip: signaling stays on TCP 7890, pictures and mic use UDP.
 // One port for every bodycam. 50300 is inside the open range 50300-50400.
 #define MEDIA_UDP_PORT  50300
+// Live video uses BCRT on the same UDP port the gateway already has open.
+// /ws/audio stays up for the HT radio.
+#define RT_STREAM       1
+#define RT_UDP_PORT     50300
 
 #define DEVICE_ID       "bodycam-01"
 #define SERVER_TOKEN    "X01040688"
 
 // ============================================================
-// CAMERA - ESP32-S3 CAM N16R8 / OV2640
+// CAMERA - ESP32-S3 CAM N16R8, DVP. OV5640 uses this same connector.
+// OV2640 is what is on the board today; the driver reads the sensor id.
 // ============================================================
 #define CAM_PIN_PWDN    -1
 #define CAM_PIN_RESET   -1
@@ -61,8 +66,8 @@
 // ============================================================
 #define LIVE_WIDTH      320
 #define LIVE_HEIGHT     240
-#define LIVE_JPEG_Q     24
-#define LIVE_FPS        15
+#define LIVE_JPEG_Q     52
+#define LIVE_FPS        10
 #define REC_WIDTH       320
 #define REC_HEIGHT      240
 #define REC_JPEG_Q      24

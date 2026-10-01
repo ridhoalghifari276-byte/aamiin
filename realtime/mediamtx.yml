@@ -1,0 +1,17 @@
+logLevel: info
+rtsp: yes
+rtspAddress: :8554
+rtsps: no
+rtmp: no
+hls: no
+srt: no
+webrtc: yes
+webrtcAddress: :8889
+webrtcLocalUDPAddress: :8189
+webrtcAdditionalHosts:
+  - 45.250.101.17
+webrtcICEServers2:
+  - url: stun:stun.l.google.com:19302
+api: no
+paths:
+  all_others:

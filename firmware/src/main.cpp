@@ -2,19 +2,22 @@
 #define WEBSOCKETS_TCP_TIMEOUT (80)
 #include <Arduino.h>
 #include <WiFi.h>
-#include <WiFiUdp.h>
+#include <fcntl.h>
+#include <errno.h>
 #include <HTTPClient.h>
 #include <WiFiClient.h>
 #include <WebSocketsClient.h>
 #include <lwip/sockets.h>
 #include <esp_wifi.h>
 #include <esp_camera.h>
+#include <esp_cache.h>
 #include <esp_heap_caps.h>
 #include <driver/i2s.h>
 #include <Adafruit_NeoPixel.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
 #include "config.h"
+#include "rt_proto.h"
 #include "portal.h"
 #include "gps.h"
 #include "speaker.h"
@@ -23,7 +26,8 @@
 // ESP32 BODYCAM
 //
 // Audio: INMP441 >>14 into a PSRAM ring, WebSocket PCM on /ws/audio.
-// Video: VGA JPEG over /ws/device @ STREAM_FPS (full FOV).
+// Video: QVGA JPEG over UDP. A lost piece is sent again so the
+// dashboard does not keep the previous picture.
 // ============================================================
 
 static volatile bool streamEnabled = false;
@@ -38,9 +42,11 @@ static Adafruit_NeoPixel pixel(1, RGB_LED, NEO_GRB + NEO_KHZ800);
 static SemaphoreHandle_t stateMux = nullptr;
 static SemaphoreHandle_t txMu = nullptr;
 static SemaphoreHandle_t udpMu = nullptr;
-static WiFiUDP mediaUdp;
-static bool udpBegun = false;
 static uint16_t udpVideoSeq = 0;
+static uint8_t audioFrame[768];
+static size_t audioLen = 0;
+static size_t audioOff = 0;
+static uint32_t jpegSig = 0;
 
 // SO_SNDBUF is not supported on this lwIP (errno 109). A short write
 // timeout is what keeps one JPEG from holding the radio for seconds.
@@ -389,12 +395,15 @@ static void audioWsEvent(WStype_t type, uint8_t *payload, size_t length) {
     case WStype_CONNECTED:
       audioWsConnected = true;
       audioWs.tuneLink("audio");
-      audioWs.enableHeartbeat(15000, 3000, 2);
-      ringClear();  // start live, not with whatever piled up while offline
+      audioLen = 0;
+      audioOff = 0;
+      ringClear();
       Serial.println("[WS-AUDIO] connected");
       break;
     case WStype_DISCONNECTED:
       audioWsConnected = false;
+      audioLen = 0;
+      audioOff = 0;
       ringClear();
       Serial.println("[WS-AUDIO] disconnected");
       break;
@@ -472,9 +481,6 @@ static bool sendWsPacket(uint8_t type, const uint8_t *data, size_t len) {
 }
 
 // Voice goes out on its own socket, so it is never stuck behind a JPEG.
-static uint8_t audioFrame[768];
-static size_t audioLen = 0;
-static size_t audioOff = 0;
 static bool queueBin(uint8_t *dst, size_t cap, size_t *outLen, const uint8_t *payload, size_t len);
 
 static int pumpAudio() {
@@ -500,6 +506,9 @@ static bool sendAudioWs() {
   if (ringCount() < (size_t)AUDIO_TX_SAMPLES) return false;
   size_t n = ringPop(txBuf, AUDIO_TX_SAMPLES);
   if (!n) return false;
+#if RT_STREAM
+  rtSendPcm(txBuf, n, millis());
+#endif
   audioOff = 0;
   if (!queueBin(audioFrame, sizeof(audioFrame), &audioLen, (uint8_t *)txBuf, n * sizeof(int16_t))) {
     ++txAudioDrops;
@@ -545,15 +554,15 @@ static void drainCamFb() {
 
 static bool camIsHd = false;
 static int liveQ = LIVE_JPEG_Q;
+static bool initCam();
 
 static void tuneLiveSize(size_t jpegBytes, uint32_t sendMs) {
   (void)sendMs;
   if (camIsHd || jpegBytes < 128) return;
   int next = liveQ;
-  // Send time here is mostly the link RTT. Raising q on a 150 ms send
-  // only made the picture blockier.
-  if (jpegBytes > 16000 && liveQ < 36) next = liveQ + 1;
-  else if (jpegBytes < 8000 && liveQ > 24) next = liveQ - 1;
+  // Two 1200-byte UDP pieces. A third piece is what the network was dropping.
+  if (jpegBytes > 2400 && liveQ < 63) next = liveQ + 2 > 63 ? 63 : liveQ + 2;
+  else if (jpegBytes < 1400 && liveQ > 36) next = liveQ - 1;
   if (next == liveQ) return;
   liveQ = next;
   sensor_t *s = esp_camera_sensor_get();
@@ -633,27 +642,88 @@ static int pumpVideo() {
     if (!camIsHd) tuneLiveSize(lastJpegBytes, lastVideoSendMs);
     return 1;
   }
-  // A healthy frame on this link is ~150 ms. Cutting it at 350 ms closed
-  // the socket mid-message and the client reconnected in a loop.
-  if (millis() - wsT0 > 8000) {
-    Serial.printf("[WS] video send stuck %lums\n", (unsigned long)(millis() - wsT0));
+  if (wsOff == 0 && millis() - wsT0 > 200) {
     wsLen = 0;
-    ++txVideoDrops;
-    streamWs.disconnect();
-    wsConnected = false;
+    ++txVideoSkips;
     return -1;
   }
   return 0;
 }
 
-static bool udpSend(uint8_t type, uint16_t seq, uint8_t idx, uint8_t nchunks,
-                    const uint8_t *data, size_t len) {
-  if (!udpMu || !data || !len || len > 1100 || nchunks == 0) return false;
-  if (xSemaphoreTake(udpMu, pdMS_TO_TICKS(8)) != pdTRUE) return false;
-  uint8_t pkt[38 + 1100];
+static int udpFd = -1;
+static struct sockaddr_in udpAddr;
+
+static bool udpOpen() {
+  if (udpFd >= 0) return true;
+  IPAddress ip;
+  if (!ip.fromString(serverHost)) return false;
+  udpFd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+  if (udpFd < 0) return false;
+  int fl = fcntl(udpFd, F_GETFL, 0);
+  fcntl(udpFd, F_SETFL, fl | O_NONBLOCK);
+  memset(&udpAddr, 0, sizeof(udpAddr));
+  udpAddr.sin_family = AF_INET;
+  udpAddr.sin_port = htons(MEDIA_UDP_PORT);
+  uint8_t *d = (uint8_t *)&udpAddr.sin_addr.s_addr;
+  d[0] = ip[0];
+  d[1] = ip[1];
+  d[2] = ip[2];
+  d[3] = ip[3];
+  Serial.printf("[UDP] video -> %u.%u.%u.%u:%d intact\n", ip[0], ip[1], ip[2], ip[3], MEDIA_UDP_PORT);
+  return true;
+}
+
+// Each piece has its own DRAM buffer. Reusing one stack buffer while the
+// radio was still reading it tore the JPEG into the colored strip.
+static const size_t UDP_CHUNK = 1400;
+static const size_t UDP_PKT = 1440;
+static const int UDP_HOLD_N = 4;
+static const int UDP_HOLD_CHUNKS = 3;
+static uint8_t udpWire[UDP_HOLD_CHUNKS][UDP_PKT] __attribute__((aligned(4)));
+static uint8_t udpRepair[UDP_PKT] __attribute__((aligned(4)));
+static uint8_t *udpHoldBuf = nullptr;
+static struct {
+  uint16_t seq;
+  uint8_t n;
+  uint8_t nacks;
+  uint16_t len[UDP_HOLD_CHUNKS];
+} udpHold[UDP_HOLD_N];
+static uint8_t udpHoldPos = 0;
+
+static size_t jpegTrim(const uint8_t *p, size_t n) {
+  if (!p || n < 4 || p[0] != 0xFF || p[1] != 0xD8) return 0;
+  for (size_t i = n; i >= 2; i--) {
+    if (p[i - 2] == 0xFF && p[i - 1] == 0xD9) return i;
+  }
+  return 0;
+}
+
+static bool udpSendWire(uint8_t *pkt, size_t pktLen) {
+  if (!pkt || pktLen < 39 || pktLen > UDP_PKT || !udpOpen()) return false;
+  int lastErr = 0;
+  int lastN = 0;
+  for (int attempt = 0; attempt < 2; attempt++) {
+    lastN = sendto(udpFd, pkt, pktLen, MSG_DONTWAIT,
+                   (struct sockaddr *)&udpAddr, sizeof(udpAddr));
+    if (lastN == (int)pktLen) return true;
+    lastErr = errno;
+    if (lastErr != EAGAIN && lastErr != EWOULDBLOCK && lastErr != ENOMEM) break;
+    vTaskDelay(pdMS_TO_TICKS(8));
+  }
+  static uint32_t lastUdpLog = 0;
+  if (millis() - lastUdpLog > 2000) {
+    lastUdpLog = millis();
+    Serial.printf("[UDP] send fail n=%d errno=%d heap=%u\n",
+                  lastN, lastErr, (unsigned)ESP.getFreeHeap());
+  }
+  return false;
+}
+
+static void udpBuild(uint8_t *pkt, uint8_t idx, uint8_t nchunks, uint16_t seq,
+                     const uint8_t *data, size_t len) {
   memset(pkt, 0, 38);
   memcpy(pkt, "BCU1", 4);
-  pkt[4] = type;
+  pkt[4] = 1;
   pkt[5] = nchunks;
   pkt[6] = idx;
   pkt[8] = (uint8_t)seq;
@@ -663,17 +733,113 @@ static bool udpSend(uint8_t type, uint16_t seq, uint8_t idx, uint8_t nchunks,
   strncpy((char *)pkt + 12, deviceId.c_str(), 15);
   strncpy((char *)pkt + 28, SERVER_TOKEN, 9);
   memcpy(pkt + 38, data, len);
-  bool ok = false;
-  if (!udpBegun) udpBegun = mediaUdp.begin(MEDIA_UDP_PORT) == 1;
-  IPAddress ip;
-  if (udpBegun && ip.fromString(serverHost)) {
-    if (mediaUdp.beginPacket(ip, MEDIA_UDP_PORT)) {
-      size_t wr = mediaUdp.write(pkt, 38 + len);
-      ok = wr == 38 + len && mediaUdp.endPacket() == 1;
+}
+
+static uint8_t *udpHoldPtr(int slot, int idx) {
+  return udpHoldBuf + (size_t)(slot * UDP_HOLD_CHUNKS + idx) * UDP_CHUNK;
+}
+
+static void udpRememberInit() {
+  if (udpHoldBuf) return;
+  size_t bytes = (size_t)UDP_HOLD_N * UDP_HOLD_CHUNKS * UDP_CHUNK;
+  udpHoldBuf = (uint8_t *)heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (!udpHoldBuf) udpHoldBuf = (uint8_t *)malloc(bytes);
+  if (!udpHoldBuf) Serial.println("[UDP] hold alloc failed");
+}
+
+static int udpFindHold(uint16_t seq) {
+  for (int i = 0; i < UDP_HOLD_N; i++) {
+    if (udpHold[i].n && udpHold[i].seq == seq) return i;
+  }
+  return -1;
+}
+
+static void udpPollNack() {
+  if (udpFd < 0 || !udpHoldBuf) return;
+  uint8_t buf[16];
+  struct sockaddr_in from;
+  for (int k = 0; k < 4; k++) {
+    socklen_t fl = sizeof(from);
+    int n = recvfrom(udpFd, buf, sizeof(buf), MSG_DONTWAIT,
+                     (struct sockaddr *)&from, &fl);
+    if (n < 0) return;
+    if (n < 8 || memcmp(buf, "BCN1", 4) != 0) continue;
+    uint8_t idx = buf[5];
+    uint16_t seq = (uint16_t)buf[6] | ((uint16_t)buf[7] << 8);
+    int slot = udpFindHold(seq);
+    if (slot < 0 || idx >= udpHold[slot].n || udpHold[slot].nacks >= 2) continue;
+    size_t clen = udpHold[slot].len[idx];
+    if (!clen || clen > UDP_CHUNK) continue;
+    udpHold[slot].nacks++;
+    udpBuild(udpRepair, idx, udpHold[slot].n, seq, udpHoldPtr(slot, idx), clen);
+    if (udpSendWire(udpRepair, 38 + clen)) {
+      static uint32_t lastLog = 0;
+      if (millis() - lastLog > 800) {
+        lastLog = millis();
+        Serial.printf("[UDP] nack seq=%u idx=%u\n", seq, idx);
+      }
     }
   }
-  xSemaphoreGive(udpMu);
-  return ok;
+}
+
+static void udpService() {
+  udpPollNack();
+}
+
+static bool sendVideoUdp(const uint8_t *jpeg, size_t len) {
+  if (!jpeg || !udpHoldBuf || !udpOpen()) return false;
+  size_t nlen = jpegTrim(jpeg, len);
+  if (!nlen) {
+    static uint32_t lastLog = 0;
+    if (millis() - lastLog > 2000) {
+      lastLog = millis();
+      Serial.printf("[CAM] jpeg no eoi bytes=%u\n", (unsigned)len);
+    }
+    return false;
+  }
+  uint8_t nchunks = (uint8_t)((nlen + UDP_CHUNK - 1) / UDP_CHUNK);
+  if (nchunks == 0 || nchunks > UDP_HOLD_CHUNKS) {
+    tuneLiveSize(nlen, 0);
+    return false;
+  }
+  uint16_t seq = ++udpVideoSeq;
+  int slot = udpHoldPos;
+  udpHoldPos = (uint8_t)((udpHoldPos + 1) % UDP_HOLD_N);
+  udpHold[slot].seq = seq;
+  udpHold[slot].n = nchunks;
+  udpHold[slot].nacks = 0;
+  size_t off = 0;
+  size_t pktLen[UDP_HOLD_CHUNKS];
+  for (uint8_t i = 0; i < nchunks; i++) {
+    size_t n = nlen - off;
+    if (n > UDP_CHUNK) n = UDP_CHUNK;
+    udpHold[slot].len[i] = (uint16_t)n;
+    memcpy(udpHoldPtr(slot, i), jpeg + off, n);
+    udpBuild(udpWire[i], i, nchunks, seq, jpeg + off, n);
+    pktLen[i] = 38 + n;
+    off += n;
+  }
+  uint32_t t0 = millis();
+  bool all = true;
+  for (uint8_t i = 0; i < nchunks; i++) {
+    if (!udpSendWire(udpWire[i], pktLen[i])) all = false;
+    if (i + 1 < nchunks) vTaskDelay(pdMS_TO_TICKS(12));
+  }
+  lastVideoSendMs = millis() - t0;
+  lastJpegBytes = nlen;
+  if (!camIsHd) tuneLiveSize(nlen, lastVideoSendMs);
+  if (all) ++txVideoFrames;
+  else ++txVideoDrops;
+  return true;
+}
+
+static void freshenFb(void *buf, size_t len) {
+  if (!buf || len < 4) return;
+  const uintptr_t line = 64;
+  uintptr_t addr = (uintptr_t)buf;
+  uintptr_t start = addr & ~(line - 1);
+  uintptr_t end = (addr + len + line - 1) & ~(line - 1);
+  esp_cache_msync((void *)start, end - start, ESP_CACHE_MSYNC_FLAG_DIR_M2C);
 }
 
 static bool sendVideoFrame() {
@@ -683,36 +849,75 @@ static bool sendVideoFrame() {
     return false;
   }
   size_t len = fb->len;
-  bool copy_ok = visualOn() && txPacket && len > 128 && len <= txPacketCap;
-  if (copy_ok) memcpy(txPacket, fb->buf, len);
-  esp_camera_fb_return(fb);
-  if (!copy_ok) {
-    ++txVideoDrops;
-    return false;
-  }
-  const size_t CHUNK = 1100;
-  uint8_t nchunks = (uint8_t)((len + CHUNK - 1) / CHUNK);
-  if (nchunks == 0 || nchunks > 16) {
-    ++txVideoDrops;
-    return false;
-  }
-  uint16_t seq = ++udpVideoSeq;
-  uint32_t t0 = millis();
-  for (uint8_t i = 0; i < nchunks; i++) {
-    size_t off = (size_t)i * CHUNK;
-    size_t n = len - off;
-    if (n > CHUNK) n = CHUNK;
-    if (!udpSend(1, seq, i, nchunks, txPacket + off, n)) {
-      ++txVideoDrops;
-      ++txVideoSkips;
-      lastVideoSendMs = millis() - t0;
-      return false;
+  uint16_t fw = fb->width;
+  uint16_t fh = fb->height;
+  bool wrongSize = fw != 320 || fh != 240;
+  bool tooBig = len > 8000;
+  bool copy_ok = visualOn() && txPacket && !wrongSize && !tooBig &&
+                 len > 128 && len <= txPacketCap;
+  if (copy_ok) {
+    freshenFb(fb->buf, len);
+    memcpy(txPacket, fb->buf, len);
+    uint32_t sig = (uint32_t)len * 16777619u;
+    size_t step = len / 8;
+    if (step < 1) step = 1;
+    for (size_t i = 0; i < 8 && i * step < len; i++) sig = sig * 16777619u ^ txPacket[i * step];
+    jpegSig = sig;
+    static uint32_t prevSig = 0;
+    static int same = 0;
+    static uint32_t lastKick = 0;
+    if (sig == prevSig) {
+      if (++same >= 20 && millis() - lastKick > 20000) {
+        lastKick = millis();
+        same = 0;
+        Serial.printf("[CAM] frozen sig=%08x bytes=%u — restart sensor\n", sig, (unsigned)len);
+        esp_camera_fb_return(fb);
+        esp_camera_deinit();
+        camIsHd = false;
+        initCam();
+        ++txVideoDrops;
+        return false;
+      }
+    } else {
+      same = 0;
+      prevSig = sig;
     }
   }
-  lastVideoSendMs = millis() - t0;
-  lastJpegBytes = len;
+  esp_camera_fb_return(fb);
+  if (wrongSize) {
+    sensor_t *s = esp_camera_sensor_get();
+    if (s) {
+      s->set_framesize(s, FRAMESIZE_QVGA);
+      s->set_quality(s, liveQ);
+    }
+    Serial.printf("[CAM] size %ux%u — forced 320x240\n", fw, fh);
+    ++txVideoDrops;
+    return false;
+  }
+  if (!copy_ok) {
+    if (tooBig) tuneLiveSize(len, 0);
+    ++txVideoDrops;
+    return false;
+  }
+  // Whole JPEG, ending at FFD9, each piece in its own buffer.
+#if RT_STREAM
+  if (!rtSendJpeg(txPacket, len, millis())) {
+    ++txVideoDrops;
+    return false;
+  }
   ++txVideoFrames;
-  if (!camIsHd) tuneLiveSize(len, lastVideoSendMs);
+  lastJpegBytes = len;
+  return true;
+#endif
+  if (len > UDP_CHUNK * UDP_HOLD_CHUNKS) {
+    tuneLiveSize(len, 0);
+    ++txVideoDrops;
+    return false;
+  }
+  if (!sendVideoUdp(txPacket, len)) {
+    ++txVideoDrops;
+    return false;
+  }
   return true;
 }
 
@@ -970,6 +1175,13 @@ static void audioTxTask(void *) {
     // Open audio WS only after /ws/device is up so two handshakes do not
     // fight for the few lwIP sockets on a filtered meeting LAN.
     if (wsConnected) startAudioWebSocket();
+    // Finish a half-sent mic frame before loop() writes anything else.
+    // A leftover tail on a new socket makes the server close it at once.
+    if (audioWsConnected && audioLen && audioOff) {
+      pumpAudio();
+      vTaskDelay(pdMS_TO_TICKS(1));
+      continue;
+    }
     audioWs.loop();
 
     if (!(streamEnabled || audioEnabled || videoEnabled || pttHeld)) {
@@ -1028,7 +1240,7 @@ static void houseKeepTask(void *) {
     if (now - lastHb >= 5000) {
       lastHb = now;
       postDeviceState();
-      Serial.printf("[STAT] ws=%d aws=%d ptt=%d sos=%d gps=%d rx=%d sats=%d audio=%lu drops=%lu video=%lu drops=%lu skip=%lu send=%ums ring=%u RSSI=%d\n",
+      Serial.printf("[STAT] ws=%d aws=%d ptt=%d sos=%d gps=%d rx=%d sats=%d audio=%lu drops=%lu video=%lu drops=%lu skip=%lu send=%ums jpg=%u sig=%08x ring=%u RSSI=%d\n",
                     wsConnected,
                     audioWsConnected,
                     (int)pttHeld,
@@ -1042,9 +1254,18 @@ static void houseKeepTask(void *) {
                     (unsigned long)txVideoDrops,
                     (unsigned long)txVideoSkips,
                     (unsigned)lastVideoSendMs,
+                    (unsigned)lastJpegBytes,
+                    (unsigned)jpegSig,
                     (unsigned)ringCount(),
                     WiFi.RSSI());
+#if RT_STREAM
+      rtHeartbeat(WiFi.RSSI(), ESP.getFreeHeap());
+      rtAdaptCam();
+#endif
     }
+#if RT_STREAM
+    rtPoll();
+#endif
     vTaskDelay(pdMS_TO_TICKS(50));
   }
 }
@@ -1056,11 +1277,13 @@ static void houseKeepTask(void *) {
 // Video only. No HTTP, no audio — nothing here may block for more than a frame.
 static void streamTxTask(void *) {
   uint32_t nextFrame = millis();
+  uint32_t wsUpAt = 0;
 
   for (;;) {
     if (WiFi.status() != WL_CONNECTED) {
       stopWebSocket();
       wsLen = 0;
+      wsUpAt = 0;
       drainCamFb();
       vTaskDelay(pdMS_TO_TICKS(200));
       continue;
@@ -1071,21 +1294,34 @@ static void streamTxTask(void *) {
     esp_wifi_set_ps(WIFI_PS_NONE);
 
     streamWs.loop();
+    udpService();
+    if (wsLen) {
+      pumpVideo();
+      vTaskDelay(pdMS_TO_TICKS(2));
+      continue;
+    }
+    if (wsConnected) {
+      if (!wsUpAt) wsUpAt = millis();
+    } else {
+      wsUpAt = 0;
+    }
 
-    // JPEG goes out as UDP datagrams. A lost piece drops that frame only.
+    // JPEG leaves on UDP. This socket only stays up so the gateway
+    // still sees the bodycam as online.
     ensureCamProfile(false);
     const uint32_t framePeriod = 1000 / LIVE_FPS;
 
     uint32_t now = millis();
     if ((int32_t)(now - nextFrame) >= 0) {
       bool sent = false;
-      if (!visualOn()) {
+      bool hold = !wsConnected || (millis() - wsUpAt) < 500;
+      if (!visualOn() || hold) {
         drainCamFb();
       } else {
         sent = sendVideoFrame();
       }
       now = millis();
-      nextFrame = now + (sent ? framePeriod : 20);
+      nextFrame = now + (sent ? framePeriod : 80);
     }
 
     now = millis();
@@ -1119,6 +1355,10 @@ void setup() {
   bindPublicServer();
 
   if (!initCam()) rgb(255, 0, 255);
+#if RT_STREAM
+  rtBegin(serverHost.c_str(), deviceId.c_str(), SERVER_TOKEN);
+  rtApplyCam();
+#endif
   nightVision = false;
   applyCamNight(false);
   gpsBegin();
@@ -1135,6 +1375,7 @@ void setup() {
     txPacketCap = 0;
     Serial.println("[WS] tx buffer alloc failed");
   }
+  udpRememberInit();
   wsFrameCap = txPacketCap ? txPacketCap + 16 : 0;
   if (wsFrameCap) {
     wsFrame = (uint8_t *)heap_caps_malloc(wsFrameCap, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
