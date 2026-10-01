@@ -622,15 +622,6 @@ static int pumpVideo() {
     if (!camIsHd) tuneLiveSize(lastJpegBytes, lastVideoSendMs);
     return 1;
   }
-  // One frame that takes seconds freezes a moving picture. Drop it and
-  // reconnect instead of holding the radio for 2–4 s.
-  if (millis() - wsT0 > 400) {
-    wsLen = 0;
-    ++txVideoDrops;
-    streamWs.disconnect();
-    wsConnected = false;
-    return -1;
-  }
   if (wsOff == 0 && millis() - wsT0 > 200) {
     wsLen = 0;
     ++txVideoSkips;
@@ -1299,7 +1290,7 @@ static void streamTxTask(void *) {
     // resetting the link ("Connection lost") in the middle of a frame.
     if (wsLen) {
       pumpVideo();
-      vTaskDelay(pdMS_TO_TICKS(4));
+      vTaskDelay(pdMS_TO_TICKS(12));
       continue;
     }
 
