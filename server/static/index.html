@@ -492,7 +492,8 @@
     }
     .feed.active { border-color: var(--cyan); }
     .feed img,
-    .feed canvas.feed-video {
+    .feed canvas.feed-video,
+    .feed video.feed-video {
       position: absolute;
       inset: 0;
       width: 100%;
@@ -501,10 +502,11 @@
       object-position: center;
       display: block;
       background: #000;
-      z-index: 0;
+      z-index: 1;
     }
     .feed.blackout img,
-    .feed.blackout canvas.feed-video { visibility: hidden; }
+    .feed.blackout canvas.feed-video,
+    .feed.blackout video.feed-video { visibility: hidden; }
     .feed.blackout .feed-empty {
       display: grid;
       background: #000;
@@ -515,7 +517,8 @@
       border-color: rgba(156, 255, 122, 0.45);
     }
     /* Night vision is a GPU filter now: the server no longer re-encodes live frames. */
-    .feed.nightvision canvas.feed-video {
+    .feed.nightvision canvas.feed-video,
+    .feed.nightvision video.feed-video {
       filter: grayscale(1) brightness(1.3) contrast(1.2) sepia(1) hue-rotate(65deg) saturate(3.2);
     }
     .face-layer {
@@ -1440,7 +1443,9 @@
     let liveWs = null;
     let audioWs = null;
     let liveBlobUrl = null;
-    let liveRotate = 0;
+    let liveRotate = 270;
+    let lkRoom = null;
+    let lkGen = 0;
     const liveSpeakerEl = document.getElementById("live-speaker");
     let spectrumRaf = 0;
     let spectrumData = null;
@@ -1517,7 +1522,74 @@
       lastVisualLive = live;
     }
 
+    function applyLkBox(el) {
+      if (!el) return;
+      el.style.transformOrigin = "center center";
+      el.style.transform = liveRotate ? ("rotate(" + liveRotate + "deg)") : "";
+    }
+
+    function stopLiveKit() {
+      lkGen++;
+      if (lkRoom) {
+        try { lkRoom.disconnect(); } catch (_) {}
+        lkRoom = null;
+      }
+    }
+
+    async function startLiveKit(device) {
+      const gen = ++lkGen;
+      if (lkRoom) {
+        try { lkRoom.disconnect(); } catch (_) {}
+        lkRoom = null;
+      }
+      const f = feeds.get(device);
+      if (f && f.liveEl) f.liveEl.textContent = "LIVEKIT";
+      let info;
+      try {
+        const res = await fetch("/api/v1/livekit-token?device=" + encodeURIComponent(device));
+        if (!res.ok || gen !== lkGen) return;
+        info = await res.json();
+      } catch (_) {
+        return;
+      }
+      const { Room, RoomEvent } = await import("https://cdn.jsdelivr.net/npm/livekit-client@2.9.9/+esm");
+      if (gen !== lkGen) return;
+      const room = new Room();
+      lkRoom = room;
+      room.on(RoomEvent.TrackSubscribed, (track) => {
+        if (gen !== lkGen || !track || track.kind !== "video") return;
+        const box = feeds.get(device);
+        if (!box || !box.lkVideo) return;
+        track.attach(box.lkVideo);
+        applyLkBox(box.lkVideo);
+        box.lkVideo.style.display = "block";
+        if (box.liveCanvas) box.liveCanvas.style.visibility = "hidden";
+        box.empty.classList.add("hidden");
+        box.liveEl.textContent = "LIVE";
+      });
+      room.on(RoomEvent.Disconnected, () => {
+        if (lkRoom === room) lkRoom = null;
+        const box = feeds.get(device);
+        if (box && box.liveEl && gen === lkGen) box.liveEl.textContent = "LIVEKIT PUTUS";
+      });
+      try {
+        await room.connect(info.url, info.token);
+        if (gen !== lkGen) {
+          room.disconnect();
+          return;
+        }
+        const box = feeds.get(device);
+        if (box && box.liveEl && box.liveEl.textContent === "LIVEKIT") {
+          box.liveEl.textContent = "LIVEKIT …";
+        }
+      } catch (_) {
+        const box = feeds.get(device);
+        if (box && box.liveEl && gen === lkGen) box.liveEl.textContent = "LIVEKIT GAGAL";
+      }
+    }
+
     function stopLiveCall() {
+      stopLiveKit();
       if (liveRetryTimer) { clearTimeout(liveRetryTimer); liveRetryTimer = 0; }
       if (liveWs) {
         try { liveWs.close(); } catch (_) {}
@@ -1539,6 +1611,8 @@
     // Without this the canvas keeps the last frame and the FPS number freezes,
     // which reads as a slow live feed instead of a dead one.
     setInterval(() => {
+      const shown = feeds.get(currentDevice);
+      if (shown && shown.lkVideo && shown.lkVideo.style.display === "block") return;
       if (!lastFrameAt) return;
       if (performance.now() - lastFrameAt <= 2000) return;
       liveFps = 0;
@@ -1603,7 +1677,7 @@
           fpsFrames = 0;
           fpsTick = now;
         }
-        f.liveEl.textContent = liveBadge();
+        if (!(f.lkVideo && f.lkVideo.style.display === "block")) f.liveEl.textContent = liveBadge();
       } catch (_) {}
       jpegBusy = false;
       if (pendingJpeg) pumpLiveJpeg();
@@ -1620,6 +1694,7 @@
       liveFps = 0;
       fpsTick = 0;
       if (!device) return;
+      startLiveKit(device);
       const proto = location.protocol === "https:" ? "wss" : "ws";
       const ws = new WebSocket(
         proto + "://" + location.host + "/ws/live?device=" + encodeURIComponent(device)
@@ -1642,6 +1717,8 @@
             const msg = JSON.parse(ev.data);
             if (msg && msg.t === "cfg") {
               liveRotate = ((msg.rotate || 0) % 360 + 360) % 360;
+              const box = feeds.get(currentDevice);
+              if (box && box.lkVideo) applyLkBox(box.lkVideo);
               return;
             }
             if (msg && msg.t === "faces") {
@@ -2073,6 +2150,12 @@
 
       const liveCanvas = document.createElement("canvas");
       liveCanvas.className = "feed-video";
+      const lkVideo = document.createElement("video");
+      lkVideo.className = "feed-video";
+      lkVideo.autoplay = true;
+      lkVideo.playsInline = true;
+      lkVideo.muted = true;
+      lkVideo.style.display = "none";
 
       const faceLayer = document.createElement("div");
       faceLayer.className = "face-layer";
@@ -2097,6 +2180,7 @@
         '</div>';
 
       root.appendChild(tag);
+      root.appendChild(lkVideo);
       root.appendChild(liveCanvas);
       root.appendChild(img);
       root.appendChild(faceLayer);
@@ -2139,7 +2223,7 @@
         setFaceEnabled(!faceOn);
       });
 
-      const entry = { root, img, liveCanvas, empty, liveEl, canvas, btnSpeaker, btnRecA, btnRecV, btnFace, statusEl, faceLayer };
+      const entry = { root, img, liveCanvas, lkVideo, empty, liveEl, canvas, btnSpeaker, btnRecA, btnRecV, btnFace, statusEl, faceLayer };
       feeds.set(deviceId, entry);
       return entry;
     }
