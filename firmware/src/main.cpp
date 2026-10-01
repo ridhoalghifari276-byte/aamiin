@@ -64,14 +64,12 @@ class TunedWs : public WebSocketsClient {
   // One non-blocking slice. tcp->write() keeps going while any byte is
   // accepted, so a slow link held the camera task for seconds.
   int pushRaw(const uint8_t *data, size_t n) {
-    if (!_client.tcp || !data || !n) return -1;
+    if (!_client.tcp || !_client.tcp->connected() || !data || !n) return -1;
     int sock = _client.tcp->fd();
     if (sock < 0) return -1;
     int r = ::send(sock, data, n, MSG_DONTWAIT);
     if (r > 0) return r;
-    // Full Wi-Fi queue is not a dead socket. Treating it as one closed
-    // the link and the dashboard went back to NO SIGNAL.
-    if (r == 0 || errno == EAGAIN || errno == EWOULDBLOCK || errno == ENOMEM || errno == ENOBUFS) return 0;
+    if (r == 0 || errno == EAGAIN || errno == EWOULDBLOCK) return 0;
     return -1;
   }
 
@@ -1292,7 +1290,7 @@ static void streamTxTask(void *) {
     // resetting the link ("Connection lost") in the middle of a frame.
     if (wsLen) {
       pumpVideo();
-      vTaskDelay(pdMS_TO_TICKS(8));
+      vTaskDelay(pdMS_TO_TICKS(12));
       continue;
     }
 
