@@ -5,9 +5,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 COPY go.mod main.go ./
-RUN go get gopkg.in/hraban/opus.v2@latest \
-    && go mod tidy \
-    && CGO_ENABLED=1 go build -o /out/bridge .
+RUN go mod tidy && CGO_ENABLED=1 go build -o /out/bridge .
 
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \

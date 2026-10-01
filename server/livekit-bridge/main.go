@@ -15,7 +15,7 @@ import (
 	lksdk "github.com/livekit/server-sdk-go/v2"
 	"github.com/pion/webrtc/v4"
 	"github.com/pion/webrtc/v4/pkg/media"
-	opus "gopkg.in/hraban/opus.v2"
+	"github.com/hraban/opus"
 )
 
 const hdrLen = 48
@@ -266,7 +266,7 @@ func writeJPEG(w io.Writer, ch <-chan []byte, dead <-chan struct{}, finish func(
 	}
 }
 
-func writeOpus(enc *opus.Encoder, track *lksdk.LocalSampleTrack, ch <-chan []byte, dead <-chan struct{}) {
+func writeOpus(enc *opus.Encoder, track *lksdk.LocalTrack, ch <-chan []byte, dead <-chan struct{}) {
 	var pcm []int16
 	buf := make([]byte, 4000)
 	for {
@@ -302,7 +302,7 @@ func upsampleStereo(in []int16) []int16 {
 	return out
 }
 
-func readH264(r io.Reader, track *lksdk.LocalSampleTrack, finish func()) {
+func readH264(r io.Reader, track *lksdk.LocalTrack, finish func()) {
 	defer finish()
 	buf := make([]byte, 32*1024)
 	var rest []byte
