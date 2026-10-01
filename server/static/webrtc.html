@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Bodycam WebRTC</title>
+  <style>
+    body { margin: 0; background: #071016; color: #d7ece8; font-family: sans-serif; }
+    header { display: flex; gap: 12px; align-items: center; padding: 12px 16px; flex-wrap: wrap; }
+    a { color: #2ee6d6; }
+    input, button { font: inherit; padding: 8px 10px; }
+    button { background: #123; color: #2ee6d6; border: 1px solid #2ee6d6; cursor: pointer; }
+    #status { opacity: 0.85; }
+    #stage video { width: min(960px, 100%); background: #000; display: block; margin: 0 16px 16px; }
+  </style>
+</head>
+<body>
+  <header>
+    <a href="/">Dashboard</a>
+    <input id="device" value="bodycam-02" />
+    <button id="join" type="button">Masuk WebRTC</button>
+    <span id="status">belum tersambung</span>
+  </header>
+  <div id="stage"></div>
+  <script type="module">
+    import { Room, RoomEvent } from "https://cdn.jsdelivr.net/npm/livekit-client@2.9.9/+esm";
+    const params = new URLSearchParams(location.search);
+    const deviceInput = document.getElementById("device");
+    const status = document.getElementById("status");
+    const stage = document.getElementById("stage");
+    if (params.get("device")) deviceInput.value = params.get("device");
+    let room = null;
+    document.getElementById("join").onclick = async () => {
+      const device = (deviceInput.value || "bodycam-02").trim();
+      status.textContent = "minta token…";
+      if (room) room.disconnect();
+      stage.replaceChildren();
+      const res = await fetch("/api/v1/livekit-token?device=" + encodeURIComponent(device));
+      if (!res.ok) {
+        status.textContent = "token gagal " + res.status;
+        return;
+      }
+      const info = await res.json();
+      room = new Room();
+      room.on(RoomEvent.TrackSubscribed, (track) => {
+        const el = track.attach();
+        el.autoplay = true;
+        el.playsInline = true;
+        stage.appendChild(el);
+        status.textContent = "live " + info.room;
+      });
+      room.on(RoomEvent.Disconnected, () => { status.textContent = "putus"; });
+      try {
+        await room.connect(info.url, info.token);
+        status.textContent = "tersambung, menunggu gambar…";
+      } catch (err) {
+        status.textContent = "gagal: " + (err && err.message ? err.message : err);
+      }
+    };
+  </script>
+</body>
+</html>

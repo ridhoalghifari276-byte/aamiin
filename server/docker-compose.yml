@@ -34,6 +34,11 @@ services:
       AI_URL: http://ai-service:8001
       # ESP32-S3-CAM dipasang horizontal → putar frame agar tegak (0/90/180/270)
       CAMERA_ROTATE: "270"
+      # Copy of each finished frame. Ignored if the bridge container is down.
+      LIVEKIT_INGEST: livekit-bridge:50301
+      LIVEKIT_API_KEY: bodycam
+      LIVEKIT_API_SECRET: b7e2c9a14f6d4803ae51c8d07f3a9b26
+      LIVEKIT_PUBLIC_URL: ws://45.250.101.17:7891
     ports:
       - "7890:8080"
       - "50300:50300/udp"
@@ -45,6 +50,32 @@ services:
       timeout: 5s
       retries: 3
       start_period: 40s
+
+  # WebRTC for browsers. Does not take UDP 50300 or TCP 7890.
+  # Signaling is the spare port 7891. Media UDP stays inside 50300-50400.
+  livekit:
+    image: livekit/livekit-server:v1.8.4
+    container_name: bodycam-livekit
+    restart: unless-stopped
+    command: --config /etc/livekit.yaml
+    volumes:
+      - ./livekit.yaml:/etc/livekit.yaml:ro
+    ports:
+      - "7891:7880"
+      - "50320-50359:50320-50359/udp"
+
+  livekit-bridge:
+    build: ./livekit-bridge
+    container_name: bodycam-livekit-bridge
+    restart: unless-stopped
+    depends_on:
+      - livekit
+    environment:
+      LIVEKIT_URL: ws://livekit:7880
+      LIVEKIT_API_KEY: bodycam
+      LIVEKIT_API_SECRET: b7e2c9a14f6d4803ae51c8d07f3a9b26
+      LIVEKIT_TOKEN: X01040688
+      LISTEN: :50301
 
 volumes:
   insightface:

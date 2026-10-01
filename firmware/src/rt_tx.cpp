@@ -14,13 +14,14 @@
 #include "config.h"
 
 static const size_t RT_HDR = 48;
-static const size_t RT_CHUNK = 1100;
-static const int RT_MAX_CHUNKS = 8;
-static const uint16_t OV5640_SENSOR = 0x5640;
-// One DRAM buffer per piece. A single stack buffer was overwritten while
-// the radio was still sending, which tore the picture.
-static uint8_t rtPkt[RT_MAX_CHUNKS][RT_HDR + RT_CHUNK] __attribute__((aligned(4)));
+// Stay under one Wi-Fi packet. A 2400-byte datagram is split by IP,
+// sendto returns ENOMEM, and the two halves get mixed into a color strip.
+static const size_t RT_CHUNK = 1200;
+static const int RT_PIECES = 2;
+static const int RT_SLOTS = 4;
+static uint8_t rtPkt[RT_SLOTS][RT_PIECES][RT_HDR + RT_CHUNK] __attribute__((aligned(4)));
 static uint8_t rtSide[RT_HDR + RT_CHUNK] __attribute__((aligned(4)));
+static uint8_t rtSlot = 0;
 
 static int rtFd = -1;
 static struct sockaddr_in rtAddr;
@@ -92,29 +93,6 @@ static void rtFill(uint8_t *pkt, uint8_t type, uint8_t flags, uint8_t nchunks,
   if (len && data) memcpy(pkt + RT_HDR, data, len);
 }
 
-static bool rtSendBuilt(uint8_t *pkt, size_t pktLen) {
-  if (!rtMu || !rtOpen(nullptr) || pktLen < RT_HDR) return false;
-  bool ok = false;
-  if (xSemaphoreTake(rtMu, pdMS_TO_TICKS(20)) == pdTRUE) {
-    pkt[8] = (uint8_t)rtSeq;
-    pkt[9] = (uint8_t)(rtSeq >> 8);
-    rtSeq++;
-    for (int attempt = 0; attempt < 2 && !ok; attempt++) {
-      int n = sendto(rtFd, pkt, pktLen, MSG_DONTWAIT, (struct sockaddr *)&rtAddr, sizeof(rtAddr));
-      if (n == (int)pktLen) {
-        ok = true;
-        break;
-      }
-      if (errno != EAGAIN && errno != EWOULDBLOCK && errno != ENOMEM) break;
-      vTaskDelay(pdMS_TO_TICKS(4));
-    }
-    xSemaphoreGive(rtMu);
-  }
-  if (ok) rtOk++;
-  else rtFail++;
-  return ok;
-}
-
 static size_t rtJpegEnd(const uint8_t *p, size_t n) {
   if (!p || n < 4 || p[0] != 0xFF || p[1] != 0xD8) return 0;
   for (size_t i = n; i >= 2; i--) {
@@ -123,30 +101,58 @@ static size_t rtJpegEnd(const uint8_t *p, size_t n) {
   return 0;
 }
 
+static bool rtSendRaw(uint8_t *pkt, size_t pktLen) {
+  if (rtFd < 0 || pktLen < RT_HDR) return false;
+  for (int attempt = 0; attempt < 3; attempt++) {
+    int n = sendto(rtFd, pkt, pktLen, MSG_DONTWAIT, (struct sockaddr *)&rtAddr, sizeof(rtAddr));
+    if (n == (int)pktLen) return true;
+    if (errno != EAGAIN && errno != EWOULDBLOCK && errno != ENOMEM) return false;
+    vTaskDelay(pdMS_TO_TICKS(4));
+  }
+  return false;
+}
+
 bool rtSendJpeg(const uint8_t *jpeg, size_t len, uint32_t tsMs) {
   size_t n = rtJpegEnd(jpeg, len);
   if (!n) return false;
   int chunks = (int)((n + RT_CHUNK - 1) / RT_CHUNK);
-  // More than 8 pieces floods the 8 Wi-Fi TX slots. Drop the frame.
-  if (chunks < 1 || chunks > RT_MAX_CHUNKS) {
+  // Two pieces cover a normal 320x240 frame. A third piece is what got lost.
+  if (chunks < 1 || chunks > RT_PIECES) {
     rtFail++;
     return false;
   }
+  if (!rtMu || !rtOpen(nullptr)) return false;
+  uint8_t slot = rtSlot;
+  rtSlot = (uint8_t)((rtSlot + 1) % RT_SLOTS);
   uint16_t frame = rtFrame++;
   size_t off = 0;
-  size_t pktLen[RT_MAX_CHUNKS];
+  size_t pktLen[RT_PIECES];
+  if (xSemaphoreTake(rtMu, pdMS_TO_TICKS(20)) != pdTRUE) return false;
   for (int i = 0; i < chunks; i++) {
     size_t c = n - off;
     if (c > RT_CHUNK) c = RT_CHUNK;
     uint8_t flags = (i + 1 == chunks) ? 1 : 0;
-    rtFill(rtPkt[i], 1, flags, (uint8_t)chunks, frame, tsMs, (uint8_t)i, jpeg + off, c);
+    rtFill(rtPkt[slot][i], 1, flags, (uint8_t)chunks, frame, tsMs, (uint8_t)i, jpeg + off, c);
+    rtPkt[slot][i][8] = (uint8_t)rtSeq;
+    rtPkt[slot][i][9] = (uint8_t)(rtSeq >> 8);
+    rtSeq++;
     pktLen[i] = RT_HDR + c;
     off += c;
   }
+  xSemaphoreGive(rtMu);
   for (int i = 0; i < chunks; i++) {
-    if (!rtSendBuilt(rtPkt[i], pktLen[i])) return false;
-    if (i + 1 < chunks) vTaskDelay(pdMS_TO_TICKS(3));
+    if (!rtSendRaw(rtPkt[slot][i], pktLen[i])) {
+      rtFail++;
+      static uint32_t lastLog = 0;
+      if (millis() - lastLog > 2000) {
+        lastLog = millis();
+        Serial.printf("[RT] send fail errno=%d jpg=%u piece=%d/%d\n", errno, (unsigned)n, i, chunks);
+      }
+      return false;
+    }
+    if (i + 1 < chunks) vTaskDelay(pdMS_TO_TICKS(6));
   }
+  rtOk++;
   rtFrames++;
   rtFpsCount++;
   if (millis() - rtFpsTick >= 1000) {
@@ -233,40 +239,12 @@ int rtLevel() {
 }
 
 void rtAdaptCam() {
-  static int last = -1;
-  static uint32_t at = 0;
-  int lv = rtLevel();
-  if (lv == last || (last >= 0 && millis() - at < 5000)) return;
-  at = millis();
-  last = lv;
-  sensor_t *s = esp_camera_sensor_get();
-  if (!s) return;
-  bool big = s->id.PID == OV5640_SENSOR;
-  if (lv >= 2) {
-    if (big) s->set_framesize(s, FRAMESIZE_QVGA);
-    s->set_quality(s, 50);
-    Serial.println("[RT] network bad — 320x240 q=50");
-  } else if (lv == 1) {
-    if (big) s->set_framesize(s, FRAMESIZE_VGA);
-    s->set_quality(s, 42);
-    Serial.println("[RT] network medium — q=42");
-  } else if (big) {
-    s->set_framesize(s, FRAMESIZE_VGA);
-    s->set_quality(s, 32);
-    Serial.println("[RT] network good — 640x480 q=32");
-  }
+  // Leave quality to tuneLiveSize. Raising q here did not shrink the
+  // JPEG and the picture went to NO SIGNAL.
 }
 
 void rtApplyCam() {
   sensor_t *s = esp_camera_sensor_get();
   if (!s) return;
-  if (s->id.PID == OV5640_SENSOR) {
-    s->set_framesize(s, FRAMESIZE_VGA);
-    s->set_quality(s, 36);
-    Serial.println("[RT] OV5640 live 640x480 q=36");
-  } else {
-    s->set_framesize(s, FRAMESIZE_QVGA);
-    s->set_quality(s, 40);
-    Serial.printf("[RT] sensor 0x%04x is not OV5640 — live stays 320x240\n", s->id.PID);
-  }
+  Serial.printf("[RT] sensor 0x%04x — live stays 320x240\n", s->id.PID);
 }

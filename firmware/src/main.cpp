@@ -506,9 +506,6 @@ static bool sendAudioWs() {
   if (ringCount() < (size_t)AUDIO_TX_SAMPLES) return false;
   size_t n = ringPop(txBuf, AUDIO_TX_SAMPLES);
   if (!n) return false;
-#if RT_STREAM
-  rtSendPcm(txBuf, n, millis());
-#endif
   audioOff = 0;
   if (!queueBin(audioFrame, sizeof(audioFrame), &audioLen, (uint8_t *)txBuf, n * sizeof(int16_t))) {
     ++txAudioDrops;
@@ -560,8 +557,8 @@ static void tuneLiveSize(size_t jpegBytes, uint32_t sendMs) {
   (void)sendMs;
   if (camIsHd || jpegBytes < 128) return;
   int next = liveQ;
-  // Two 1200-byte UDP pieces. A third piece is what the network was dropping.
-  if (jpegBytes > 2400 && liveQ < 63) next = liveQ + 2 > 63 ? 63 : liveQ + 2;
+  // Two UDP pieces of 1200. Anything larger is dropped before it can tear.
+  if (jpegBytes > 2200 && liveQ < 63) next = liveQ + 2 > 63 ? 63 : liveQ + 2;
   else if (jpegBytes < 1400 && liveQ > 36) next = liveQ - 1;
   if (next == liveQ) return;
   liveQ = next;
@@ -901,10 +898,13 @@ static bool sendVideoFrame() {
   }
   // Whole JPEG, ending at FFD9, each piece in its own buffer.
 #if RT_STREAM
-  if (!rtSendJpeg(txPacket, len, millis())) {
+  uint32_t t0 = millis();
+  if (!rtSendJpeg(txPacket, len, t0)) {
+    if (len > 2200) tuneLiveSize(len, 0);
     ++txVideoDrops;
     return false;
   }
+  lastVideoSendMs = millis() - t0;
   ++txVideoFrames;
   lastJpegBytes = len;
   return true;
@@ -1178,7 +1178,24 @@ static void audioTxTask(void *) {
     // Finish a half-sent mic frame before loop() writes anything else.
     // A leftover tail on a new socket makes the server close it at once.
     if (audioWsConnected && audioLen && audioOff) {
-      pumpAudio();
+      static size_t stallOff = 0;
+      static uint32_t stallAt = 0;
+      int pr = pumpAudio();
+      if (pr == 0) {
+        if (audioOff != stallOff) {
+          stallOff = audioOff;
+          stallAt = millis();
+        } else if (!stallAt) {
+          stallAt = millis();
+        } else if (millis() - stallAt > 200) {
+          audioLen = 0;
+          audioOff = 0;
+          stallAt = 0;
+          ++txAudioDrops;
+        }
+      } else {
+        stallAt = 0;
+      }
       vTaskDelay(pdMS_TO_TICKS(1));
       continue;
     }
@@ -1306,15 +1323,19 @@ static void streamTxTask(void *) {
       wsUpAt = 0;
     }
 
-    // JPEG leaves on UDP. This socket only stays up so the gateway
-    // still sees the bodycam as online.
+    // JPEG leaves on UDP. The video socket is only the online flag.
+    // A dropped socket must not freeze the picture.
     ensureCamProfile(false);
     const uint32_t framePeriod = 1000 / LIVE_FPS;
 
     uint32_t now = millis();
     if ((int32_t)(now - nextFrame) >= 0) {
       bool sent = false;
+#if RT_STREAM
+      bool hold = false;
+#else
       bool hold = !wsConnected || (millis() - wsUpAt) < 500;
+#endif
       if (!visualOn() || hold) {
         drainCamFb();
       } else {

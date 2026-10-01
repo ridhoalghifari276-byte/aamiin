@@ -162,7 +162,7 @@
       display: block !important;
     }
     .side-nav { display: flex; flex-direction: column; gap: 0.4rem; }
-    .nav-btn {
+    .nav-btn, .nav-link {
       text-align: left;
       font-family: "Rajdhani", sans-serif;
       font-weight: 600;
@@ -180,6 +180,7 @@
       color: var(--cyan);
       background: rgba(46, 230, 214, 0.1);
     }
+    .nav-link { display: block; text-decoration: none; }
     .device-chips {
       display: flex;
       flex-wrap: wrap;
@@ -1202,6 +1203,7 @@
         <h2>Navigasi</h2>
         <nav class="side-nav">
           <button type="button" class="nav-btn active" data-view="live">Live Camera</button>
+          <a class="nav-link" href="/webrtc?device=bodycam-02">LiveKit WebRTC</a>
           <button type="button" class="nav-btn" data-view="videos">Video rekaman</button>
           <button type="button" class="nav-btn" data-view="faces">Wajah tercapture</button>
           <button type="button" class="nav-btn" data-view="registry">Wajah terdaftar</button>

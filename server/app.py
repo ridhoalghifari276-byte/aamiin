@@ -93,6 +93,128 @@ def _event_loop_watchdog():
 # Signaling stays on TCP 7890. Media is UDP 50300. A missing piece is
 # asked for once (same idea as WebRTC NACK) instead of freezing the last JPEG.
 UDP_MEDIA_PORT = int(os.getenv("BODYCAM_UDP_PORT", "50300"))
+# Optional copy of an already-reassembled frame into the LiveKit bridge.
+# Empty disables it. A down bridge must not affect the dashboard or the HT.
+LIVEKIT_INGEST = os.getenv("LIVEKIT_INGEST", "").strip()
+LIVEKIT_API_KEY = os.getenv("LIVEKIT_API_KEY", "bodycam").strip()
+LIVEKIT_API_SECRET = os.getenv("LIVEKIT_API_SECRET", "").strip()
+LIVEKIT_PUBLIC_URL = os.getenv("LIVEKIT_PUBLIC_URL", "ws://45.250.101.17:7891").strip()
+_lk_q: queue.Queue = queue.Queue(maxsize=32)
+_lk_frame = defaultdict(int)
+_lk_seq = 0
+
+
+def livekit_submit(kind: int, device: str, data: bytes):
+    """Hand a finished JPEG or PCM chunk to the bridge. Never blocks the ingest path."""
+    if not LIVEKIT_INGEST or not device or not data or len(data) > 64000:
+        return
+    item = (kind, device, bytes(data))
+    try:
+        _lk_q.put_nowait(item)
+    except queue.Full:
+        try:
+            _lk_q.get_nowait()
+        except queue.Empty:
+            pass
+        try:
+            _lk_q.put_nowait(item)
+        except queue.Full:
+            pass
+
+
+def _lk_packets(kind: int, device: str, payload: bytes) -> list[bytes]:
+    global _lk_seq
+    chunk = 1000
+    n = (len(payload) + chunk - 1) // chunk
+    if n < 1 or n > 8:
+        return []
+    _lk_frame[device] = (_lk_frame[device] + 1) & 0xFFFF
+    frame = _lk_frame[device]
+    now_ms = int(time.time() * 1000) & 0xFFFFFFFF
+    dev = device.encode("ascii", "ignore")[:16]
+    tok = TOKEN.encode("ascii", "ignore")[:12]
+    out = []
+    for i in range(n):
+        part = payload[i * chunk : (i + 1) * chunk]
+        pkt = bytearray(48 + len(part))
+        pkt[0:4] = b"BCRT"
+        pkt[4] = 1
+        pkt[5] = kind & 0xFF
+        pkt[6] = 1 if i + 1 == n else 0
+        pkt[7] = n
+        struct.pack_into("<H", pkt, 8, _lk_seq & 0xFFFF)
+        struct.pack_into("<I", pkt, 10, now_ms)
+        struct.pack_into("<H", pkt, 14, frame)
+        struct.pack_into("<H", pkt, 16, len(part))
+        pkt[18] = i
+        pkt[20 : 20 + len(dev)] = dev
+        pkt[36 : 36 + len(tok)] = tok
+        pkt[48:] = part
+        _lk_seq = (_lk_seq + 1) & 0xFFFF
+        out.append(bytes(pkt))
+    return out
+
+
+def _livekit_loop():
+    if not LIVEKIT_INGEST:
+        return
+    host, _, port_s = LIVEKIT_INGEST.rpartition(":")
+    try:
+        port = int(port_s)
+    except ValueError:
+        print(f"[livekit] bad LIVEKIT_INGEST {LIVEKIT_INGEST}", flush=True)
+        return
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    logged = False
+    last_err = 0.0
+    while True:
+        kind, device, payload = _lk_q.get()
+        try:
+            addr = (host, port)
+            for pkt in _lk_packets(kind, device, payload):
+                sock.sendto(pkt, addr)
+            if not logged:
+                logged = True
+                print(f"[livekit] forwarding to {host}:{port}", flush=True)
+        except Exception as e:
+            logged = False
+            now = time.time()
+            if now - last_err > 5:
+                last_err = now
+                print(f"[livekit] forward {device}: {e}", flush=True)
+            time.sleep(0.5)
+
+
+def _b64url(raw: bytes) -> str:
+    import base64
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
+
+
+def livekit_viewer_token(identity: str, room: str) -> str:
+    import hmac
+    import hashlib
+    now = int(time.time())
+    header = _b64url(b'{"alg":"HS256","typ":"JWT"}')
+    payload = {
+        "iss": LIVEKIT_API_KEY,
+        "sub": identity,
+        "name": identity,
+        "nbf": now - 10,
+        "exp": now + 6 * 3600,
+        "video": {
+            "roomJoin": True,
+            "room": room,
+            "canPublish": False,
+            "canSubscribe": True,
+            "canPublishData": False,
+        },
+    }
+    body = _b64url(json.dumps(payload, separators=(",", ":")).encode())
+    sig = hmac.new(LIVEKIT_API_SECRET.encode(), f"{header}.{body}".encode(), hashlib.sha256).digest()
+    return f"{header}.{body}.{_b64url(sig)}"
+
+
+threading.Thread(target=_livekit_loop, name="livekit-forward", daemon=True).start()
 _UDP_HDR = 38
 _UDP_NACK_AFTER = 0.13
 _UDP_HOLD = 0.45
@@ -385,6 +507,7 @@ def enqueue_pcm(
     session_id: str | None = None,
     session_mode: str | None = None,
 ):
+    livekit_submit(2, device, data)
     item = (device, data, session_id, session_mode)
     try:
         audio_q.put_nowait(item)
@@ -1214,6 +1337,7 @@ def accept_jpeg(device: str, data: bytes, session_id: str | None, session_mode: 
     # A torn piece still starts with FFD8 and the browser paints a color strip.
     if len(data) < 128 or data[:2] != b"\xff\xd8" or data[-2:] != b"\xff\xd9":
         return
+    livekit_submit(1, device, data)
     now = time.time()
     heavy = len(data) > LIVE_PREVIEW_MAX
     if not heavy:
@@ -2463,6 +2587,27 @@ async def ws_ext_audio(websocket: WebSocket, device: str = "bodycam-01", raw: in
         return
     except Exception:
         return
+
+
+@app.get("/api/v1/livekit-token")
+def api_livekit_token(device: str = "bodycam-02"):
+    room = "".join(ch for ch in device if ch.isalnum() or ch in "-_")[:32] or "bodycam"
+    if not LIVEKIT_API_SECRET:
+        raise HTTPException(503, "livekit is not configured")
+    return {
+        "ok": True,
+        "url": LIVEKIT_PUBLIC_URL,
+        "room": room,
+        "token": livekit_viewer_token("dashboard", room),
+    }
+
+
+@app.get("/webrtc")
+def webrtc_page():
+    page = STATIC / "webrtc.html"
+    if not page.exists():
+        raise HTTPException(404, "webrtc page missing")
+    return FileResponse(page, headers={"Cache-Control": "no-store"})
 
 
 @app.get("/")
