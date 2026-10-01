@@ -603,11 +603,7 @@ static bool queueVideoFrame(const uint8_t *payload, size_t len) {
 
 // 1 = idle (frame finished or nothing queued), 0 = still sending, -1 = dropped.
 static int pumpVideo() {
-  static uint32_t movedAt = 0;
-  if (!wsLen) {
-    movedAt = 0;
-    return 1;
-  }
+  if (!wsLen) return 1;
   // One full VGA JPEG fills every Wi-Fi TX slot. The mic then stalls
   // (ring hits 47999) and this socket is reset. One slot per turn.
   size_t left = wsLen - wsOff;
@@ -615,40 +611,22 @@ static int pumpVideo() {
   int n = streamWs.pushRaw(wsFrame + wsOff, slice);
   if (n < 0) {
     wsLen = 0;
-    movedAt = 0;
     ++txVideoDrops;
     streamWs.disconnect();
     wsConnected = false;
     return -1;
   }
-  if (n > 0) {
-    wsOff += (size_t)n;
-    movedAt = millis();
-  } else if (!movedAt) {
-    movedAt = millis();
-  }
+  if (n > 0) wsOff += (size_t)n;
   if (wsOff >= wsLen) {
     lastVideoSendMs = millis() - wsT0;
     wsLen = 0;
-    movedAt = 0;
     ++txVideoFrames;
     if (!camIsHd) tuneLiveSize(lastJpegBytes, lastVideoSendMs);
     return 1;
   }
   if (wsOff == 0 && millis() - wsT0 > 200) {
     wsLen = 0;
-    movedAt = 0;
     ++txVideoSkips;
-    return -1;
-  }
-  // Bytes stopped. A slow send that is still moving is left alone.
-  // A hard stall used to sit on video=1 until the dashboard froze.
-  if (wsOff > 0 && millis() - movedAt > 800) {
-    wsLen = 0;
-    movedAt = 0;
-    ++txVideoDrops;
-    streamWs.disconnect();
-    wsConnected = false;
     return -1;
   }
   return 0;
@@ -1125,23 +1103,7 @@ static void audioTxTask(void *) {
     if (wsConnected) startAudioWebSocket();
     // Finish a half-sent mic frame before loop() writes anything else.
     if (audioWsConnected && audioLen && audioOff) {
-      static uint32_t audioMove = 0;
-      size_t before = audioOff;
-      if (pumpAudio() < 0) {
-        audioMove = 0;
-        audioWs.disconnect();
-        audioWsConnected = false;
-      } else if (audioOff != before) {
-        audioMove = millis();
-      } else if (!audioMove) {
-        audioMove = millis();
-      } else if (millis() - audioMove > 800) {
-        audioMove = 0;
-        audioLen = 0;
-        audioOff = 0;
-        audioWs.disconnect();
-        audioWsConnected = false;
-      }
+      pumpAudio();
       vTaskDelay(pdMS_TO_TICKS(1));
       continue;
     }
