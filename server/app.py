@@ -90,6 +90,88 @@ def _event_loop_watchdog():
             os._exit(1)
 
 
+# Signaling stays on TCP 7890. Media is UDP 50300 for every bodycam, same split
+# as the Stream SDK: a late packet is dropped instead of blocking the next frame.
+UDP_MEDIA_PORT = int(os.getenv("BODYCAM_UDP_PORT", "50300"))
+_UDP_HDR = 38
+_udp_parts: dict[tuple, dict] = {}
+_udp_frames = 0
+_udp_logged = False
+
+
+def _udp_finish(kind: int, device: str, blob: bytes):
+    global _udp_frames
+    if kind == 1 and len(blob) > 128:
+        accept_jpeg(device, blob, None, "video")
+        _udp_frames += 1
+    elif kind == 2 and len(blob) >= 2:
+        enqueue_pcm(device, blob)
+    if _udp_frames and _udp_frames % 100 == 0:
+        print(f"[udp] frames={_udp_frames} device={device}", flush=True)
+
+
+def _on_udp_media(data: bytes, addr):
+    global _udp_logged
+    if len(data) < _UDP_HDR or data[:4] != b"BCU1":
+        return
+    kind = data[4]
+    nchunks = data[5]
+    idx = data[6]
+    seq = int.from_bytes(data[8:10], "little")
+    plen = int.from_bytes(data[10:12], "little")
+    device = data[12:28].split(b"\x00", 1)[0].decode("ascii", "ignore").strip()
+    token = data[28:38].split(b"\x00", 1)[0].decode("ascii", "ignore")
+    if token != TOKEN or not device or nchunks == 0 or idx >= nchunks:
+        return
+    if 38 + plen > len(data):
+        return
+    payload = data[38 : 38 + plen]
+    if not _udp_logged:
+        _udp_logged = True
+        print(f"[udp] media from {addr[0]}:{addr[1]} device={device}", flush=True)
+    now = time.monotonic()
+    if len(_udp_parts) > 48:
+        _udp_parts.clear()
+    else:
+        stale = [k for k, v in _udp_parts.items() if now - v["t"] > 0.15]
+        for key in stale:
+            _udp_parts.pop(key, None)
+    if nchunks == 1:
+        _udp_finish(kind, device, payload)
+        return
+    key = (device, kind, seq)
+    slot = _udp_parts.get(key)
+    if slot is None or slot["n"] != nchunks:
+        slot = {"t": now, "n": nchunks, "parts": {}}
+        _udp_parts[key] = slot
+    slot["parts"][idx] = payload
+    if len(slot["parts"]) != nchunks:
+        return
+    try:
+        blob = b"".join(slot["parts"][i] for i in range(nchunks))
+    except KeyError:
+        _udp_parts.pop(key, None)
+        return
+    _udp_parts.pop(key, None)
+    _udp_finish(kind, device, blob)
+
+
+class _UdpMedia(asyncio.DatagramProtocol):
+    def datagram_received(self, data, addr):
+        try:
+            _on_udp_media(data, addr)
+        except Exception as e:
+            print(f"[udp] {e}", flush=True)
+
+
+async def _start_udp_media():
+    loop = asyncio.get_running_loop()
+    await loop.create_datagram_endpoint(
+        _UdpMedia, local_addr=("0.0.0.0", UDP_MEDIA_PORT)
+    )
+    print(f"[udp] listening 0.0.0.0:{UDP_MEDIA_PORT}", flush=True)
+
+
 async def _arm_watchdog():
     async def beat():
         global _loop_beat
@@ -99,6 +181,7 @@ async def _arm_watchdog():
 
     asyncio.create_task(beat())
     threading.Thread(target=_event_loop_watchdog, name="watchdog", daemon=True).start()
+    await _start_udp_media()
 
 
 ingest_q: queue.Queue = queue.Queue(maxsize=48)

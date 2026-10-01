@@ -36,6 +36,7 @@ services:
       CAMERA_ROTATE: "270"
     ports:
       - "7890:8080"
+      - "50300:50300/udp"
     volumes:
       - ./data:/data
     healthcheck:

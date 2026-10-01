@@ -23,6 +23,9 @@
 #define SERVER_HOST     "45.250.101.17"
 #define SERVER_PORT     7890
 #define SERVER_WS_PATH  "/ws/device"
+// Media follows the zip: signaling stays on TCP 7890, pictures and mic use UDP.
+// One port for every bodycam. 50300 is inside the open range 50300-50400.
+#define MEDIA_UDP_PORT  50300
 
 #define DEVICE_ID       "bodycam-01"
 #define SERVER_TOKEN    "X01040688"

@@ -2,6 +2,7 @@
 #define WEBSOCKETS_TCP_TIMEOUT (80)
 #include <Arduino.h>
 #include <WiFi.h>
+#include <WiFiUdp.h>
 #include <HTTPClient.h>
 #include <WiFiClient.h>
 #include <WebSocketsClient.h>
@@ -36,6 +37,11 @@ static volatile bool stateDirty = false;
 static Adafruit_NeoPixel pixel(1, RGB_LED, NEO_GRB + NEO_KHZ800);
 static SemaphoreHandle_t stateMux = nullptr;
 static SemaphoreHandle_t txMu = nullptr;
+static SemaphoreHandle_t udpMu = nullptr;
+static WiFiUDP mediaUdp;
+static bool udpBegun = false;
+static uint16_t udpVideoSeq = 0;
+static uint16_t udpAudioSeq = 0;
 
 // SO_SNDBUF is not supported on this lwIP (errno 109). A short write
 // timeout is what keeps one JPEG from holding the radio for seconds.
@@ -643,26 +649,86 @@ static int pumpVideo() {
   return 0;
 }
 
+static bool udpSend(uint8_t type, uint16_t seq, uint8_t idx, uint8_t nchunks,
+                    const uint8_t *data, size_t len) {
+  if (!udpMu || !data || !len || len > 1100 || nchunks == 0) return false;
+  if (xSemaphoreTake(udpMu, pdMS_TO_TICKS(8)) != pdTRUE) return false;
+  uint8_t pkt[38 + 1100];
+  memset(pkt, 0, 38);
+  memcpy(pkt, "BCU1", 4);
+  pkt[4] = type;
+  pkt[5] = nchunks;
+  pkt[6] = idx;
+  pkt[8] = (uint8_t)seq;
+  pkt[9] = (uint8_t)(seq >> 8);
+  pkt[10] = (uint8_t)len;
+  pkt[11] = (uint8_t)(len >> 8);
+  strncpy((char *)pkt + 12, deviceId.c_str(), 15);
+  strncpy((char *)pkt + 28, SERVER_TOKEN, 9);
+  memcpy(pkt + 38, data, len);
+  bool ok = false;
+  if (!udpBegun) udpBegun = mediaUdp.begin(MEDIA_UDP_PORT) == 1;
+  IPAddress ip;
+  if (udpBegun && ip.fromString(serverHost)) {
+    if (mediaUdp.beginPacket(ip, MEDIA_UDP_PORT)) {
+      size_t wr = mediaUdp.write(pkt, 38 + len);
+      ok = wr == 38 + len && mediaUdp.endPacket() == 1;
+    }
+  }
+  xSemaphoreGive(udpMu);
+  return ok;
+}
+
 static bool sendVideoFrame() {
-  // Grab + free the sensor buffer BEFORE any TCP write.
   camera_fb_t *fb = esp_camera_fb_get();
   if (!fb) {
     ++txVideoDrops;
     return false;
   }
   size_t len = fb->len;
-  bool copy_ok = wsConnected && visualOn() && txPacket && wsFrame &&
-                 len > 128 && len + 1 <= txPacketCap;
-  if (copy_ok) {
-    txPacket[0] = 0x01;
-    memcpy(txPacket + 1, fb->buf, len);
-    lastJpegBytes = len;
-  }
+  bool copy_ok = visualOn() && txPacket && len > 128 && len <= txPacketCap;
+  if (copy_ok) memcpy(txPacket, fb->buf, len);
   esp_camera_fb_return(fb);
-  if (!copy_ok || !queueVideoFrame(txPacket, len + 1)) {
+  if (!copy_ok) {
     ++txVideoDrops;
     return false;
   }
+  const size_t CHUNK = 1100;
+  uint8_t nchunks = (uint8_t)((len + CHUNK - 1) / CHUNK);
+  if (nchunks == 0 || nchunks > 16) {
+    ++txVideoDrops;
+    return false;
+  }
+  uint16_t seq = ++udpVideoSeq;
+  uint32_t t0 = millis();
+  for (uint8_t i = 0; i < nchunks; i++) {
+    size_t off = (size_t)i * CHUNK;
+    size_t n = len - off;
+    if (n > CHUNK) n = CHUNK;
+    if (!udpSend(1, seq, i, nchunks, txPacket + off, n)) {
+      ++txVideoDrops;
+      ++txVideoSkips;
+      lastVideoSendMs = millis() - t0;
+      return false;
+    }
+  }
+  lastVideoSendMs = millis() - t0;
+  lastJpegBytes = len;
+  ++txVideoFrames;
+  if (!camIsHd) tuneLiveSize(len, lastVideoSendMs);
+  return true;
+}
+
+static bool sendAudioUdp() {
+  static int16_t txBuf[AUDIO_TX_SAMPLES];
+  if (!audioRing || ringCount() < (size_t)AUDIO_TX_SAMPLES) return false;
+  size_t n = ringPop(txBuf, AUDIO_TX_SAMPLES);
+  if (!n) return false;
+  if (!udpSend(2, ++udpAudioSeq, 0, 1, (const uint8_t *)txBuf, n * sizeof(int16_t))) {
+    ++txAudioDrops;
+    return false;
+  }
+  ++txAudioPackets;
   return true;
 }
 
@@ -926,15 +992,13 @@ static void audioTxTask(void *) {
       vTaskDelay(pdMS_TO_TICKS(20));
       continue;
     }
-    if (audioWsConnected) {
-      // 20 ms packets. Drop only if more than 80 ms is waiting, so a stall
-      // does not become a gap (crackle) or a growing delay.
+    if (audioWsConnected || WiFi.status() == WL_CONNECTED) {
+      // Mic leaves on UDP. The audio socket stays up only for speaker downlink.
       if (ringCount() > (size_t)AUDIO_TX_SAMPLES * 4) {
         ringKeepLatest((size_t)AUDIO_TX_SAMPLES * 2);
       }
-      if (audioLen) pumpAudio();
-      else sendAudioWs();
-      vTaskDelay(pdMS_TO_TICKS(audioLen ? 1 : 5));
+      sendAudioUdp();
+      vTaskDelay(pdMS_TO_TICKS(5));
       continue;
     }
     // HTTP fallback only while recording a file. Live stays on WS so a
@@ -1020,26 +1084,9 @@ static void streamTxTask(void *) {
     WiFi.setSleep(false);
     esp_wifi_set_ps(WIFI_PS_NONE);
 
-    if (!wsConnected) {
-      wsLen = 0;
-      drainCamFb();
-      streamWs.loop();
-      vTaskDelay(pdMS_TO_TICKS(20));
-      continue;
-    }
-
-    // Finish the current websocket message in short slices. loop() is not
-    // called mid-frame so a ping cannot land inside the JPEG.
-    if (wsLen) {
-      pumpVideo();
-      vTaskDelay(pdMS_TO_TICKS(1));
-      continue;
-    }
-
     streamWs.loop();
 
-    // Stay on 320x240. A framesize switch overflows the sensor and a VGA
-    // JPEG takes the whole radio for about a second.
+    // JPEG goes out as UDP datagrams. A lost piece drops that frame only.
     ensureCamProfile(false);
     const uint32_t framePeriod = 1000 / LIVE_FPS;
 
@@ -1048,14 +1095,11 @@ static void streamTxTask(void *) {
       bool sent = false;
       if (!visualOn()) {
         drainCamFb();
-      } else if (streamWs.canSend()) {
-        sent = sendVideoFrame();
       } else {
-        ++txVideoSkips;
-        drainCamFb();
+        sent = sendVideoFrame();
       }
       now = millis();
-      nextFrame = now + (sent ? framePeriod : 15);
+      nextFrame = now + (sent ? framePeriod : 20);
     }
 
     now = millis();
@@ -1070,6 +1114,7 @@ void setup() {
   Serial.begin(115200);
   delay(300);
   txMu = xSemaphoreCreateMutex();
+  udpMu = xSemaphoreCreateMutex();
 
   led(true);
 #if USE_RGB_LED
