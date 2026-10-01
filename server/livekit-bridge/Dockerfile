@@ -1,4 +1,5 @@
-FROM golang:1.22-bookworm AS build
+FROM golang:1.24-bookworm AS build
+ENV GOTOOLCHAIN=auto
 RUN apt-get update && apt-get install -y --no-install-recommends \
     pkg-config libopus-dev gcc libc6-dev \
     && rm -rf /var/lib/apt/lists/*
