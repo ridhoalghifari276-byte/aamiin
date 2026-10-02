@@ -25,9 +25,9 @@ services:
       BODYCAM_API_TOKENS: '{"bodycam-01":"BC-01-n4T8vL2qH9cF","bodycam-02":"BC-02-w6Y1dM5sJ3bA","bodycam-03":"BC-03-p7C0kR8uE2gZ"}'
       # Same-provider private IP — public 45.250.101.16:4000 times out from this VPS (hairpin).
       PQTALKIE_URL: http://192.168.245.99:4000
-      # Per-device kiosk slug (not the HTTPS SPA URL on :3443). Channel comes from auth.
-      # ESP bodycam kiosk slug (channel comes from PQTALKIE auth — ch 11).
-      PQTALKIE_TOKENS: '{"bodycam-03":"nW6M9EmsFqX2OLvyfoxaP7Yw"}'
+      # Kiosk slug from https://45.250.101.16:3443/r/<slug>. Channel comes from auth.
+      # Agent 2..10 on the radio list, in that order.
+      PQTALKIE_TOKENS: '{"bodycam-02":"https://45.250.101.16:3443/r/F-OT-WeXHeP_ZxfWFx3ur1Rw","bodycam-03":"https://45.250.101.16:3443/r/a11x1-_uQwh5M6sZ6cvYDT_1zF","bodycam-04":"https://45.250.101.16:3443/r/EgUd98BAHH8Zm0zAZCKz2v-p","bodycam-05":"https://45.250.101.16:3443/r/4UqCJqYXFV2uXs6dYWD0ga0t","bodycam-06":"https://45.250.101.16:3443/r/l3JVpzkQ77jmmncMB9NX_XOc","bodycam-07":"https://45.250.101.16:3443/r/ofKXENfXSF3kpoaJGeT5bPwG","bodycam-08":"https://45.250.101.16:3443/r/c0QUNzTRcjDvyLUi0SbVgoqb","bodycam-09":"https://45.250.101.16:3443/r/Yqw5G3Xu_96u6Xq1HZdhXFwm","bodycam-10":"https://45.250.101.16:3443/r/PhbxYkYg_zvnEopU5NuphHDF"}'
       # Optional default if a unit has no entry in PQTALKIE_TOKENS:
       PQTALKIE_TOKEN: ""
       DATA_DIR: /data
