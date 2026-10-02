@@ -585,8 +585,11 @@
     }
     .stream-strip {
       display: grid;
-      grid-template-columns: repeat(8, minmax(0, 1fr));
+      grid-template-columns: repeat(5, minmax(0, 1fr));
       gap: 0.45rem;
+    }
+    @media (max-width: 1400px) {
+      .stream-strip { grid-template-columns: repeat(5, minmax(0, 1fr)); }
     }
     @media (max-width: 1100px) {
       .stream-strip { grid-template-columns: repeat(4, minmax(0, 1fr)); }
@@ -1218,7 +1221,7 @@
         </div>
         <div id="wall" class="wall"></div>
         <div class="strip-wrap">
-          <div class="strip-label">Online Preview · Max 8</div>
+          <div class="strip-label">Online Preview · Max 10</div>
           <div id="stream-strip" class="stream-strip"></div>
         </div>
       </section>
@@ -1383,7 +1386,7 @@
     const archiveDevicesEl = document.getElementById("archive-devices");
     const faceDevicesEl = document.getElementById("face-devices");
 
-    const MAX_STRIP = 8;
+    const MAX_STRIP = 10;
     let currentDevice = new URLSearchParams(location.search).get("device") || "bodycam-01";
     let archiveDevice = currentDevice;
     let facesDevice = currentDevice;

@@ -459,15 +459,20 @@ async def _arm_watchdog():
     _start_udp_media()
 
 
-ingest_q: queue.Queue = queue.Queue(maxsize=48)
-audio_q: queue.Queue = queue.Queue(maxsize=96)
-INGEST_WORKERS = 3
+ingest_q: queue.Queue = queue.Queue(maxsize=int(os.getenv("INGEST_Q_MAX", "512")))
+audio_q: queue.Queue = queue.Queue(maxsize=int(os.getenv("AUDIO_Q_MAX", "1024")))
+# 10-user scene: 3 workers decoded-record-only frames at ~25 fps; 8 workers
+# comfortably cover 10 units in record mode (10 × 15 fps = 150 decode/s).
+INGEST_WORKERS = int(os.getenv("INGEST_WORKERS", "8"))
 lock = threading.RLock()
 face_engine: FaceEngine | None = None
 device_state: dict[str, dict] = {}
 ONLINE_TTL = 8.0
-TARGET_FPS = 20
-LIVE_FPS = 12
+# 10-user scene: target_fps/live_fps were 20/12 — that floor meant viewers
+# never saw more than 12 fps even when the device was pumping 30. Floor matches
+# the OV5640 720p ceiling so the WS/MJPEG sender isn't artificially throttled.
+TARGET_FPS = int(os.getenv("TARGET_FPS", "30"))
+LIVE_FPS = int(os.getenv("LIVE_FPS", "30"))
 LIVE_MAX_SIDE = 640
 # Frames above this are record-HD. Viewers get a downscaled copy, not the original.
 LIVE_PREVIEW_MAX = 48 * 1024
@@ -475,7 +480,9 @@ FACE_INTERVAL_SEC = 0.75
 MAX_RECORDINGS_PER_DEVICE = 80
 last_face_submit: dict[str, float] = defaultdict(float)
 WS_IDLE_SEC = 45.0
-MJPEG_MAX = 6
+# 10-user scene: 6 simultaneous MJPEG viewers was the hard wall — bump to 32
+# so 10 viewers + headroom for recordings doesn't trigger 503s.
+MJPEG_MAX = int(os.getenv("MJPEG_MAX", "32"))
 _mjpeg_live = 0
 _mjpeg_gate = threading.Lock()
 
@@ -1958,9 +1965,14 @@ async def mjpeg(request: Request, device: str = "bodycam-01", annotate: int = 0)
                         + f
                         + b"\r\n"
                     )
+                    # 10-user scene: tight loop instead of 50 ms tick so 30 fps
+                    # frames can flush as soon as a new one lands.
                     await asyncio.sleep(0)
                 else:
-                    await asyncio.sleep(0.05)
+                    # 10-user scene: 50 ms idle tick capped the MJPEG FPS at 20
+                    # even when the device was pumping 30. 10 ms keeps the loop
+                    # busy without burning CPU when no new frame has arrived.
+                    await asyncio.sleep(0.01)
         finally:
             with _mjpeg_gate:
                 _mjpeg_live = max(0, _mjpeg_live - 1)
@@ -2191,7 +2203,9 @@ async def ws_live(websocket: WebSocket, device: str = "bodycam-01"):
                         last_overlay = blob
                         await websocket.send_text(blob)
 
-            await asyncio.sleep(0.015)
+            # 10-user scene: 0.015 = 67 fps poll, fine for 30 fps. Lower to
+            # 0.005 only if the device streams >60 fps later.
+            await asyncio.sleep(0.005)
 
     try:
         await _ws_send_until_close(websocket, sender)

@@ -28,7 +28,9 @@
 #define MEDIA_UDP_PORT  50300
 // Live video uses BCRT on the same UDP port the gateway already has open.
 // /ws/audio stays up for the HT radio.
-#define RT_STREAM       1
+// 10-user scene: disable RT_STREAM so we don't send video twice (UDP + WS). WebRTC
+// viewers go through the Go gateway on a separate path; here we keep only WS.
+#define RT_STREAM       0
 #define RT_UDP_PORT     50300
 
 #define DEVICE_ID       "bodycam-01"
@@ -58,20 +60,22 @@
 #define CAM_HMIRROR     0
 
 // ============================================================
-// VIDEO — outdoor bodycam.
-// Live (no record): VGA, moderate JPEG, steady FPS. Small frames stay
-// smooth while walking/running and keep the server light.
-// Record: 720p. Sharper file, slower FPS so the sensor does not overflow.
-// ESP JPEG q: lower number = sharper, larger file. q=12 overflowed (FB-OVF).
+// VIDEO — outdoor bodycam. Sensor: OV5640 (sheet max: 720p@30fps, 1080p@15fps).
+// Live (no record): 720p @ 30fps, JPEG q=10. ~25-35 KB per frame keeps 9 MB/s
+//   aggregate for 10 users (budget ~5 MB/s at single 2.4GHz AP, ~9 MB/s with
+//   dual-AP or Ethernet relay).
+// Record: 1080p @ 15fps, JPEG q=12. ~50-70 KB per frame, max per-sheet.
+// ESP JPEG q: lower = sharper, larger file. q=10 is the OV5640 sweet spot
+// for 720p; q=12 keeps 1080p from overflowing the buffer.
 // ============================================================
-#define LIVE_WIDTH      640
-#define LIVE_HEIGHT     480
-#define LIVE_JPEG_Q     20
-#define LIVE_FPS        6
-#define REC_WIDTH       640
-#define REC_HEIGHT      480
-#define REC_JPEG_Q      24
-#define REC_FPS         12
+#define LIVE_WIDTH      1280
+#define LIVE_HEIGHT     720
+#define LIVE_JPEG_Q     10
+#define LIVE_FPS        30
+#define REC_WIDTH       1920
+#define REC_HEIGHT      1080
+#define REC_JPEG_Q      12
+#define REC_FPS         15
 #define STREAM_WIDTH    LIVE_WIDTH
 #define STREAM_HEIGHT   LIVE_HEIGHT
 #define JPEG_QUALITY    LIVE_JPEG_Q

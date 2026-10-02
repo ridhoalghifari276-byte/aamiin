@@ -602,8 +602,9 @@ static bool queueVideoFrame(const uint8_t *payload, size_t len) {
 // 1 = idle (frame finished or nothing queued), 0 = still sending, -1 = dropped.
 static int pumpVideo() {
   if (!wsLen) return 1;
-  // One full VGA JPEG fills every Wi-Fi TX slot. The mic then stalls
-  // (ring hits 47999) and this socket is reset. One slot per turn.
+  // One full 720p/1080p JPEG fills every Wi-Fi TX slot. The mic then stalls
+  // (ring hits 47999) and this socket is reset. 640 bytes keeps the link
+  // measured in one slot per turn even at 720p30.
   size_t left = wsLen - wsOff;
   size_t slice = left > 640 ? 640 : left;
   int n = streamWs.pushRaw(wsFrame + wsOff, slice);
@@ -988,11 +989,16 @@ static bool initCam() {
   c.pin_reset = CAM_PIN_RESET;
   // 16 MHz produced no JPEG at all (sig stayed 0) and the link never
   // finished the handshake. 20 MHz is the clock that actually outputs frames.
-  c.xclk_freq_hz = 20000000;
+  // 24 MHz hits OV5640's max 720p@30fps ceiling; stay at 20 MHz if your clone
+  // is unstable at 24.
+  c.xclk_freq_hz = 24000000;
   c.pixel_format = PIXFORMAT_JPEG;
   c.frame_size = FRAMESIZE_VGA;
   c.jpeg_quality = JPEG_QUALITY;
-  c.fb_count = 2;
+  // 10-user scene: keep only one framebuffer in PSRAM. A 1080p JPEG is
+  // ~310 KB, so 1 buf = 310 KB vs 620 KB. Tiny tearing is acceptable for
+  // streaming; the second buffer is a record-only luxury we can't afford.
+  c.fb_count = 1;
   // LATEST can hand back a buffer the sensor is still filling. That is a stripe.
   c.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
   c.fb_location = CAMERA_FB_IN_PSRAM;
@@ -1005,15 +1011,27 @@ static bool initCam() {
 
   sensor_t *s = esp_camera_sensor_get();
   if (s) {
+    // 10-user scene: OV5640 already does its own AWB/AEC well; the legacy
+    // OV2640 workarounds (aec2, lenc, bpc, wpc, raw_gma, dcw) cost cycles per
+    // frame and shave a couple fps off the OV5640. Leave brightness/contrast/
+    // saturation at neutral so night-vision presets can do their own thing.
     s->set_brightness(s, 0);
     s->set_contrast(s, 0);
     s->set_saturation(s, 0);
+    s->set_whitebal(s, 1);
+    s->set_awb_gain(s, 1);
+    s->set_aec2(s, 0);
+    s->set_raw_gma(s, 0);
+    s->set_lenc(s, 0);
+    s->set_bpc(s, 0);
+    s->set_wpc(s, 0);
+    s->set_dcw(s, 0);
     s->set_quality(s, LIVE_JPEG_Q);
     s->set_vflip(s, CAM_VFLIP);
     s->set_hmirror(s, CAM_HMIRROR);
   }
 
-  Serial.printf("[CAM] live VGA %dx%d q=%d @ %d FPS · record HD %dx%d q=%d @ %d FPS\n",
+  Serial.printf("[CAM] live %dx%d q=%d @ %d FPS · record %dx%d q=%d @ %d FPS\n",
                 LIVE_WIDTH, LIVE_HEIGHT, LIVE_JPEG_Q, LIVE_FPS,
                 REC_WIDTH, REC_HEIGHT, REC_JPEG_Q, REC_FPS);
   return true;
@@ -1216,9 +1234,13 @@ static void camGrabTask(void *) {
       continue;
     }
     size_t len = fb->len;
+    // 10-user scene: drop the 1280x720 / 48 KB caps so OV5640 1080p frames
+    // (1920x1080, ~50-70 KB @ q=12) are accepted by the grab path. The hard
+    // upper bound is now txPacketCap (256 KB), which covers the largest
+    // expected HD JPEG with headroom.
     bool ok = grabBuf && grabMu && fb->buf && fb->width >= 160 && fb->height >= 120 &&
-              fb->width <= 1280 && fb->height <= 720 &&
-              len > 128 && len <= txPacketCap && len <= 48000;
+              fb->width <= 1920 && fb->height <= 1080 &&
+              len > 128 && len <= txPacketCap;
     if (ok) {
       // Look for FFD9 anywhere. Checking only the last 32 bytes threw
       // away later frames, grabSeq froze, and the dashboard stayed black.
@@ -1307,7 +1329,10 @@ static void streamTxTask(void *) {
     }
 
     // Whole JPEG on the video socket. UDP pieces were arriving torn.
-    const uint32_t framePeriod = 1000 / LIVE_FPS;
+    // 10-user scene: FPS flips between live (30) and record (15). LIVE_FPS at
+    // 30fps keeps the JS board from queueing; record drops to 15fps per the
+    // OV5640 sensor ceiling.
+    const uint32_t framePeriod = 1000 / (camIsHd ? REC_FPS : LIVE_FPS);
 
     uint32_t now = millis();
     if ((int32_t)(now - nextFrame) >= 0) {
@@ -1363,7 +1388,9 @@ void setup() {
   speakerBegin();
 
   // Drain the sensor immediately so DMA cannot overflow during WS connect.
-  txPacketCap = 160 * 1024;
+  // 10-user scene: 1080p JPEG is ~70 KB max — 256 KB headroom avoids a forced
+  // re-alloc path on the very first HD frame.
+  txPacketCap = 256 * 1024;
   txPacket = (uint8_t *)heap_caps_malloc(txPacketCap, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
   if (!txPacket) {
     txPacketCap = 48 * 1024;
@@ -1381,8 +1408,9 @@ void setup() {
   if (!grabBuf) Serial.println("[CAM] grab buffer alloc failed");
   udpRememberInit();
   // Internal RAM. A PSRAM send buffer was what the Wi-Fi stack aborted
-  // ("Connection lost") after each JPEG. 16 KB covers a live VGA frame.
-  wsFrameCap = 40 * 1024;
+  // ("Connection lost") after each JPEG. 64 KB covers a 1080p frame so we
+  // don't fall back to the 48 KB realloc during the first HD frame.
+  wsFrameCap = 64 * 1024;
   wsFrame = (uint8_t *)heap_caps_malloc(wsFrameCap, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
   if (!wsFrame) wsFrame = (uint8_t *)malloc(wsFrameCap);
   if (!wsFrame) {
