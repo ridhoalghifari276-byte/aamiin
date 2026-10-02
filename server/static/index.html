@@ -11,18 +11,18 @@
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
   <style>
     :root {
-      --bg0: #05080d;
-      --bg1: #0a121c;
-      --panel: rgba(8, 18, 28, 0.92);
-      --line: #1a3a4a;
-      --cyan: #2ee6d6;
-      --cyan-dim: #1a8f85;
-      --amber: #f0b429;
-      --red: #ff4d6a;
-      --green: #3dff9a;
-      --text: #d7f6f2;
-      --muted: #6f93a0;
-      --hud: rgba(46, 230, 214, 0.12);
+      --bg0: #04070d;
+      --bg1: #07111c;
+      --panel: rgba(6, 14, 24, 0.94);
+      --line: rgba(56, 140, 170, 0.35);
+      --cyan: #3ee0ff;
+      --cyan-dim: #1c7f96;
+      --amber: #e8b84a;
+      --red: #ff4d5a;
+      --green: #2dff9a;
+      --text: #e7f7ff;
+      --muted: #7f9aab;
+      --hud: rgba(62, 224, 255, 0.1);
     }
     * { box-sizing: border-box; margin: 0; padding: 0; }
     html, body { height: 100%; }
@@ -30,9 +30,9 @@
       font-family: "Rajdhani", system-ui, sans-serif;
       color: var(--text);
       background:
-        radial-gradient(1200px 600px at 10% -10%, rgba(46, 230, 214, 0.08), transparent 55%),
-        radial-gradient(900px 500px at 100% 0%, rgba(240, 180, 41, 0.05), transparent 50%),
-        linear-gradient(180deg, var(--bg1), var(--bg0));
+        radial-gradient(900px 420px at 8% -20%, rgba(232, 184, 74, 0.08), transparent 50%),
+        radial-gradient(1100px 600px at 80% 0%, rgba(62, 224, 255, 0.07), transparent 55%),
+        linear-gradient(180deg, #0b1624, var(--bg0) 28%);
       overflow: hidden;
     }
     body::before {
@@ -76,10 +76,11 @@
     }
     .brand h1 {
       font-family: "Orbitron", sans-serif;
-      font-size: 1rem;
-      letter-spacing: 0.18em;
-      color: var(--cyan);
+      font-size: 1.05rem;
+      letter-spacing: 0.22em;
+      color: var(--amber);
       text-transform: uppercase;
+      text-shadow: 0 0 18px rgba(232, 184, 74, 0.35);
     }
     .brand .tag {
       font-size: 0.75rem;
@@ -127,7 +128,7 @@
     /* MAIN */
     .main {
       display: grid;
-      grid-template-columns: 220px 1fr 300px;
+      grid-template-columns: 248px 1fr 320px;
       min-height: 0;
       height: 100%;
     }
@@ -165,21 +166,33 @@
     .nav-btn, .nav-link {
       text-align: left;
       font-family: "Rajdhani", sans-serif;
-      font-weight: 600;
-      font-size: 0.82rem;
-      letter-spacing: 0.08em;
+      font-weight: 700;
+      font-size: 0.92rem;
+      letter-spacing: 0.06em;
       text-transform: uppercase;
-      border: 1px solid var(--line);
-      background: rgba(0, 0, 0, 0.25);
+      border: 1px solid transparent;
+      border-left: 3px solid transparent;
+      background: transparent;
       color: var(--muted);
-      padding: 0.65rem 0.7rem;
+      padding: 0.55rem 0.65rem;
       cursor: pointer;
     }
-    .nav-btn.active {
-      border-color: var(--cyan);
-      color: var(--cyan);
-      background: rgba(46, 230, 214, 0.1);
+    .nav-btn small {
+      display: block;
+      font-weight: 500;
+      font-size: 0.68rem;
+      letter-spacing: 0.04em;
+      text-transform: none;
+      color: #5e7888;
+      margin-top: 0.05rem;
     }
+    .nav-btn.active {
+      border-color: rgba(62, 224, 255, 0.25);
+      border-left-color: var(--cyan);
+      color: var(--cyan);
+      background: linear-gradient(90deg, rgba(62, 224, 255, 0.14), transparent 80%);
+    }
+    .nav-btn.active small { color: #9fd8e6; }
     .nav-link { display: block; text-decoration: none; }
     .device-chips {
       display: flex;
@@ -354,13 +367,14 @@
       padding: 0.3rem 0.6rem;
     }
     .device-card {
-      border: 1px solid var(--line);
-      background: rgba(0, 0, 0, 0.25);
+      border: 1px solid rgba(62, 224, 255, 0.22);
+      background: linear-gradient(180deg, rgba(12, 28, 42, 0.9), rgba(4, 10, 16, 0.92));
       padding: 0.65rem 0.7rem;
       cursor: pointer;
       transition: border-color 0.2s, background 0.2s, transform 0.15s;
       position: relative;
       overflow: hidden;
+      border-radius: 2px;
     }
     .device-card::before {
       content: "";
@@ -483,14 +497,15 @@
     .feed {
       position: relative;
       background: #000;
-      border: 1px solid var(--line);
+      border: 1px solid rgba(62, 224, 255, 0.35);
+      box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.6), inset 0 0 80px rgba(0, 20, 30, 0.35);
       min-height: 0;
       height: 100%;
       width: 100%;
       overflow: hidden;
       isolation: isolate;
     }
-    .feed.active { border-color: var(--cyan); }
+    .feed.active { border-color: rgba(62, 224, 255, 0.7); }
     .feed img,
     .feed canvas.feed-video {
       position: absolute;
@@ -776,14 +791,15 @@
     }
     .ov-btn {
       font-family: "Rajdhani", sans-serif;
-      font-weight: 600;
+      font-weight: 700;
       font-size: 0.78rem;
       letter-spacing: 0.08em;
       text-transform: uppercase;
-      border: 1px solid rgba(46, 230, 214, 0.35);
-      background: rgba(0, 12, 16, 0.75);
+      border: 1px solid rgba(62, 224, 255, 0.35);
+      border-radius: 4px;
+      background: rgba(4, 16, 24, 0.82);
       color: var(--text);
-      padding: 0.35rem 0.65rem;
+      padding: 0.4rem 0.75rem;
       cursor: pointer;
       backdrop-filter: blur(4px);
       transition: border-color 0.15s, color 0.15s, background 0.15s;
@@ -1205,11 +1221,10 @@
       <aside class="rail rail-left">
         <h2>Navigasi</h2>
         <nav class="side-nav">
-          <button type="button" class="nav-btn active" data-view="live">Live Camera</button>
-          <a class="nav-link" href="/webrtc?device=bodycam-02">LiveKit WebRTC</a>
-          <button type="button" class="nav-btn" data-view="videos">Video rekaman</button>
-          <button type="button" class="nav-btn" data-view="faces">Wajah tercapture</button>
-          <button type="button" class="nav-btn" data-view="registry">Wajah terdaftar</button>
+          <button type="button" class="nav-btn active" data-view="live">Live Camera<small>Streaming &amp; monitoring</small></button>
+          <button type="button" class="nav-btn" data-view="videos">Video rekaman<small>Manajemen arsip</small></button>
+          <button type="button" class="nav-btn" data-view="faces">Wajah tercapture<small>Deteksi &amp; pengenalan</small></button>
+          <button type="button" class="nav-btn" data-view="registry">Wajah terdaftar<small>Database personel</small></button>
         </nav>
         <p class="hint">GPIO 1 rekam audio (tahan 7 detik = reset Wi-Fi). GPIO 3 rekam video + suara. GPIO 14 = PTT. GPIO 21 = SOS.</p>
       </aside>
@@ -1299,7 +1314,7 @@
     </div>
 
     <footer class="foot">
-      <span>SECURE OPS // MJPEG + PCM + FACE</span>
+      <span>TNI AD · SECURE OPS · ESP32-S3 BODYCAM NET</span>
       <span>
         <a id="mjpeg-link" href="/api/v1/mjpeg?device=bodycam-01" target="_blank" rel="noopener">raw stream</a>
         · <a href="/health" target="_blank" rel="noopener">health</a>

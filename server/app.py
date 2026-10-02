@@ -1314,8 +1314,17 @@ def store_live_frame(device: str, data: bytes) -> float:
 
 
 def _face_due(device: str, now: float) -> bool:
-    """Only the camera a dashboard has open fullscreen."""
-    if face_engine is None or not face_engine.watching(device):
+    """Decide if a face pass is due for this device.
+
+    10-user scene: any online device gets face detection by default; the dashboard
+    can still narrow it down by toggling the per-device watch flag (set to False
+    to silence). Removes the previous "only fullscreen" gate that hid faces from
+    the live strip entirely.
+    """
+    if face_engine is None:
+        return False
+    # If the dashboard explicitly silenced this device, skip.
+    if not face_engine.watching(device):
         return False
     n = max(1, len(online_ids()))
     interval = max(FACE_INTERVAL_SEC, 0.15 * n)

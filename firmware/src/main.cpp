@@ -892,32 +892,45 @@ static void audioCaptureTask(void *) {
     if (!live) continue;
     if (e != ESP_OK || bytes < sizeof(int32_t)) continue;
     size_t n = bytes / sizeof(int32_t);
-    // Two poles near 150 Hz cut footfall and wind. One extra shift leaves
-    // headroom so a gust clips the gain, not the waveform.
-    // R = exp(-2*pi*150/16000) ≈ 0.943 → 241/256.
-    static int32_t x1 = 0, y1 = 0, x2 = 0, y2 = 0;
-    static int gain = 384;  // 1.5x restores the extra shift
+    // Soft single-pole high-pass around 50 Hz (R = 252/256). Below 50 Hz is
+    // mic handling noise and DC bias; speech fundamentals start ~120 Hz.
+    // Two poles at 150 Hz (the original) were eating the consonants and gave
+    // the "radio" timbre. One gentle pole keeps speech intact.
+    static int32_t hp_x = 0, hp_y = 0;
+    static int gain = 256;     // 1.0x baseline
     int32_t peak = 0;
-    const int R = 241;
+    const int R_HP = 252;
     for (size_t i = 0; i < n; i++) {
-      int32_t s = raw[i] >> (MIC_SHIFT + 1);
-      int32_t a = s - x1 + ((y1 * R) >> 8);
-      x1 = s;
-      y1 = a;
-      int32_t b = a - x2 + ((y2 * R) >> 8);
-      x2 = a;
-      y2 = b;
-      int32_t y = (b * gain) >> 8;
-      if (y > 26000) y = 26000 + ((y - 26000) >> 2);
-      if (y < -26000) y = -26000 + ((y + 26000) >> 2);
-      if (y > 32767) y = 32767;
-      if (y < -32768) y = -32768;
-      int32_t mag = y < 0 ? -y : y;
+      int32_t s = raw[i] >> MIC_SHIFT;
+      int32_t y = s - hp_x + ((hp_y * R_HP) >> 8);
+      hp_x = s;
+      hp_y = y;
+      int32_t out = (y * gain) >> 8;
+      // Tanh-style soft clip starting at 22000. Hard clip at 26k (the previous
+      // setting) added odd harmonics that read as "radio distortion" on playback.
+      if (out > 22000) {
+        int32_t over = out - 22000;
+        if (over > 32767) over = 32767;
+        out = 22000 + ((over * 256) / (256 + (over >> 4)));
+      } else if (out < -22000) {
+        int32_t over = -22000 - out;
+        if (over > 32767) over = 32767;
+        out = -22000 - ((over * 256) / (256 + (over >> 4)));
+      }
+      if (out > 32767) out = 32767;
+      if (out < -32768) out = -32768;
+      int32_t mag = out < 0 ? -out : out;
       if (mag > peak) peak = mag;
-      pcm[i] = (int16_t)y;
+      pcm[i] = (int16_t)out;
     }
-    if (peak > 22000 && gain > 96) gain = (gain * 3) / 4;
-    else if (peak < 5000 && gain < 512) gain += 1;
+    // Symmetric AGC. The previous code dropped gain 25% in one step but
+    // recovered only 1 LSB per chunk (~80 ms), so a single loud blip pinned
+    // gain to 96 and quiet speech stayed half-volume.
+    if (peak > 26000) {
+      if (gain > 128) gain -= 8;
+    } else if (peak < 4000) {
+      if (gain < 512) gain += 4;
+    }
     ringPush(pcm, n);
   }
 }

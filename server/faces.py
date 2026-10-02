@@ -271,7 +271,13 @@ class FaceEngine:
             self.live_names[device] = []
 
     def note_watch(self, device: str, on: bool):
-        """Fullscreen viewer heartbeat. Detection runs only while this is fresh."""
+        """Toggle live face detection for a device.
+
+        `on=True`  → heartbeat timestamp (watching() True while fresh)
+        `on=False` → sentinel 0.0 (watching() False until the user re-enables)
+        A device never touched via this endpoint defaults to "watched" so the
+        live strip shows face boxes even when no tab is fullscreen on it.
+        """
         device = (device or "").strip()
         if not device:
             return
@@ -280,17 +286,30 @@ class FaceEngine:
                 self._watch[device] = time.time()
                 self.enabled[device] = True
             else:
-                self._watch.pop(device, None)
+                self._watch[device] = 0.0  # explicit-off sentinel
                 self.enabled[device] = False
                 self.live_bboxes[device] = []
                 self.live_scores[device] = []
                 self.live_names[device] = []
 
     def watching(self, device: str) -> bool:
+        # 10-user scene: a device is "watched" if either (a) a dashboard tab
+        # is heartbeating it OR (b) the user has never toggled it (default on
+        # so the live strip shows face boxes from the first frame). An explicit
+        # `note_watch(d, False)` puts the device into "silenced" mode and keeps
+        # it there until the user re-enables.
         with self._lock:
-            ts = self._watch.get(device) or 0.0
-            if (time.time() - ts) > self.watch_sec:
+            explicit = self._watch.get(device)
+            if explicit is None:
+                # No tab has ever toggled this device; treat as watched.
+                return bool(self.enabled.get(device, True))
+            ts = explicit
+            if ts == 0.0:
+                # User explicitly turned watch off.
                 return False
+            if (time.time() - ts) > self.watch_sec:
+                # Heartbeat went stale; fall back to default-on.
+                return bool(self.enabled.get(device, True))
             return bool(self.enabled.get(device, False))
 
     def submit(self, device: str, jpeg: bytes):

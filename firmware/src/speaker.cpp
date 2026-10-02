@@ -15,7 +15,11 @@
 // Wiring (unchanged): DIN38 BCLK40 LRC39, SD hardwired to 3V3 (RIGHT slot).
 
 static const size_t SPK_RING = 8000;  // 0.5 s s16le mono
-static const int SPK_GAIN = 1;
+// SPK_GAIN boosts the downlink before the MAX98357A. The radio mic on the
+// other bodycam peaks around +/-8000 after AGC, so gain 1 sounds thin. Gain
+// 4 (+12 dB) lands typical speech near full-scale. Bump to 6 or 8 if it is
+// still too quiet, but anything above ~8 starts to clip the bodycam-mic peaks.
+static const int SPK_GAIN = 4;
 static int16_t *spkRing = nullptr;
 static volatile size_t spkW = 0;
 static volatile size_t spkR = 0;

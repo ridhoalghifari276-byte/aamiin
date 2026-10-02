@@ -25,9 +25,20 @@ static float crsDeg = 0;
 static int sats = 0;
 static uint32_t fixAt = 0;
 static uint32_t nmeaAt = 0;
+static uint32_t byteCount = 0;     // raw bytes seen since boot — drives baud probe
 
 static char lineBuf[128];
 static size_t lineLen = 0;
+
+// Baud candidates tried when GPS_BAUD == 0 in config.h. NEO-7M clones ship
+// from the factory at 9600 8N1, but a lot of cheap boards are flashed to
+// 38400 or 115200 first; try in the order most NMEA streams show up on.
+static const long kProbeBauds[] = { 9600, 38400, 115200, 4800, 19200 };
+static const int kProbeCount = sizeof(kProbeBauds) / sizeof(kProbeBauds[0]);
+static int probeIdx = 0;
+static bool probeDone = false;
+static uint32_t probeStartMs = 0;
+static long activeBaud = 0;
 
 static bool nmeaChecksumOk(const char *line) {
   const char *star = strrchr(line, '*');
@@ -140,18 +151,89 @@ static void handleLine(char *line) {
   }
 }
 
-void gpsBegin() {
+static void gpsStartBaud(long baud) {
+  if (activeBaud == baud && activeBaud != 0) {
+    // already running at this rate
+    return;
+  }
+  GpsUart.end();
+  GpsUart.begin(baud, SERIAL_8N1, GPS_RX, GPS_TX);
   GpsUart.setRxBufferSize(512);
-  GpsUart.begin(GPS_BAUD, SERIAL_8N1, GPS_RX, GPS_TX);
   lineLen = 0;
-  Serial.printf("[GPS] UART1 %d baud  RX=GPIO%d (GPS TX -> GPIO%d, no ESP TX)\n",
-                GPS_BAUD, GPS_RX, GPS_RX);
+  activeBaud = baud;
+}
+
+void gpsBegin() {
+  probeStartMs = millis();
+  probeIdx = 0;
+  probeDone = false;
+  activeBaud = 0;
+  byteCount = 0;
+  // If GPS_BAUD is set in config.h we still go through gpsStartBaud() so the
+  // log line is uniform. GPS_BAUD == 0 means "auto-detect on first run".
+#if GPS_BAUD > 0
+  gpsStartBaud(GPS_BAUD);
+  Serial.printf("[GPS] UART1 %ld baud  RX=GPIO%d (fixed from config.h)\n",
+                activeBaud, GPS_RX);
+#else
+  gpsStartBaud(kProbeBauds[0]);
+  Serial.println("[GPS] UART1 auto-detect: trying 9600 (set GPS_BAUD in config.h to skip)");
+#endif
   xTaskCreatePinnedToCore(gpsTask, "gps", 4096, nullptr, 1, nullptr, 0);
 }
 
 static void gpsPoll() {
+  // Auto-detect baud: if no NMEA / no raw bytes after a probe window, cycle to
+  // the next candidate. Also dump the first ~32 raw bytes so you can SEE the
+  // GPS TX line on the serial monitor (helps diagnose wiring / dead modules).
+  uint32_t now = millis();
+#if GPS_BAUD == 0
+  if (!probeDone) {
+    // Each baud gets 2s. If a candidate produced bytes or parsed a fix, lock in.
+    uint32_t slotStart = probeStartMs + (uint32_t)probeIdx * 2000u;
+    if (now - slotStart >= 2000u) {
+      if (byteCount > 0 || (nmeaAt && (now - nmeaAt) < 2000)) {
+        Serial.printf("[GPS] locked at %ld baud (%lu bytes)\n",
+                      activeBaud, (unsigned long)byteCount);
+        probeDone = true;
+      } else {
+        probeIdx++;
+        if (probeIdx >= kProbeCount) {
+          // Wrap once and stop. With no data at any baud we still need to keep
+          // polling, so leave activeBaud on the last attempt.
+          Serial.println("[GPS] no NMEA on any baud - check wiring (TX->GPIO, VCC=3V3)");
+          Serial.println("        also confirm the GPS has a fix (cold start 30-90s outdoors)");
+          probeDone = true;
+        } else {
+          Serial.printf("[GPS] no data @ %ld baud, trying %ld\n",
+                        activeBaud, kProbeBauds[probeIdx]);
+          gpsStartBaud(kProbeBauds[probeIdx]);
+        }
+      }
+    }
+  }
+#endif
+
+  // First-time RX dump so wiring problems show up on Serial Monitor. Only the
+  // first 32 bytes after boot; after that we trust the parser.
+  static uint32_t dumpDone = 0;
+  static char dumpBuf[64];
+  static size_t dumpLen = 0;
+  if (!dumpDone && byteCount >= 32) {
+    dumpDone = 1;
+    Serial.print("[GPS] raw RX: ");
+    for (size_t i = 0; i < dumpLen && i < 32; i++) {
+      uint8_t b = (uint8_t)dumpBuf[i];
+      if (b >= 32 && b < 127) Serial.write(b);
+      else Serial.printf("\\x%02x", b);
+    }
+    Serial.println();
+  }
+
   while (GpsUart.available()) {
     char c = (char)GpsUart.read();
+    byteCount++;
+    if (dumpLen < sizeof(dumpBuf)) dumpBuf[dumpLen++] = c;
     if (c == '\r') continue;
     if (c == '\n') {
       if (lineLen >= 10) {
@@ -165,6 +247,15 @@ static void gpsPoll() {
       lineBuf[lineLen++] = c;
     } else {
       lineLen = 0;
+    }
+  }
+
+  // Periodic byte-rate log so a stuck-at-zero RX also shows up in the heartbeat.
+  if (probeDone && byteCount == 0) {
+    static uint32_t lastZeroWarn = 0;
+    if (now - lastZeroWarn >= 30000) {
+      lastZeroWarn = now;
+      Serial.println("[GPS] 0 bytes received since boot - check GPS TX wire");
     }
   }
 
