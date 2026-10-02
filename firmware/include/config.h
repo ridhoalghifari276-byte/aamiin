@@ -150,7 +150,7 @@
 #define POWER_HOLD_MS       3000   // boot: hold SOS to force portal
 #define WIFI_RESET_HOLD_MS  8000   // hold video button for 8s to clear Wi-Fi / portal
 // Peer-SOS alert auto-clears after this many ms without a refresh from the
-// server. Server repeats the broadcast every ~1 s while any device has
-// sos=true; if the link is down for this long we accept the link is dead
-// and stop alerting the user.
-#define PEER_SOS_ALIVE_MS   5000
+// server. The gateway repeats the broadcast on each device-state post
+// (~5 s) while any unit still has sos=true. If that refresh stops, the
+// siren stops too — the other unit is gone or turned SOS off.
+#define PEER_SOS_ALIVE_MS   15000

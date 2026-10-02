@@ -934,6 +934,7 @@ static void handleServerCommand(const char *json, size_t len) {
     }
     xSemaphoreGive(stateMux);
   }
+  speakerSiren(on);
   Serial.printf("[PEER-SOS] from=%s on=%d\n", from, (int)on);
   stateDirty = true;
 }
@@ -1666,6 +1667,7 @@ void loop() {
   if (peerSosActive && (millis() - peerSosAt) > PEER_SOS_ALIVE_MS) {
     peerSosActive = false;
     peerSosFrom[0] = 0;
+    speakerSiren(false);
     stateLed();
     Serial.println("[PEER-SOS] auto-cleared (server silent)");
   }

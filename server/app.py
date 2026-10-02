@@ -474,10 +474,12 @@ device_sockets: dict[str, WebSocket] = {}
 _sockets_lock = threading.RLock()
 
 
-async def _broadcast_peer_sos(from_device: str, on: bool):
+async def _broadcast_peer_sos(from_device: str, on: bool, quiet: bool = False):
     """Push a peer-SOS event to every connected bodycam. Runs on the main
     event loop, so callers running from FastAPI threadpool must use
     asyncio.run_coroutine_threadsafe to schedule it.
+    quiet=True is the keepalive repeat while SOS stays on, so the siren
+    does not time out on the other units.
     """
     payload = json.dumps({"type": "sos", "from": from_device, "on": bool(on)})
     with _sockets_lock:
@@ -488,7 +490,8 @@ async def _broadcast_peer_sos(from_device: str, on: bool):
     for dev, ws in targets:
         try:
             await ws.send_text(payload)
-            print(f"[peer-sos] {from_device}->{dev} on={on}", flush=True)
+            if not quiet:
+                print(f"[peer-sos] {from_device}->{dev} on={on}", flush=True)
         except Exception as e:
             print(f"[peer-sos] send to {dev} failed: {e}", flush=True)
 ONLINE_TTL = 8.0
@@ -1615,20 +1618,22 @@ async def post_device_state(
                 device_state[x_device_id]["radio"] = radio_ready
     except Exception as e:
         print(f"[ptt] state hook {x_device_id}: {e}", flush=True)
-    # Peer-SOS cross-device broadcast. Only fire on edge transitions so we
-    # do not flood the WS every heartbeat.
-    if sos_now != sos_was and device_sockets:
-        print(f"[peer-sos] edge {x_device_id} {sos_was}->{sos_now} "
-              f"targets={len(device_sockets)-1}", flush=True)
+    # Peer-SOS: one message on the edge, then a quiet repeat on every state
+    # post while SOS stays on. Peers use that repeat to keep the siren going.
+    edge = sos_now != sos_was
+    if (edge or sos_now) and device_sockets:
+        if edge:
+            print(f"[peer-sos] edge {x_device_id} {sos_was}->{sos_now} "
+                  f"targets={len(device_sockets)-1}", flush=True)
         try:
             loop = asyncio.get_running_loop()
             asyncio.run_coroutine_threadsafe(
-                _broadcast_peer_sos(x_device_id, sos_now), loop
+                _broadcast_peer_sos(x_device_id, sos_now, quiet=not edge), loop
             )
         except RuntimeError:
             # No running loop (rare): skip broadcast.
             pass
-    elif sos_now != sos_was:
+    elif edge:
         print(f"[peer-sos] edge {x_device_id} {sos_was}->{sos_now} "
               f"no connected bodycams", flush=True)
     return {"ok": True, "device": x_device_id, "state": device_state[x_device_id]}

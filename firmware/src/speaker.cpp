@@ -24,6 +24,9 @@ static int16_t *spkRing = nullptr;
 static volatile size_t spkW = 0;
 static volatile size_t spkR = 0;
 static volatile bool muted = false;
+static volatile bool sirenOn = false;
+static uint32_t sirenPhase = 0;
+static uint32_t sirenCount = 0;
 static SemaphoreHandle_t spkMu = nullptr;
 static uint32_t spkPushCount = 0;
 
@@ -33,6 +36,26 @@ static size_t spkCountUnsafe() {
 
 void speakerMute(bool on) {
   muted = on;
+}
+
+void speakerSiren(bool on) {
+  if (sirenOn == on) return;
+  sirenOn = on;
+  if (!on) {
+    sirenPhase = 0;
+    sirenCount = 0;
+  }
+  Serial.printf("[SPK] siren %s\n", on ? "ON" : "off");
+}
+
+// European hi-lo ambulance: 650 Hz then 980 Hz, 400 ms each.
+static int16_t nextSiren() {
+  const uint32_t half = (uint32_t)MIC_SAMPLE_RATE * 400 / 1000;
+  uint32_t inc = ((sirenCount / half) & 1) ? 4014u : 2662u;
+  sirenCount++;
+  sirenPhase = (sirenPhase + inc) & 65535u;
+  float a = sinf((float)sirenPhase * (2.0f * 3.1415926f / 65536.0f));
+  return (int16_t)(a * 20000.0f);
 }
 
 void speakerPush(const uint8_t *pcm, size_t bytes) {
@@ -65,31 +88,47 @@ static void speakerTask(void *) {
   // Interleaved L,R — SD=3V3 uses RIGHT; L=R keeps both slots filled like radio FW.
   int16_t stereo[256];
   for (;;) {
-    if (muted || !spkRing || !spkMu) {
+    if (!spkRing || !spkMu) {
+      vTaskDelay(pdMS_TO_TICKS(10));
+      continue;
+    }
+    const bool alert = sirenOn;
+    if (muted && !alert) {
       vTaskDelay(pdMS_TO_TICKS(10));
       continue;
     }
     size_t take = 0;
-    if (xSemaphoreTake(spkMu, pdMS_TO_TICKS(20)) == pdTRUE) {
+    int16_t radio[128];
+    if (!muted && xSemaphoreTake(spkMu, pdMS_TO_TICKS(20)) == pdTRUE) {
       size_t avail = spkCountUnsafe();
       take = avail > 128 ? 128 : avail;
       for (size_t i = 0; i < take; i++) {
-        int16_t s = spkRing[spkR];
+        radio[i] = spkRing[spkR];
         spkR = (spkR + 1) % SPK_RING;
-        stereo[i * 2] = s;
-        stereo[i * 2 + 1] = s;
       }
       xSemaphoreGive(spkMu);
     }
-    if (!take) {
+    size_t n = alert ? 128 : take;
+    if (!n) {
       // Stopping the I2S clock between packets is the click/crackle.
       memset(stereo, 0, 64 * 2 * sizeof(int16_t));
       size_t written = 0;
       i2s_write(I2S_NUM_1, stereo, 64 * 2 * sizeof(int16_t), &written, pdMS_TO_TICKS(20));
       continue;
     }
+    for (size_t i = 0; i < n; i++) {
+      int32_t s = (i < take) ? (int32_t)radio[i] : 0;
+      if (alert) {
+        // Keep a little of the radio under the siren so a voice is still heard.
+        s = s / 3 + (int32_t)nextSiren();
+        if (s > 32767) s = 32767;
+        if (s < -32768) s = -32768;
+      }
+      stereo[i * 2] = (int16_t)s;
+      stereo[i * 2 + 1] = (int16_t)s;
+    }
     size_t written = 0;
-    i2s_write(I2S_NUM_1, stereo, take * 2 * sizeof(int16_t), &written, pdMS_TO_TICKS(50));
+    i2s_write(I2S_NUM_1, stereo, n * 2 * sizeof(int16_t), &written, pdMS_TO_TICKS(50));
   }
 }
 
@@ -163,5 +202,5 @@ void speakerBegin() {
   Serial.printf("[SPK] OK STEREO %dHz BCLK%d LRC%d DIN%d (SD=3V3 RIGHT)\n",
                 MIC_SAMPLE_RATE, SPK_I2S_BCLK, SPK_I2S_LRC, SPK_I2S_DOUT);
   bootBeep();
-  xTaskCreatePinnedToCore(speakerTask, "spk", 4096, nullptr, 3, nullptr, 0);
+  xTaskCreatePinnedToCore(speakerTask, "spk", 6144, nullptr, 3, nullptr, 0);
 }
