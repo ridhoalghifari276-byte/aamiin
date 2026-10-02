@@ -789,6 +789,7 @@
       gap: 0.4rem;
       align-items: center;
     }
+    .orient-bar .ov-btn { font-size: 0.72rem; padding: 0.32rem 0.6rem; }
     .ov-btn {
       font-family: "Rajdhani", sans-serif;
       font-weight: 700;
@@ -1459,6 +1460,12 @@
     let audioWs = null;
     let liveBlobUrl = null;
     let liveRotate = 0;
+    let viewRotate = 0;
+    let viewFlipH = false;
+    let viewFlipV = false;
+    let shownBmp = null;
+    let lastFaceMsg = null;
+    const VIEW_ORIENT_KEY = "bc_view_orient";
     const liveSpeakerEl = document.getElementById("live-speaker");
     let spectrumRaf = 0;
     let spectrumData = null;
@@ -1545,6 +1552,10 @@
         URL.revokeObjectURL(liveBlobUrl);
         liveBlobUrl = null;
       }
+      if (shownBmp) {
+        try { shownBmp.close(); } catch (_) {}
+        shownBmp = null;
+      }
       pendingJpeg = null;
       jpegBusy = false;
     }
@@ -1582,27 +1593,14 @@
       pendingJpeg = null;
       try {
         const bmp = await createImageBitmap(new Blob([bytes], { type: "image/jpeg" }));
-        const c = f.liveCanvas;
-        if (c) {
-          // Mount orientation is applied here, not on the server, so live frames
-          // never get decoded + re-encoded on the way to the browser.
-          const swap = liveRotate === 90 || liveRotate === 270;
-          const cw = swap ? bmp.height : bmp.width;
-          const ch = swap ? bmp.width : bmp.height;
-          if (c.width !== cw || c.height !== ch) {
-            c.width = cw;
-            c.height = ch;
+        if (f.liveCanvas) {
+          // Mount orientation stays a canvas transform. Operator rotate/flip
+          // is applied on top of it, still without re-encoding the JPEG.
+          paintLiveBitmap(f, bmp);
+          if (shownBmp && shownBmp !== bmp) {
+            try { shownBmp.close(); } catch (_) {}
           }
-          const ctx = c.getContext("2d");
-          if (liveRotate) {
-            ctx.save();
-            ctx.translate(cw / 2, ch / 2);
-            ctx.rotate(liveRotate * Math.PI / 180);
-            ctx.drawImage(bmp, -bmp.width / 2, -bmp.height / 2);
-            ctx.restore();
-          } else {
-            ctx.drawImage(bmp, 0, 0);
-          }
+          shownBmp = bmp;
         } else {
           const url = URL.createObjectURL(new Blob([bytes], { type: "image/jpeg" }));
           const prev = liveBlobUrl;
@@ -1610,7 +1608,7 @@
           f.img.src = url;
           if (prev && prev !== url) URL.revokeObjectURL(prev);
         }
-        bmp.close();
+        if (!f.liveCanvas) bmp.close();
         f.empty.classList.add("hidden");
         fpsFrames += 1;
         const now = performance.now();
@@ -1680,6 +1678,96 @@
       };
     }
 
+    function loadViewOrient(device) {
+      viewRotate = 0;
+      viewFlipH = false;
+      viewFlipV = false;
+      if (!device) return;
+      try {
+        const all = JSON.parse(localStorage.getItem(VIEW_ORIENT_KEY) || "{}");
+        const o = all[device] || {};
+        const rot = ((o.rot || 0) % 360 + 360) % 360;
+        viewRotate = rot === 90 || rot === 180 || rot === 270 ? rot : 0;
+        viewFlipH = !!o.h;
+        viewFlipV = !!o.v;
+      } catch (_) {}
+    }
+
+    function saveViewOrient(device) {
+      if (!device) return;
+      try {
+        const all = JSON.parse(localStorage.getItem(VIEW_ORIENT_KEY) || "{}");
+        all[device] = { rot: viewRotate, h: viewFlipH, v: viewFlipV };
+        localStorage.setItem(VIEW_ORIENT_KEY, JSON.stringify(all));
+      } catch (_) {}
+    }
+
+    function updateOrientButtons() {
+      const f = feeds.get(currentDevice);
+      if (!f) return;
+      if (f.btnRot) {
+        f.btnRot.textContent = "Putar " + viewRotate + "°";
+        f.btnRot.classList.toggle("on", viewRotate !== 0);
+      }
+      if (f.btnFlipV) f.btnFlipV.classList.toggle("on", viewFlipV);
+      if (f.btnFlipH) f.btnFlipH.classList.toggle("on", viewFlipH);
+    }
+
+    function paintLiveBitmap(f, bmp) {
+      const c = f.liveCanvas;
+      if (!c || !bmp) return;
+      const viewRot = ((viewRotate % 360) + 360) % 360;
+      const rot = ((liveRotate + viewRot) % 360 + 360) % 360;
+      const swap = rot === 90 || rot === 270;
+      const cw = swap ? bmp.height : bmp.width;
+      const ch = swap ? bmp.width : bmp.height;
+      if (c.width !== cw || c.height !== ch) {
+        c.width = cw;
+        c.height = ch;
+      }
+      const ctx = c.getContext("2d");
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+      ctx.clearRect(0, 0, cw, ch);
+      ctx.save();
+      ctx.translate(cw / 2, ch / 2);
+      if (viewFlipH || viewFlipV) ctx.scale(viewFlipH ? -1 : 1, viewFlipV ? -1 : 1);
+      if (rot) ctx.rotate(rot * Math.PI / 180);
+      ctx.drawImage(bmp, -bmp.width / 2, -bmp.height / 2);
+      ctx.restore();
+    }
+
+    function mapViewBox(x, y, w, h, fw, fh) {
+      let x1 = x, y1 = y, x2 = x + w, y2 = y + h;
+      let ow = fw, oh = fh;
+      const rot = ((viewRotate % 360) + 360) % 360;
+      if (rot === 90) {
+        x1 = fh - y2; y1 = x; x2 = fh - y; y2 = x + w;
+        ow = fh; oh = fw;
+      } else if (rot === 180) {
+        x1 = fw - x2; y1 = fh - y2; x2 = fw - x; y2 = fh - y;
+      } else if (rot === 270) {
+        x1 = y; y1 = fw - x2; x2 = y + h; y2 = fw - x;
+        ow = fh; oh = fw;
+      }
+      if (viewFlipH) {
+        const nx1 = ow - x2;
+        x2 = ow - x1;
+        x1 = nx1;
+      }
+      if (viewFlipV) {
+        const ny1 = oh - y2;
+        y2 = oh - y1;
+        y1 = ny1;
+      }
+      return { x: x1, y: y1, w: x2 - x1, h: y2 - y1, ow: ow, oh: oh };
+    }
+
+    function repaintLiveOrient() {
+      const f = feeds.get(currentDevice);
+      if (f && shownBmp && isVisualLive()) paintLiveBitmap(f, shownBmp);
+      if (lastFaceMsg) drawFaceOverlay(lastFaceMsg);
+    }
+
     function coverBox(img, x, y, bw, bh, iw, ih) {
       const cw = img.clientWidth, ch = img.clientHeight;
       if (!cw || !ch || !iw || !ih) return null;
@@ -1695,17 +1783,21 @@
     }
 
     function drawFaceOverlay(st) {
+      lastFaceMsg = st || null;
       const f = feeds.get(currentDevice);
       if (!f || !f.faceLayer) return;
       f.faceLayer.innerHTML = "";
       if (!faceOn || !st || st.enabled === false) return;
       const boxes = st.bboxes || [];
       const names = st.names || [];
-      const fw = (st.frame && st.frame[0]) || (f.liveCanvas && f.liveCanvas.width) || f.img.naturalWidth || 0;
-      const fh = (st.frame && st.frame[1]) || (f.liveCanvas && f.liveCanvas.height) || f.img.naturalHeight || 0;
+      const fw = (st.frame && st.frame[0]) || 0;
+      const fh = (st.frame && st.frame[1]) || 0;
       const target = f.liveCanvas || f.img;
       boxes.forEach((b, i) => {
-        const mapped = coverBox(target, b[0], b[1], b[2], b[3], fw, fh);
+        const src = fw && fh
+          ? mapViewBox(b[0], b[1], b[2], b[3], fw, fh)
+          : { x: b[0], y: b[1], w: b[2], h: b[3], ow: fw, oh: fh };
+        const mapped = coverBox(target, src.x, src.y, src.w, src.h, src.ow, src.oh);
         if (!mapped) return;
         const el = document.createElement("div");
         el.className = "face-box";
@@ -2077,6 +2169,7 @@
     }
 
     function createFeed(deviceId) {
+      loadViewOrient(deviceId);
       const root = document.createElement("div");
       root.className = "feed hud-corners active show-controls";
       root.dataset.device = deviceId;
@@ -2106,6 +2199,11 @@
           '<span class="spectrum-label">Voice Spectrum</span>' +
           '<canvas></canvas>' +
         '</div>' +
+        '<div class="overlay-bar orient-bar">' +
+          '<button type="button" class="ov-btn" data-act="rot">Putar 0°</button>' +
+          '<button type="button" class="ov-btn" data-act="flip-v">Atas–Bawah</button>' +
+          '<button type="button" class="ov-btn" data-act="flip-h">Kiri–Kanan</button>' +
+        '</div>' +
         '<div class="overlay-bar">' +
           '<button type="button" class="ov-btn" data-act="speaker">Speaker</button>' +
           '<button type="button" class="ov-btn rec" data-act="rec-audio">Rec Audio</button>' +
@@ -2127,6 +2225,9 @@
       const btnRecA = overlay.querySelector('[data-act="rec-audio"]');
       const btnRecV = overlay.querySelector('[data-act="rec-video"]');
       const btnFace = overlay.querySelector('[data-act="face"]');
+      const btnRot = overlay.querySelector('[data-act="rot"]');
+      const btnFlipV = overlay.querySelector('[data-act="flip-v"]');
+      const btnFlipH = overlay.querySelector('[data-act="flip-h"]');
       const statusEl = overlay.querySelector("[data-status]");
 
       img.addEventListener("load", () => {
@@ -2156,9 +2257,31 @@
         e.stopPropagation();
         setFaceEnabled(!faceOn);
       });
+      btnRot.addEventListener("click", (e) => {
+        e.stopPropagation();
+        viewRotate = (viewRotate + 90) % 360;
+        saveViewOrient(deviceId);
+        updateOrientButtons();
+        repaintLiveOrient();
+      });
+      btnFlipV.addEventListener("click", (e) => {
+        e.stopPropagation();
+        viewFlipV = !viewFlipV;
+        saveViewOrient(deviceId);
+        updateOrientButtons();
+        repaintLiveOrient();
+      });
+      btnFlipH.addEventListener("click", (e) => {
+        e.stopPropagation();
+        viewFlipH = !viewFlipH;
+        saveViewOrient(deviceId);
+        updateOrientButtons();
+        repaintLiveOrient();
+      });
 
-      const entry = { root, img, liveCanvas, empty, liveEl, canvas, btnSpeaker, btnRecA, btnRecV, btnFace, statusEl, faceLayer };
+      const entry = { root, img, liveCanvas, empty, liveEl, canvas, btnSpeaker, btnRecA, btnRecV, btnFace, btnRot, btnFlipV, btnFlipH, statusEl, faceLayer };
       feeds.set(deviceId, entry);
+      updateOrientButtons();
       return entry;
     }
 
@@ -2545,6 +2668,7 @@
     function renderMainFeed() {
       const keepSpeaker = speakerOn;
       lastVisualLive = null;
+      lastFaceMsg = null;
       wallEl.innerHTML = "";
       feeds.clear();
       if (!currentDevice) {

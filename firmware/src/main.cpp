@@ -198,21 +198,24 @@ static void applyCamNight(bool on) {
     s->set_raw_gma(s, 1);
     s->set_dcw(s, 1);
   } else {
-    // Daylight preset. Must mirror the initCam() thermal-stable settings,
-    // otherwise this branch silently undoes them and the picture goes dark
-    // green after the first applyCamNight(false) call in setup().
-    s->set_brightness(s, 1);
-    s->set_contrast(s, 1);
+    // Daylight preset. Must mirror initCam() thermal-stable settings so this
+    // branch doesn't undo them after the first call. Do NOT override aec_value
+    // or gainceiling — those force the sensor into a fixed operating point
+    // that reads as black on boot when AEC/AGC haven't converged.
+    s->set_brightness(s, 0);
+    s->set_contrast(s, 0);
     s->set_saturation(s, 0);
     s->set_whitebal(s, 1);
     s->set_awb_gain(s, 1);
     s->set_wb_mode(s, 0);
-    s->set_aec2(s, 1);
-    s->set_ae_level(s, 1);
-    s->set_aec_value(s, 800);
-    s->set_gainceiling(s, (gainceiling_t)6);
+    s->set_gain_ctrl(s, 1);
+    s->set_exposure_ctrl(s, 1);
+    // aec2 + ae_level make the OV5640 hunt: after a few minutes the frame
+    // slams between black and white. Leave both off so AEC can settle.
+    s->set_aec2(s, 0);
+    s->set_ae_level(s, 0);
     s->set_raw_gma(s, 0);
-    s->set_lenc(s, 1);
+    s->set_lenc(s, 0);
     s->set_bpc(s, 0);
     s->set_wpc(s, 0);
     s->set_dcw(s, 0);
@@ -1073,8 +1076,12 @@ static bool initCam() {
   // 10-user scene: keep only one framebuffer in PSRAM. A 1080p JPEG is
   // ~310 KB, so 1 buf = 310 KB vs 620 KB. Tiny tearing is acceptable for
   // streaming; the second buffer is a record-only luxury we can't afford.
-  c.fb_count = 1;
-  // LATEST can hand back a buffer the sensor is still filling. That is a stripe.
+  c.fb_count = 2;
+  // fb_count=2 lets the DMA-side fill the second buffer while the
+  // grab task reads the first. fb_count=1 (the original) triggered
+  // "cam_hal: FB-OVF" overflows whenever the Wi-Fi link stalled for a
+  // few hundred ms, which produced torn (white/green) frames because the
+  // sensor kept writing into a buffer the task hadn't drained yet.
   c.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
   c.fb_location = CAMERA_FB_IN_PSRAM;
 
@@ -1086,28 +1093,36 @@ static bool initCam() {
 
   sensor_t *s = esp_camera_sensor_get();
   if (s) {
-    // Thermal-stability fixes for OV5640 on continuous outdoor use:
-    //  - AEC2 enabled: adaptive exposure converges faster when the sensor
-    //    warms up; without it the picture goes dark 2-3 minutes after boot.
-    //  - LENC on: lens shading correction recovers the greenish tint that
-    //    shows up around the edges once the IR-cut / lens temperature shifts.
-    //  - AWB mode 0 (auto) but WB gain left to the sensor; locking both
-    //    (awb=0) keeps color stable but flips the picture magenta under
-    //    any lighting change, so we let AWB run and just clamp drift.
-    //  - AE level +1: small exposure bump that masks the typical "warm
-    //    sensor reads dimmer" effect.
-    s->set_brightness(s, 1);
-    s->set_contrast(s, 1);
+    // Thermal-stability fixes for OV5640/OV2640 on continuous outdoor use.
+    // Key principle: do NOT touch aec_value, gainceiling, or any register
+    // that locks an absolute value — let AEC/AGC converge on their own and
+    // only nudge the algorithms that are known to drift with sensor
+    // temperature (AWB, AWB-gain, lens shading).
+    //
+    // The previous attempt set aec_value=800 + gainceiling=128X which left
+    // the sensor exposed too dark on boot: gainceiling enum 6 = 128X but
+    // forcing AEC2=1 made the adaptive loop under-compensate, producing a
+    // near-black picture. Leaving all the gain/exposure knobs at their
+    // driver defaults gives the cleanest image and lets the auto loops run.
+    s->set_brightness(s, 0);
+    s->set_contrast(s, 0);
     s->set_saturation(s, 0);
     s->set_whitebal(s, 1);
     s->set_awb_gain(s, 1);
     s->set_wb_mode(s, 0);          // auto WB
-    s->set_aec2(s, 1);             // adaptive AEC, was 0
-    s->set_ae_level(s, 1);         // +1 stops -> compensate warm-up dim
-    s->set_aec_value(s, 800);      // start with mid exposure target
-    s->set_gainceiling(s, (gainceiling_t)6);  // GAINCEILING_8X (was default 2X)
+    s->set_gain_ctrl(s, 1);
+    s->set_exposure_ctrl(s, 1);
+    // aec2 and a raised AE level make this sensor oscillate after warm-up:
+    // the picture goes black, then white, and keeps flipping. Auto exposure
+    // stays on; only that second loop is off.
+    s->set_aec2(s, 0);
+    s->set_ae_level(s, 0);
     s->set_raw_gma(s, 0);
-    s->set_lenc(s, 1);             // lens shading, was 0
+    // LENC was previously on to fight edge-green-tint, but it adds a full
+    // ISP-stage post-process that pushed 720p JPEG to 25-30 KB at q=10 and
+    // starved Wi-Fi. With q=12 + 24 fps we no longer need it; if the
+    // corners read green again, re-enable this and drop FPS to 20.
+    s->set_lenc(s, 0);
     s->set_bpc(s, 0);
     s->set_wpc(s, 0);
     s->set_dcw(s, 0);
@@ -1237,7 +1252,6 @@ static void audioTxTask(void *) {
 static void houseKeepTask(void *) {
   uint32_t lastHb = 0;
   uint32_t linkOkAt = millis();
-  uint32_t lastCamTune = 0;
   for (;;) {
     if (WiFi.status() != WL_CONNECTED) {
       linkOkAt = millis();
@@ -1289,18 +1303,6 @@ static void houseKeepTask(void *) {
       rtHeartbeat(WiFi.RSSI(), ESP.getFreeHeap());
       rtAdaptCam();
 #endif
-    }
-    // Periodic sensor re-tune: AWB/AEC drift after 5-10 minutes on the OV5640
-    // is the cause of the green/dark picture after warm-up. A nudge every
-    // 60 s — flipping whitebal off then on — forces the AWB state machine to
-    // re-converge without us having to talk to the sensor every frame.
-    if (now - lastCamTune >= 60000) {
-      lastCamTune = now;
-      sensor_t *s = esp_camera_sensor_get();
-      if (s) {
-        s->set_whitebal(s, 0);
-        s->set_whitebal(s, 1);
-      }
     }
 #if RT_STREAM
     rtPoll();

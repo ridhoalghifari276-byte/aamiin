@@ -1618,6 +1618,8 @@ async def post_device_state(
     # Peer-SOS cross-device broadcast. Only fire on edge transitions so we
     # do not flood the WS every heartbeat.
     if sos_now != sos_was and device_sockets:
+        print(f"[peer-sos] edge {x_device_id} {sos_was}->{sos_now} "
+              f"targets={len(device_sockets)-1}", flush=True)
         try:
             loop = asyncio.get_running_loop()
             asyncio.run_coroutine_threadsafe(
@@ -1626,6 +1628,9 @@ async def post_device_state(
         except RuntimeError:
             # No running loop (rare): skip broadcast.
             pass
+    elif sos_now != sos_was:
+        print(f"[peer-sos] edge {x_device_id} {sos_was}->{sos_now} "
+              f"no connected bodycams", flush=True)
     return {"ok": True, "device": x_device_id, "state": device_state[x_device_id]}
 
 

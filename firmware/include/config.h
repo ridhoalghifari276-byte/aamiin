@@ -70,12 +70,18 @@
 // ============================================================
 #define LIVE_WIDTH      1280
 #define LIVE_HEIGHT     720
-#define LIVE_JPEG_Q     10
-#define LIVE_FPS        30
+// JPEG quality 0..63 (lower = sharper, larger file). Q=12 keeps a 720p JPEG
+// around 8-14 KB and prevents cam_hal: FB-OVF overflows that came with Q=10
+// (which produced 25-30 KB frames and stalled Wi-Fi). Q=12 still looks clean
+// on bodycam output.
+#define LIVE_JPEG_Q     12
+// 24 fps instead of 30 — halves the Wi-Fi pressure when 10 units are on the
+// same AP and gives the camera task margin to keep up when link stalls.
+#define LIVE_FPS        24
 #define REC_WIDTH       1920
 #define REC_HEIGHT      1080
-#define REC_JPEG_Q      12
-#define REC_FPS         15
+#define REC_JPEG_Q      14
+#define REC_FPS         12
 #define STREAM_WIDTH    LIVE_WIDTH
 #define STREAM_HEIGHT   LIVE_HEIGHT
 #define JPEG_QUALITY    LIVE_JPEG_Q
