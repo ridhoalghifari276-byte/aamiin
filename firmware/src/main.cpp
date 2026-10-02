@@ -1,7 +1,7 @@
-// Handshake budget. 3 s expired at RSSI -77 before the HTTP 101
-// arrived, so the socket died with "Header response timeout".
+// Handshake budget. 80 ms expired before the VPS answered, so the
+// socket died with "disconnected" and never printed "connected".
 // Video and mic do not use this write path.
-#define WEBSOCKETS_TCP_TIMEOUT (5000)
+#define WEBSOCKETS_TCP_TIMEOUT (3000)
 #include <Arduino.h>
 #include <WiFi.h>
 #include <fcntl.h>
@@ -58,28 +58,18 @@ class TunedWs : public WebSocketsClient {
     if (!_client.tcp) return;
     _client.tcp->setNoDelay(true);
     _client.tcp->setConnectionTimeout(5);
-    int fd = _client.tcp->fd();
-    if (fd >= 0) {
-      // Non-blocking send returns as soon as 5744 bytes are queued and
-      // never waits for the ACK, so the rest of the JPEG sits forever.
-      struct timeval tv;
-      tv.tv_sec = 0;
-      tv.tv_usec = 80000;
-      setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-    }
     Serial.printf("[WS] %s nodelay\n", tag);
   }
 
-  // One slice. A full TCP buffer waits up to SO_SNDTIMEO for an ACK
-  // instead of returning immediately and leaving the frame stuck.
+  // One non-blocking slice. tcp->write() keeps going while any byte is
+  // accepted, so a slow link held the camera task for seconds.
   int pushRaw(const uint8_t *data, size_t n) {
-    if (!_client.tcp || !data || !n) return -1;
+    if (!_client.tcp || !_client.tcp->connected() || !data || !n) return -1;
     int sock = _client.tcp->fd();
     if (sock < 0) return -1;
-    int r = ::send(sock, data, n, 0);
+    int r = ::send(sock, data, n, MSG_DONTWAIT);
     if (r > 0) return r;
-    if (r == 0 || errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK ||
-        errno == ETIMEDOUT || errno == ENOMEM || errno == ENOBUFS) return 0;
+    if (r == 0 || errno == EAGAIN || errno == EWOULDBLOCK) return 0;
     return -1;
   }
 
@@ -100,8 +90,6 @@ class TunedWs : public WebSocketsClient {
 static TunedWs streamWs;
 static volatile bool wsConnected = false;
 static bool wsStarted = false;
-static uint32_t wsRetryAt = 0;
-static uint32_t wsAttemptAt = 0;
 static TunedWs audioWs;
 static volatile bool audioWsConnected = false;
 static bool audioWsStarted = false;
@@ -308,8 +296,8 @@ static bool postJson(const char *path, const String &body) {
 
   h.addHeader("Content-Type", "application/json");
   copySessionHeaders(h);
-  h.setConnectTimeout(1500);
-  h.setTimeout(800);
+  h.setConnectTimeout(4000);
+  h.setTimeout(4000);
   int code = h.POST(body);
   h.end();
   return code >= 200 && code < 300;
@@ -464,7 +452,6 @@ static void startWebSocket() {
   if (WiFi.status() != WL_CONNECTED) return;
   if (wsStarted) return;
   if (!serverHost.length()) return;
-  if ((int32_t)(wsRetryAt - millis()) > 0) return;
 
   String path = String(SERVER_WS_PATH) +
                 "?device=" + deviceId +
@@ -475,7 +462,6 @@ static void startWebSocket() {
   // Empty subprotocol: FastAPI rejects Sec-WebSocket-Protocol: arduino.
   streamWs.begin(serverHost.c_str(), SERVER_PORT, path.c_str(), "");
   wsStarted = true;
-  wsAttemptAt = millis();
   Serial.printf("[WS] connecting %s:%d%s\n", serverHost.c_str(), SERVER_PORT, path.c_str());
 }
 
@@ -572,13 +558,10 @@ static void ensureCamProfile(bool hd) {
   if (camIsHd == hd) return;
   sensor_t *s = esp_camera_sensor_get();
   if (!s) return;
-  // Only the grab task calls this, and only when record is toggled.
-  // Live stays 640x480 so the server is not fed 720p all the time.
-  s->set_framesize(s, hd ? FRAMESIZE_HD : FRAMESIZE_VGA);
   s->set_quality(s, hd ? REC_JPEG_Q : liveQ);
+  s->set_sharpness(s, hd ? 1 : 0);
   camIsHd = hd;
-  Serial.printf("[CAM] %s %dx%d q=%d\n", hd ? "record" : "live",
-                hd ? REC_WIDTH : LIVE_WIDTH, hd ? REC_HEIGHT : LIVE_HEIGHT,
+  Serial.printf("[CAM] %s 640x480 q=%d\n", hd ? "record" : "live",
                 hd ? REC_JPEG_Q : liveQ);
 }
 
@@ -619,16 +602,16 @@ static bool queueVideoFrame(const uint8_t *payload, size_t len) {
 // 1 = idle (frame finished or nothing queued), 0 = still sending, -1 = dropped.
 static int pumpVideo() {
   if (!wsLen) return 1;
+  // One full VGA JPEG fills every Wi-Fi TX slot. The mic then stalls
+  // (ring hits 47999) and this socket is reset. One slot per turn.
   size_t left = wsLen - wsOff;
-  // Stay under one segment so the send buffer is not filled to 5744
-  // and then left waiting for an ACK that send() no longer asks for.
-  size_t slice = left > 1360 ? 1360 : left;
+  size_t slice = left > 640 ? 640 : left;
   int n = streamWs.pushRaw(wsFrame + wsOff, slice);
   if (n < 0) {
-    // The socket is already dead. Do not also call disconnect(): that
-    // left the library printing "TCP connection cleanup" forever.
     wsLen = 0;
     ++txVideoDrops;
+    streamWs.disconnect();
+    wsConnected = false;
     return -1;
   }
   if (n > 0) wsOff += (size_t)n;
@@ -639,15 +622,12 @@ static int pumpVideo() {
     if (!camIsHd) tuneLiveSize(lastJpegBytes, lastVideoSendMs);
     return 1;
   }
-  // No byte has left the device, so dropping this frame does not splice.
   if (wsOff == 0 && millis() - wsT0 > 200) {
     wsLen = 0;
     ++txVideoSkips;
     return -1;
   }
-  // Bytes already queued stay on the socket. Disconnecting here threw
-  // away a frame at offset 5744 and the picture never reached 1 FPS.
-  return n > 0 ? 2 : 0;
+  return 0;
 }
 
 static int udpFd = -1;
@@ -842,35 +822,10 @@ static void freshenFb(void *buf, size_t len) {
   esp_cache_msync((void *)start, end - start, ESP_CACHE_MSYNC_FLAG_DIR_M2C);
 }
 
-// One JPEG, one HTTP request. A long-lived websocket frame was stopping
-// at byte 5744 and the dashboard stayed on NO SIGNAL after a single picture.
-static bool postJpeg(const uint8_t *jpg, size_t len) {
-  static WiFiClient frameClient;
-  static HTTPClient frameHttp;
-  static bool frameOpen = false;
-  if (!frameOpen) {
-    frameOpen = frameHttp.begin(frameClient, baseUrl() + "/api/v1/frame");
-    if (!frameOpen) return false;
-    frameHttp.setReuse(true);
-    frameHttp.setConnectTimeout(800);
-    frameHttp.setTimeout(600);
-  }
-  frameHttp.addHeader("Content-Type", "image/jpeg");
-  copySessionHeaders(frameHttp);
-  uint32_t t0 = millis();
-  int code = frameHttp.POST((uint8_t *)jpg, len);
-  lastVideoSendMs = millis() - t0;
-  if (code >= 200 && code < 300) return true;
-  frameHttp.end();
-  frameClient.stop();
-  frameOpen = false;
-  return false;
-}
-
 static bool sendVideoFrame() {
   // The camera task owns esp_camera_fb_get(). Calling it here blocked the
   // websocket handshake for seconds, so the dashboard stayed on NO SIGNAL.
-  if (!visualOn() || !txPacket || !grabBuf || !grabMu) {
+  if (!visualOn() || !txPacket || !grabBuf || !grabMu || !wsConnected) {
     ++txVideoDrops;
     return false;
   }
@@ -882,9 +837,9 @@ static bool sendVideoFrame() {
   }
   uint32_t seq = grabSeq;
   len = grabLen;
-  bool fresh = seq != lastSeq && len > 128 && len <= txPacketCap;
+  bool fresh = seq != lastSeq && len > 128 && len + 1 <= txPacketCap;
   if (fresh) {
-    memcpy(txPacket, grabBuf, len);
+    memcpy(txPacket + 1, grabBuf, len);
     lastSeq = seq;
   }
   xSemaphoreGive(grabMu);
@@ -892,12 +847,12 @@ static bool sendVideoFrame() {
     ++txVideoSkips;
     return false;
   }
+  txPacket[0] = 0x01;
   lastJpegBytes = len;
-  if (!postJpeg(txPacket, len)) {
+  if (!queueVideoFrame(txPacket, len + 1)) {
     ++txVideoDrops;
     return false;
   }
-  ++txVideoFrames;
   return true;
 }
 
@@ -1144,25 +1099,10 @@ static void audioTxTask(void *) {
     // Open audio WS only after /ws/device is up so two handshakes do not
     // fight for the few lwIP sockets on a filtered meeting LAN.
     if (wsConnected) startAudioWebSocket();
-    // A JPEG already owns the 8 Wi-Fi slots. Mic packets during that
-    // send are what froze the picture at video=1 after audio connected.
-    if (wsLen && !(audioLen && audioOff)) {
-      if (ringCount() > (size_t)AUDIO_TX_SAMPLES * 4) {
-        ringKeepLatest((size_t)AUDIO_TX_SAMPLES * 2);
-      }
-      if (!audioLen) audioWs.loop();
-      vTaskDelay(pdMS_TO_TICKS(10));
-      continue;
-    }
     // Finish a half-sent mic frame before loop() writes anything else.
     if (audioWsConnected && audioLen && audioOff) {
-      int st = pumpAudio();
-      // Keep the newest mic audio. Disconnecting this socket after a
-      // short stall was what took the video socket down with it.
-      if (ringCount() > (size_t)AUDIO_TX_SAMPLES * 4) {
-        ringKeepLatest((size_t)AUDIO_TX_SAMPLES * 2);
-      }
-      vTaskDelay(pdMS_TO_TICKS(st > 0 ? 1 : 10));
+      pumpAudio();
+      vTaskDelay(pdMS_TO_TICKS(1));
       continue;
     }
     audioWs.loop();
@@ -1193,7 +1133,6 @@ static void audioTxTask(void *) {
 // HOUSEKEEPING — every blocking HTTP call lives here, never in the video task.
 static void houseKeepTask(void *) {
   uint32_t lastHb = 0;
-  uint32_t lastPost = 0;
   uint32_t linkOkAt = millis();
   for (;;) {
     if (WiFi.status() != WL_CONNECTED) {
@@ -1211,25 +1150,19 @@ static void houseKeepTask(void *) {
       serverHost = SERVER_HOST;
       stopWebSocket();
       stopAudioWebSocket();
-      WiFi.setSleep(false);
-      esp_wifi_set_ps(WIFI_PS_NONE);
+      WiFi.setSleep(true);
       linkOkAt = millis();
     }
 
     applySessionCmd();
-    if (stateDirty && wsConnected) {
+    if (stateDirty) {
       stateDirty = false;
       postDeviceState();
     }
     uint32_t now = millis();
     if (now - lastHb >= 5000) {
       lastHb = now;
-      // An HTTP post while the socket is down takes the radio at RSSI -74
-      // and the websocket handshake never finishes, so the feed stays black.
-      if (wsConnected && now - lastPost >= 15000) {
-        lastPost = now;
-        postDeviceState();
-      }
+      postDeviceState();
       Serial.printf("[STAT] ws=%d aws=%d ptt=%d sos=%d gps=%d rx=%d sats=%d audio=%lu drops=%lu video=%lu drops=%lu skip=%lu send=%ums jpg=%u sig=%08x ring=%u RSSI=%d\n",
                     wsConnected,
                     audioWsConnected,
@@ -1282,16 +1215,10 @@ static void camGrabTask(void *) {
       vTaskDelay(pdMS_TO_TICKS(30));
       continue;
     }
-    if (videoEnabled != camIsHd) {
-      esp_camera_fb_return(fb);
-      ensureCamProfile(videoEnabled);
-      vTaskDelay(pdMS_TO_TICKS(40));
-      continue;
-    }
     size_t len = fb->len;
     bool ok = grabBuf && grabMu && fb->buf && fb->width >= 160 && fb->height >= 120 &&
               fb->width <= 1280 && fb->height <= 720 &&
-              len > 128 && len <= txPacketCap && len <= 40000;
+              len > 128 && len <= txPacketCap && len <= 48000;
     if (ok) {
       // Look for FFD9 anywhere. Checking only the last 32 bytes threw
       // away later frames, grabSeq froze, and the dashboard stayed black.
@@ -1362,8 +1289,8 @@ static void streamTxTask(void *) {
     // Finish the JPEG before loop(). loop() peeks the socket and was
     // resetting the link ("Connection lost") in the middle of a frame.
     if (wsLen) {
-      int st = pumpVideo();
-      vTaskDelay(pdMS_TO_TICKS(st == 0 ? 5 : 1));
+      pumpVideo();
+      vTaskDelay(pdMS_TO_TICKS(12));
       continue;
     }
 
@@ -1379,14 +1306,14 @@ static void streamTxTask(void *) {
       wsUpAt = 0;
     }
 
-    // Each picture is its own POST /api/v1/frame. The video websocket
-    // stays up for presence only, so a slow JPEG cannot freeze it.
-    const uint32_t framePeriod = videoEnabled ? 250 : 100;
+    // Whole JPEG on the video socket. UDP pieces were arriving torn.
+    const uint32_t framePeriod = 1000 / LIVE_FPS;
 
     uint32_t now = millis();
     if ((int32_t)(now - nextFrame) >= 0) {
       bool sent = false;
-      if (!visualOn()) {
+      bool hold = !wsConnected || (millis() - wsUpAt) < 500;
+      if (!visualOn() || hold) {
         sent = false;
       } else {
         sent = sendVideoFrame();
@@ -1472,15 +1399,15 @@ void setup() {
   applyCamNight(false);
   btnIgnoreUntil = millis() + 1200;
   stateLed();
+  postDeviceState();
 
   xTaskCreatePinnedToCore(audioTxTask, "audiotx", 8192, nullptr, 3, nullptr, 0);
   xTaskCreatePinnedToCore(houseKeepTask, "house", 8192, nullptr, 1, nullptr, 0);
 
   led(false);
-  Serial.printf("[BODYCAM] live A/V started - %dx%d HTTP frame, audio=%d Hz/%d ms\n",
-                STREAM_WIDTH, STREAM_HEIGHT,
+  Serial.printf("[BODYCAM] live A/V started - %dx%d @ %d FPS, audio=%d Hz/%d ms\n",
+                STREAM_WIDTH, STREAM_HEIGHT, STREAM_FPS,
                 MIC_SAMPLE_RATE, AUDIO_CHUNK_MS);
-  Serial.println("[CAM] picture = POST /api/v1/frame  (websocket is presence only)");
 }
 
 void loop() {
