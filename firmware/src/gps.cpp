@@ -88,6 +88,13 @@ static void noteNmea(int nsat) {
   portEXIT_CRITICAL(&gpsMux);
 }
 
+// Raw-talker-id detection: works for $GPGGA / $GNGGA / $GLGGA / $GAGGA and
+// the same family on RMC. strncmp(line+3, "GGA", 3) matches every talker
+// because the third-through-fifth chars are what NMEA defines as the
+// sentence id, regardless of the leading two-letter talker prefix.
+static const char *kKnownGga = "GGA";
+static const char *kKnownRmc = "RMC";
+
 static void applyFix(double lat, double lon, float alt, float spd, float crs, int nsat, bool valid) {
   if (!valid) return;
   if (lat == 0.0 && lon == 0.0) return;
@@ -105,6 +112,24 @@ static void applyFix(double lat, double lon, float alt, float spd, float crs, in
   portEXIT_CRITICAL(&gpsMux);
 }
 
+static void parseGsv(char *line) {
+  // $GPGSV,totalMsgs,msgNum,satsInView,(sat1,elev1,azim1,snr1)*cs
+  // field[3] is the "satellites in view" count. The message is split across
+  // multiple sentences (max 3 sats each) so we only update the counter when
+  // we see the first sentence of a batch (msgNum == 1) to avoid double
+  // counting the same satellites.
+  char *star = strchr(line, '*');
+  if (star) *star = 0;
+  char *f[20];
+  int n = splitCsv(line, f, 20);
+  if (n < 4) return;
+  int msgNum = atoi(f[2]);
+  int inView = atoi(f[3]);
+  if (msgNum != 1) return;        // only the head of the batch updates the count
+  if (inView <= 0 || inView > 64) return;
+  noteNmea(inView);
+}
+
 static void parseGga(char *line) {
   char *star = strchr(line, '*');
   if (star) *star = 0;
@@ -114,6 +139,10 @@ static void parseGga(char *line) {
   // $GPGGA,time,lat,N,lon,E,fix,sats,hdop,alt,M,...
   int quality = atoi(f[6]);
   int nsat = f[7][0] ? atoi(f[7]) : -1;
+  // Always record the satellite number when GGA arrives, even if quality is
+  // zero. The previous code only updated sats when quality > 0, which meant
+  // a module that took 5 minutes to get its first fix never reported sat
+  // count progress to the UI.
   noteNmea(nsat);
   if (quality <= 0) return;
   if (!f[2][0] || !f[4][0]) return;
@@ -140,14 +169,41 @@ static void parseRmc(char *line) {
   applyFix(lat, lon, -9999.0f, spd, crs, -1, true);
 }
 
+// Total NMEA lines parsed and total lines seen (including ones that failed
+// checksum). Used by the periodic status log to tell "module is silent" from
+// "module is talking but the parser drops every line".
+static uint32_t nmeaOk = 0;
+static uint32_t nmeaBad = 0;
+static uint32_t lastNmeaLog = 0;
+static char lastTalker[8] = {0};
+static uint32_t lastTalkerCount = 0;
+
 static void handleLine(char *line) {
   if (line[0] != '$') return;
-  if (strchr(line, '*') && !nmeaChecksumOk(line)) return;
+  bool hasStar = strchr(line, '*') != nullptr;
+  bool ok = !hasStar || nmeaChecksumOk(line);
+  if (!ok) {
+    nmeaBad++;
+    return;
+  }
   noteNmea(-1);
+  nmeaOk++;
+  // Stash the talker/sentence id so the periodic log can show what the GPS
+  // is actually sending. Helps tell apart "no satellites" from "no GGA".
+  size_t tl = strlen(line);
+  if (tl >= 6) {
+    size_t copy = tl < 6 ? tl : 6;
+    if (copy > sizeof(lastTalker) - 1) copy = sizeof(lastTalker) - 1;
+    memcpy(lastTalker, line, copy);
+    lastTalker[copy] = 0;
+    lastTalkerCount++;
+  }
   if (talkerIs(line, "GGA")) {
     parseGga(line);
   } else if (talkerIs(line, "RMC")) {
     parseRmc(line);
+  } else if (talkerIs(line, "GSV")) {
+    parseGsv(line);
   }
 }
 
@@ -157,8 +213,13 @@ static void gpsStartBaud(long baud) {
     return;
   }
   GpsUart.end();
-  GpsUart.begin(baud, SERIAL_8N1, GPS_RX, GPS_TX);
+  // setRxBufferSize must be called BEFORE begin(). Calling it after begin()
+  // prints "RX Buffer can't be resized when Serial is already running" and
+  // leaves the UART driver in an undefined state on some ESP32-S3 clones,
+  // which then crashes WebSocketsClient on the next TCP event. Default 256
+  // bytes is plenty for one-second NMEA bursts.
   GpsUart.setRxBufferSize(512);
+  GpsUart.begin(baud, SERIAL_8N1, GPS_RX, GPS_TX);
   lineLen = 0;
   activeBaud = baud;
 }
@@ -166,7 +227,11 @@ static void gpsStartBaud(long baud) {
 void gpsBegin() {
   probeStartMs = millis();
   probeIdx = 0;
-  probeDone = false;
+  // Mark probeDone immediately when GPS_BAUD is fixed in config.h, otherwise
+  // the periodic NMEA status log below never prints — it guards on
+  // probeDone, and the auto-detect block that flips probeDone is itself
+  // #if'd out when GPS_BAUD > 0.
+  probeDone = (GPS_BAUD > 0);
   activeBaud = 0;
   byteCount = 0;
   // If GPS_BAUD is set in config.h we still go through gpsStartBaud() so the
@@ -179,6 +244,17 @@ void gpsBegin() {
   gpsStartBaud(kProbeBauds[0]);
   Serial.println("[GPS] UART1 auto-detect: trying 9600 (set GPS_BAUD in config.h to skip)");
 #endif
+  // Many NEO-7M clones ship with GGA disabled (only GLL/GSV/RMC enabled by
+  // default). Without GGA our parser never sees a satellite count and the
+  // dashboard reads "sats=0" forever even when the module is tracking 8
+  // birds. u-blox accepts the proprietary PUBX config command over UART1 to
+  // re-enable every standard sentence at 1 Hz.
+  //
+  // We do NOT have a TX wire (config.h: GPS_TX = -1), so we cannot push the
+  // command back to the module. Best we can do is document it: if you want
+  // auto-enable, wire GPS_RX<->GPS_TX (loopback) or drive a u-center session
+  // once on the bench, send "$PUBX,40,GGA,1,1,1,1*5B" etc., then save the
+  // config with "$PUBX,00*0A" then "$PUBX,06,1*3A".
   xTaskCreatePinnedToCore(gpsTask, "gps", 4096, nullptr, 1, nullptr, 0);
 }
 
@@ -257,6 +333,19 @@ static void gpsPoll() {
       lastZeroWarn = now;
       Serial.println("[GPS] 0 bytes received since boot - check GPS TX wire");
     }
+  }
+  // Periodic sentence breakdown so you can SEE what the module is sending.
+  // Without this, "sats=0" can mean anything: no RX, all checksums failing,
+  // only GSV sent, or only RMC with status=V (no fix).
+  if (probeDone && now - lastNmeaLog >= 15000) {
+    lastNmeaLog = now;
+    Serial.printf("[GPS] NMEA ok=%lu bad=%lu last='%s' (x%lu) bytes=%lu\n",
+                  (unsigned long)nmeaOk,
+                  (unsigned long)nmeaBad,
+                  lastTalker,
+                  (unsigned long)lastTalkerCount,
+                  (unsigned long)byteCount);
+    lastTalkerCount = 0;
   }
 
   portENTER_CRITICAL(&gpsMux);

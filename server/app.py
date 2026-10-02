@@ -467,6 +467,30 @@ INGEST_WORKERS = int(os.getenv("INGEST_WORKERS", "8"))
 lock = threading.RLock()
 face_engine: FaceEngine | None = None
 device_state: dict[str, dict] = {}
+# device_id -> active /ws/device WebSocket. Used to push server-side events
+# (currently peer-SOS broadcasts) back to every connected bodycam without
+# routing through the dashboard.
+device_sockets: dict[str, WebSocket] = {}
+_sockets_lock = threading.RLock()
+
+
+async def _broadcast_peer_sos(from_device: str, on: bool):
+    """Push a peer-SOS event to every connected bodycam. Runs on the main
+    event loop, so callers running from FastAPI threadpool must use
+    asyncio.run_coroutine_threadsafe to schedule it.
+    """
+    payload = json.dumps({"type": "sos", "from": from_device, "on": bool(on)})
+    with _sockets_lock:
+        targets = [
+            (dev, ws) for dev, ws in device_sockets.items()
+            if dev != from_device
+        ]
+    for dev, ws in targets:
+        try:
+            await ws.send_text(payload)
+            print(f"[peer-sos] {from_device}->{dev} on={on}", flush=True)
+        except Exception as e:
+            print(f"[peer-sos] send to {dev} failed: {e}", flush=True)
 ONLINE_TTL = 8.0
 # 10-user scene: target_fps/live_fps were 20/12 — that floor meant viewers
 # never saw more than 12 fps even when the device was pumping 30. Floor matches
@@ -1571,10 +1595,15 @@ async def post_device_state(
             "ts": time.time(),
         }
         touch_device(x_device_id)
+    sos_now = bool(body.get("sos"))
+    sos_was = False
+    with lock:
+        if x_device_id in device_state:
+            sos_was = bool(device_state[x_device_id].get("sos"))
     try:
         pqtalkie.ensure_standby(x_device_id)
         pqtalkie.set_device_tx(x_device_id, bool(body.get("ptt")))
-        pqtalkie.set_device_sos(x_device_id, bool(body.get("sos")))
+        pqtalkie.set_device_sos(x_device_id, sos_now)
         if body.get("lat") is not None and body.get("lon") is not None:
             pqtalkie.set_device_location(x_device_id, body.get("lat"), body.get("lon"))
         tok = (body.get("ptt_token") or "").strip()
@@ -1586,6 +1615,17 @@ async def post_device_state(
                 device_state[x_device_id]["radio"] = radio_ready
     except Exception as e:
         print(f"[ptt] state hook {x_device_id}: {e}", flush=True)
+    # Peer-SOS cross-device broadcast. Only fire on edge transitions so we
+    # do not flood the WS every heartbeat.
+    if sos_now != sos_was and device_sockets:
+        try:
+            loop = asyncio.get_running_loop()
+            asyncio.run_coroutine_threadsafe(
+                _broadcast_peer_sos(x_device_id, sos_now), loop
+            )
+        except RuntimeError:
+            # No running loop (rare): skip broadcast.
+            pass
     return {"ok": True, "device": x_device_id, "state": device_state[x_device_id]}
 
 
@@ -1995,7 +2035,9 @@ async def mjpeg(request: Request, device: str = "bodycam-01", annotate: int = 0)
 
 @app.websocket("/ws/device")
 async def ws_device(websocket: WebSocket):
-    """Persistent ESP32 ingest socket. Binary packet: 0x01 JPEG, 0x02 PCM."""
+    """Persistent ESP32 ingest socket. Binary packet: 0x01 JPEG, 0x02 PCM.
+    Also used for server→device TEXT frames (currently peer-SOS broadcasts).
+    """
     await websocket.accept()
     device = websocket.query_params.get("device") or ""
     token = websocket.query_params.get("token") or ""
@@ -2004,6 +2046,8 @@ async def ws_device(websocket: WebSocket):
         return
     touch_device(device)
     print(f"[ws-device] connected {device}", flush=True)
+    with _sockets_lock:
+        device_sockets[device] = websocket
     threading.Thread(
         target=lambda d=device: _safe_standby(d),
         name=f"ptt-standby-{device}",
@@ -2054,6 +2098,9 @@ async def ws_device(websocket: WebSocket):
             await speaker_task
         except Exception:
             pass
+        with _sockets_lock:
+            if device_sockets.get(device) is websocket:
+                device_sockets.pop(device, None)
         print(f"[ws-device] disconnected {device}", flush=True)
 
 

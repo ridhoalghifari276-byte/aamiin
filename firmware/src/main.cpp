@@ -3,6 +3,7 @@
 // Video and mic do not use this write path.
 #define WEBSOCKETS_TCP_TIMEOUT (3000)
 #include <Arduino.h>
+#include <ArduinoJson.h>
 #include <WiFi.h>
 #include <fcntl.h>
 #include <errno.h>
@@ -38,6 +39,13 @@ static volatile bool videoEnabled = false;
 static volatile bool nightVision = false;
 static volatile bool pttHeld = false;
 static volatile bool sosActive = false;
+// Incoming SOS from another device, broadcast by the server. Distinct from
+// sosActive (local GPIO21 button) so we can tell "I pressed SOS" from "a
+// peer pressed SOS". peerSosActiveAuto expires after PEER_SOS_ALIVE_MS so
+// the alert clears itself even if the peer's state goes stale.
+static volatile bool peerSosActive = false;
+static volatile uint32_t peerSosAt = 0;
+static char peerSosFrom[24] = {0};
 static volatile bool stateDirty = false;
 
 static Adafruit_NeoPixel pixel(1, RGB_LED, NEO_GRB + NEO_KHZ800);
@@ -190,14 +198,24 @@ static void applyCamNight(bool on) {
     s->set_raw_gma(s, 1);
     s->set_dcw(s, 1);
   } else {
-    // Match the bright firmware: do not touch exposure, gain, or aec2.
-    // Those overrides turned the live picture dark green.
-    s->set_brightness(s, 0);
-    s->set_contrast(s, 0);
+    // Daylight preset. Must mirror the initCam() thermal-stable settings,
+    // otherwise this branch silently undoes them and the picture goes dark
+    // green after the first applyCamNight(false) call in setup().
+    s->set_brightness(s, 1);
+    s->set_contrast(s, 1);
     s->set_saturation(s, 0);
     s->set_whitebal(s, 1);
     s->set_awb_gain(s, 1);
     s->set_wb_mode(s, 0);
+    s->set_aec2(s, 1);
+    s->set_ae_level(s, 1);
+    s->set_aec_value(s, 800);
+    s->set_gainceiling(s, (gainceiling_t)6);
+    s->set_raw_gma(s, 0);
+    s->set_lenc(s, 1);
+    s->set_bpc(s, 0);
+    s->set_wpc(s, 0);
+    s->set_dcw(s, 0);
     s->set_special_effect(s, 0);
     s->set_vflip(s, CAM_VFLIP);
     s->set_hmirror(s, CAM_HMIRROR);
@@ -206,7 +224,13 @@ static void applyCamNight(bool on) {
 }
 
 static void stateLed() {
+  // Peer SOS overrides local SOS colour: pulse fast (250ms period) so the
+  // operator can tell at a glance which device triggered the alert.
   if (sosActive) rgb(255, 0, 60);
+  else if (peerSosActive) {
+    bool on = ((millis() / 250) & 1) == 0;
+    rgb(on ? 255 : 0, 0, on ? 60 : 0);
+  }
   else if (pttHeld) rgb(255, 120, 0);
   else if (!streamEnabled && !audioEnabled && !videoEnabled) rgb(0, 0, 0);
   else if (videoEnabled) rgb(255, 0, 0);
@@ -346,6 +370,8 @@ static void postDeviceState() {
 //   /ws/audio  : raw PCM s16le mono 16 kHz
 // ============================================================
 
+static void handleServerCommand(const char *json, size_t len);  // defined below
+
 static void wsEvent(WStype_t type, uint8_t *payload, size_t length) {
   switch (type) {
     case WStype_CONNECTED:
@@ -371,6 +397,7 @@ static void wsEvent(WStype_t type, uint8_t *payload, size_t length) {
     case WStype_TEXT:
       if (payload && length) {
         Serial.printf("[WS] server: %.*s\n", (int)length, (char *)payload);
+        handleServerCommand((const char *)payload, length);
       }
       break;
     case WStype_BIN:
@@ -874,6 +901,41 @@ static void applySessionCmd() {
 }
 
 // ============================================================
+// SERVER COMMAND (TEXT frame) — server broadcasts peer SOS events here.
+// Expected schema: {"type":"sos","from":"bodycam-XX","on":true|false}
+// Anything else is dropped. We never trust the JSON blindly.
+// ============================================================
+
+static void handleServerCommand(const char *json, size_t len) {
+  if (!json || !len) return;
+  StaticJsonDocument<256> doc;
+  DeserializationError err = deserializeJson(doc, json, len);
+  if (err) return;
+  const char *type = doc["type"] | "";
+  if (strcmp(type, "sos") != 0) return;
+  const char *from = doc["from"] | "";
+  bool on = doc["on"] | false;
+  // Ignore our own broadcast echo — server sometimes fans out to all
+  // devices including the originator.
+  if (strcmp(from, deviceId.c_str()) == 0) return;
+  if (stateMux && xSemaphoreTake(stateMux, pdMS_TO_TICKS(50)) == pdTRUE) {
+    if (on) {
+      peerSosActive = true;
+      peerSosAt = millis();
+      size_t fl = strnlen(from, sizeof(peerSosFrom) - 1);
+      memcpy(peerSosFrom, from, fl);
+      peerSosFrom[fl] = 0;
+    } else {
+      peerSosActive = false;
+      peerSosFrom[0] = 0;
+    }
+    xSemaphoreGive(stateMux);
+  }
+  Serial.printf("[PEER-SOS] from=%s on=%d\n", from, (int)on);
+  stateDirty = true;
+}
+
+// ============================================================
 // AUDIO CAPTURE — firmware.zip: shift the INMP441 word and store it
 // ============================================================
 
@@ -1024,18 +1086,28 @@ static bool initCam() {
 
   sensor_t *s = esp_camera_sensor_get();
   if (s) {
-    // 10-user scene: OV5640 already does its own AWB/AEC well; the legacy
-    // OV2640 workarounds (aec2, lenc, bpc, wpc, raw_gma, dcw) cost cycles per
-    // frame and shave a couple fps off the OV5640. Leave brightness/contrast/
-    // saturation at neutral so night-vision presets can do their own thing.
-    s->set_brightness(s, 0);
-    s->set_contrast(s, 0);
+    // Thermal-stability fixes for OV5640 on continuous outdoor use:
+    //  - AEC2 enabled: adaptive exposure converges faster when the sensor
+    //    warms up; without it the picture goes dark 2-3 minutes after boot.
+    //  - LENC on: lens shading correction recovers the greenish tint that
+    //    shows up around the edges once the IR-cut / lens temperature shifts.
+    //  - AWB mode 0 (auto) but WB gain left to the sensor; locking both
+    //    (awb=0) keeps color stable but flips the picture magenta under
+    //    any lighting change, so we let AWB run and just clamp drift.
+    //  - AE level +1: small exposure bump that masks the typical "warm
+    //    sensor reads dimmer" effect.
+    s->set_brightness(s, 1);
+    s->set_contrast(s, 1);
     s->set_saturation(s, 0);
     s->set_whitebal(s, 1);
     s->set_awb_gain(s, 1);
-    s->set_aec2(s, 0);
+    s->set_wb_mode(s, 0);          // auto WB
+    s->set_aec2(s, 1);             // adaptive AEC, was 0
+    s->set_ae_level(s, 1);         // +1 stops -> compensate warm-up dim
+    s->set_aec_value(s, 800);      // start with mid exposure target
+    s->set_gainceiling(s, (gainceiling_t)6);  // GAINCEILING_8X (was default 2X)
     s->set_raw_gma(s, 0);
-    s->set_lenc(s, 0);
+    s->set_lenc(s, 1);             // lens shading, was 0
     s->set_bpc(s, 0);
     s->set_wpc(s, 0);
     s->set_dcw(s, 0);
@@ -1165,6 +1237,7 @@ static void audioTxTask(void *) {
 static void houseKeepTask(void *) {
   uint32_t lastHb = 0;
   uint32_t linkOkAt = millis();
+  uint32_t lastCamTune = 0;
   for (;;) {
     if (WiFi.status() != WL_CONNECTED) {
       linkOkAt = millis();
@@ -1216,6 +1289,18 @@ static void houseKeepTask(void *) {
       rtHeartbeat(WiFi.RSSI(), ESP.getFreeHeap());
       rtAdaptCam();
 #endif
+    }
+    // Periodic sensor re-tune: AWB/AEC drift after 5-10 minutes on the OV5640
+    // is the cause of the green/dark picture after warm-up. A nudge every
+    // 60 s — flipping whitebal off then on — forces the AWB state machine to
+    // re-converge without us having to talk to the sensor every frame.
+    if (now - lastCamTune >= 60000) {
+      lastCamTune = now;
+      sensor_t *s = esp_camera_sensor_get();
+      if (s) {
+        s->set_whitebal(s, 0);
+        s->set_whitebal(s, 1);
+      }
     }
 #if RT_STREAM
     rtPoll();
@@ -1373,6 +1458,7 @@ void setup() {
   delay(300);
   txMu = xSemaphoreCreateMutex();
   udpMu = xSemaphoreCreateMutex();
+  if (!stateMux) stateMux = xSemaphoreCreateMutex();
 
   led(true);
 #if USE_RGB_LED
@@ -1571,6 +1657,21 @@ void loop() {
       stateLed();
       Serial.printf("[BTN] sos=%d (GPIO21)\n", (int)sosActive);
     }
+  }
+
+  // Auto-clear stale peer-SOS and refresh LED blink. Cheap (~ microseconds)
+  // and runs on every loop() tick.
+  if (peerSosActive && (millis() - peerSosAt) > PEER_SOS_ALIVE_MS) {
+    peerSosActive = false;
+    peerSosFrom[0] = 0;
+    stateLed();
+    Serial.println("[PEER-SOS] auto-cleared (server silent)");
+  }
+  // Blink rate is 250 ms; refresh LED when peer SOS is the active state.
+  static uint32_t lastLedBlink = 0;
+  if (peerSosActive && (millis() - lastLedBlink) >= 250) {
+    lastLedBlink = millis();
+    stateLed();
   }
 
   delay(1);
